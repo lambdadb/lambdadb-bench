@@ -26,7 +26,8 @@ classifiers = [
 ]
 dependencies = [
   "datasets>=2.20",
-  "PyYAML>=6.0"
+  "lambdadb>=0.7.5",
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

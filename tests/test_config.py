@@ -63,6 +63,54 @@ metadata:
     assert redacted["api_key_env"] == "QDRANT_API_KEY"
 
 
+def test_load_lambdadb_target_fields(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LAMBDADB_ENDPOINT", "https://api.lambdadb.ai")
+    monkeypatch.setenv("LAMBDADB_PROJECT_NAME", "demo")
+    target_path = tmp_path / "target.yaml"
+    target_path.write_text(
+        """
+vendor: lambdadb
+name: lambdadb-ci
+endpoint: ${LAMBDADB_ENDPOINT}
+project_name: ${LAMBDADB_PROJECT_NAME}
+api_key_env: LAMBDADB_API_KEY
+collection_name: smoke
+vector_field: dense
+index_configs:
+  dense:
+    type: vector
+    dimensions: 3
+    similarity: cosine
+""",
+        encoding="utf-8",
+    )
+
+    target = load_target(target_path)
+
+    assert target.endpoint == "https://api.lambdadb.ai"
+    assert target.project_name == "demo"
+    assert target.api_key_env == "LAMBDADB_API_KEY"
+    assert target.collection_name == "smoke"
+    assert target.vector_field == "dense"
+    assert target.index_configs["dense"]["dimensions"] == 3
+
+
+def test_conflicting_collection_names_fail(tmp_path) -> None:
+    target_path = tmp_path / "target.yaml"
+    target_path.write_text(
+        """
+vendor: lambdadb
+name: lambdadb-ci
+collection: old
+collection_name: new
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="collection"):
+        load_target(target_path)
+
+
 def test_missing_env_var_fails(tmp_path) -> None:
     target_path = tmp_path / "target.yaml"
     target_path.write_text(

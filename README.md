@@ -94,6 +94,37 @@ QDRANT_URL=https://example.qdrant.io \
   ldbbench target check --target configs/qdrant-cloud.example.yaml
 ```
 
+Check a LambdaDB target config:
+
+```bash
+LAMBDADB_ENDPOINT=https://api.lambdadb.ai \
+LAMBDADB_PROJECT_NAME=my-project \
+  ldbbench target check --target configs/lambdadb.example.yaml
+```
+
+The real LambdaDB adapter uses the official `lambdadb` Python SDK. Configure
+LambdaDB targets with:
+
+- `endpoint`: API base URL, for example `https://api.lambdadb.ai`.
+- `project_name`: LambdaDB project name.
+- `api_key_env`: environment variable name containing the project API key.
+- `collection_name`: target collection.
+- `vector_field`: field that stores normalized benchmark vectors. Defaults to
+  `vector`.
+- `index_configs`: LambdaDB collection index config used by create/recreate
+  preparation modes.
+
+Normal unit tests do not contact LambdaDB. Optional integration coverage is
+gated behind:
+
+```bash
+LAMBDADB_BENCH_RUN_INTEGRATION=1
+LAMBDADB_API_KEY=...
+LAMBDADB_ENDPOINT=https://api.lambdadb.ai
+LAMBDADB_PROJECT_NAME=...
+LAMBDADB_COLLECTION_NAME=...
+```
+
 Dry-run a benchmark plan without contacting a database:
 
 ```bash

@@ -92,6 +92,11 @@ class TargetConfig:
     vendor: str
     name: str
     endpoint: str | None
+    api_key_env: str | None
+    collection_name: str | None
+    project_name: str | None
+    vector_field: str | None
+    index_configs: dict[str, Any]
     region: str | None
     prepare_mode: str
     metadata: dict[str, Any]
@@ -103,6 +108,11 @@ class TargetConfig:
         vendor = _required_str(raw, "vendor")
         name = _required_str(raw, "name")
         endpoint = _optional_str(raw, "endpoint")
+        api_key_env = _optional_str(raw, "api_key_env")
+        collection_name = _collection_name(raw)
+        project_name = _optional_str(raw, "project_name")
+        vector_field = _optional_str(raw, "vector_field")
+        index_configs = _optional_mapping(raw, "index_configs")
         region = _optional_str(raw, "region")
         prepare = _optional_mapping(raw, "prepare")
         prepare_mode = prepare.get("mode", "existing")
@@ -116,6 +126,11 @@ class TargetConfig:
             vendor=vendor,
             name=name,
             endpoint=endpoint,
+            api_key_env=api_key_env,
+            collection_name=collection_name,
+            project_name=project_name,
+            vector_field=vector_field,
+            index_configs=index_configs,
             region=region,
             prepare_mode=prepare_mode,
             metadata=_optional_mapping(raw, "metadata"),
@@ -242,6 +257,14 @@ def _optional_str(data: Mapping[str, Any], key: str) -> str | None:
     if not isinstance(value, str):
         raise ConfigError(f"{key} must be a string")
     return value
+
+
+def _collection_name(data: Mapping[str, Any]) -> str | None:
+    collection = _optional_str(data, "collection")
+    collection_name = _optional_str(data, "collection_name")
+    if collection and collection_name and collection != collection_name:
+        raise ConfigError("target collection and collection_name must match")
+    return collection_name or collection
 
 
 def _required_mapping(data: Mapping[str, Any], key: str) -> dict[str, Any]:

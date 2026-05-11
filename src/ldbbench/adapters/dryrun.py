@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
-from ldbbench.adapters.base import AdapterCapabilities, CheckResult
+from ldbbench.adapters.base import (
+    AdapterCapabilities,
+    CheckResult,
+    PrepareResult,
+    QueryResult,
+    UpsertResult,
+    VectorRecord,
+)
 from ldbbench.config import TargetConfig
 
 
@@ -24,6 +32,44 @@ class StaticAdapter:
             message="target metadata is valid for dry-run checks",
             details={"vendor": target.vendor, "target": target.name},
         )
+
+    def prepare(
+        self,
+        target: TargetConfig,
+        *,
+        dimensions: int | None = None,
+        metric: str | None = None,
+    ) -> PrepareResult:
+        raise NotImplementedError("dry-run adapters do not prepare real targets")
+
+    def upsert_batch(
+        self,
+        target: TargetConfig,
+        records: list[dict[str, Any] | VectorRecord],
+    ) -> UpsertResult:
+        raise NotImplementedError("dry-run adapters do not upsert records")
+
+    def query(
+        self,
+        target: TargetConfig,
+        *,
+        vector: list[float],
+        top_k: int,
+        consistency: str,
+        include_vectors: bool = False,
+        filter_query: dict[str, Any] | None = None,
+    ) -> QueryResult:
+        raise NotImplementedError("dry-run adapters do not query real targets")
+
+    def fetch(
+        self,
+        target: TargetConfig,
+        *,
+        ids: list[str],
+        consistency: str,
+        include_vectors: bool = False,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError("dry-run adapters do not fetch real documents")
 
 
 LAMBDADB_DRYRUN = StaticAdapter(
@@ -64,4 +110,3 @@ DRYRUN_ADAPTERS = {
     adapter.vendor: adapter
     for adapter in [LAMBDADB_DRYRUN, QDRANT_DRYRUN, PINECONE_DRYRUN]
 }
-

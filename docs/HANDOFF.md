@@ -2,7 +2,7 @@
 
 Last updated: 2026-05-11
 
-This repository is ready to continue from Phase 2-4 in a new Codex session.
+This repository is ready to continue from Phase 2-5 in a new Codex session.
 
 ## Current State
 
@@ -27,7 +27,7 @@ f2dcb0a Refine benchmark consistency and setup design
 23908ba Add initial benchmark design
 ```
 
-Current working tree was clean before this handoff document was added.
+Current working tree contains the Phase 2-4 LambdaDB adapter changes.
 
 ## Completed Work
 
@@ -109,6 +109,38 @@ Exact ground truth generation is complete for small/local datasets.
 
 This is brute-force exact search. It is good for fixtures and small smoke datasets. A scalable FAISS/cloud runner strategy is still needed before serious 1M/10M ground truth runs.
 
+### Phase 2-4
+
+LambdaDB adapter surface is complete.
+
+- Added `lambdadb>=0.7.5`.
+- Extended the adapter protocol beyond `check` to include:
+  - `prepare`
+  - `upsert_batch`
+  - `query`
+  - `fetch`
+- Implemented `src/ldbbench/adapters/lambdadb.py`.
+- Registered the real LambdaDB adapter while preserving dry-run planning behavior for `ldbbench run --dry-run`.
+- Added LambdaDB target config fields:
+  - `endpoint`
+  - `project_name`
+  - `api_key_env`
+  - `collection_name` with legacy `collection` compatibility
+  - `vector_field`
+  - `index_configs`
+- Added fake-SDK unit tests for check, prepare, upsert, query, fetch, and missing credential behavior.
+- Added gated LambdaDB integration coverage behind `LAMBDADB_BENCH_RUN_INTEGRATION=1`.
+- Updated `README.md` and `configs/lambdadb.example.yaml`.
+
+Implementation choices:
+
+- benchmark `query.consistency: eventual` maps to LambdaDB `consistent_read=False`.
+- benchmark `query.consistency: strong` maps to LambdaDB `consistent_read=True`.
+- LambdaDB query uses `{"knn": {"field": <vector_field>, "queryVector": [...], "k": top_k}}`.
+- LambdaDB create mode uses explicit `target.index_configs` when provided; otherwise it builds a minimal unmanaged vector field from dataset dimensions and metric.
+- `endpoint` is passed to the LambdaDB SDK as `base_url`.
+- `collection_name` is preferred in new YAML, but existing `collection` is still accepted.
+
 ## Validation Commands
 
 Use these from repo root:
@@ -120,10 +152,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after Phase 2-3:
+Current test count after Phase 2-4:
 
 ```text
-31 passed
+42 passed, 1 skipped
 ```
 
 Useful smoke commands:
@@ -147,47 +179,7 @@ QDRANT_URL=https://example.qdrant.io \
 
 ## Next Work
 
-Continue with Phase 2-4.
-
-### Phase 2-4: LambdaDB Adapter
-
-Goal:
-
-- Add real LambdaDB adapter using the official Python SDK.
-- Keep tests deterministic with fakes/mocks.
-- Do not require a real LambdaDB endpoint for unit tests.
-- Add gated integration tests only if credentials are explicitly present.
-
-Recommended subtasks:
-
-1. Add LambdaDB SDK dependency.
-2. Extend adapter protocol beyond `check` to include:
-   - `prepare`
-   - `upsert_batch`
-   - `query`
-   - optionally `fetch`
-3. Implement `src/ldbbench/adapters/lambdadb.py`.
-4. Register real LambdaDB adapter while preserving dry-run behavior.
-5. Add config fields needed by LambdaDB:
-   - endpoint/base URL
-   - project name or project host
-   - API key env var
-   - collection name
-   - vector field name/index config field
-6. Add unit tests with fake LambdaDB SDK objects.
-7. Add optional integration test gate, for example:
-   - `LAMBDADB_BENCH_RUN_INTEGRATION=1`
-   - `LAMBDADB_API_KEY`
-   - `LAMBDADB_ENDPOINT` or `LAMBDADB_BASE_URL`
-   - `LAMBDADB_PROJECT_NAME`
-8. Update README with LambdaDB adapter setup.
-
-Important consistency mapping:
-
-- benchmark `query.consistency: eventual` -> LambdaDB `consistent_read=False`
-- benchmark `query.consistency: strong` -> LambdaDB `consistent_read=True`
-
-Strong consistency should remain a LambdaDB-supported capability. Qdrant and Pinecone should keep strong consistency as `N/A`.
+Continue with Phase 2-5.
 
 ## LambdaDB SDK Notes
 
@@ -229,7 +221,7 @@ LambdaDB(
 )
 ```
 
-`server_url` emitted a deprecation warning during earlier introspection. Prefer `base_url` + `project_name`, or `project_host` if that better matches current product usage.
+`server_url` and `project_host` are legacy SDK parameters. The adapter config uses `endpoint` as SDK `base_url` plus `project_name`.
 
 Observed collection methods:
 
@@ -298,15 +290,7 @@ collections.docs.fetch(
 )
 ```
 
-Open detail to verify before final adapter implementation:
-
-- exact LambdaDB query DSL for vector search using normalized `vector` field.
-- exact `index_configs` shape for creating a vector collection/index.
-- whether benchmark normalized field should be named `vector`, `emb`, or configurable per target.
-- whether `collection` in target YAML should be renamed to `collection_name` for clarity.
-- whether `base_url` + `project_name` is enough for all LambdaDB environments.
-
-## Phase 2 Remaining After LambdaDB Adapter
+## Phase 2 Remaining
 
 ### Phase 2-5: Qdrant Adapter
 
@@ -343,7 +327,7 @@ Open detail to verify before final adapter implementation:
 ## Notes For Next Session
 
 - Start by reading this file and `docs/DESIGN.md`.
-- The next implementation should not require real LambdaDB credentials for normal tests.
+- The next implementation should not require real database credentials for normal tests.
 - Prefer fakes/mocks for SDK unit tests.
 - Add real integration tests behind explicit env gates only.
 - Keep public claims careful: the repo is a reproducible harness, not a leaderboard.

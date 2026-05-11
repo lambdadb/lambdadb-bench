@@ -281,7 +281,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
 
     scenario = load_scenario(args.scenario)
     target = load_target(args.target)
-    adapter = get_adapter(target.vendor)
+    adapter = get_adapter(target.vendor, dry_run=True)
     plan = build_run_plan(
         scenario=scenario,
         target=target,
