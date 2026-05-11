@@ -82,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Limit rows to prepare. Useful for smoke tests.",
     )
     prepare.add_argument(
+        "--query-count",
+        type=int,
+        help="Number of held-out query rows to write.",
+    )
+    prepare.add_argument(
         "--dry-run",
         action="store_true",
         help="Write only the dataset manifest without downloading rows.",
@@ -176,11 +181,18 @@ def run_dataset_prepare(args: argparse.Namespace) -> int:
         output_dir=output_dir,
         limit=args.limit,
         dry_run=args.dry_run,
+        query_count=args.query_count,
     )
     print(f"dataset: {scenario.name}")
     print(f"status: {result.manifest['status']}")
+    print(
+        "requested_source_rows: "
+        f"{result.manifest['dataset']['requested_source_rows']}"
+    )
     print(f"requested_rows: {result.manifest['dataset']['requested_rows']}")
+    print(f"requested_query_rows: {result.manifest['dataset']['requested_query_rows']}")
     print(f"written_rows: {result.manifest['dataset']['written_rows']}")
+    print(f"written_query_rows: {result.manifest['dataset']['written_query_rows']}")
     print(f"wrote {result.manifest_path}")
     if not args.dry_run:
         print(f"wrote {result.raw_records_path}")

@@ -6,7 +6,9 @@ dataset:
   source: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
   subset: en
   rows: 1000000
+  id_field: _id
   vector_field: emb
+  text_field: text
   dimensions: 1024
   metric: cosine
   seed: 20260511
@@ -49,4 +51,3 @@ metrics:
   include_error_rate: true
   include_recall: true
   include_cost_estimates: true
-

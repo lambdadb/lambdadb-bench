@@ -46,8 +46,18 @@ Prepare a tiny row-limited dataset cache for a smoke test:
 ldbbench dataset prepare \
   --scenario scenarios/cohere-wikipedia-1m.yaml \
   --limit 100 \
+  --query-count 10 \
   --out data/datasets/cohere-wikipedia-1m-smoke
 ```
+
+Dataset preparation writes a raw source sample plus normalized benchmark
+artifacts:
+
+- `raw_records.jsonl`: source rows as received from the dataset provider.
+- `queries.jsonl`: held-out query vectors.
+- `records.jsonl`: records intended for database loading.
+- `dataset_manifest.json`: dataset source, row counts, artifact paths, and
+  checksums.
 
 Validate the example scenario and target config:
 
