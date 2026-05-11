@@ -35,6 +35,8 @@ def initialize_run_artifacts(
     scenario_path: str | Path,
     target_path: str | Path,
     output_dir: str | Path,
+    adapter_capabilities: dict[str, object] | None = None,
+    dry_run_plan: dict[str, object] | None = None,
 ) -> ManifestPaths:
     """Write the initial reproducibility artifacts for a benchmark run."""
 
@@ -55,6 +57,8 @@ def initialize_run_artifacts(
         scenario_path=scenario_path,
         target_path=target_path,
         redacted_target=redacted_target,
+        adapter_capabilities=adapter_capabilities,
+        dry_run_plan=dry_run_plan,
     )
     run_manifest.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -75,6 +79,8 @@ def build_run_manifest(
     scenario_path: str | Path,
     target_path: str | Path,
     redacted_target: dict[str, Any],
+    adapter_capabilities: dict[str, object] | None = None,
+    dry_run_plan: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     scenario_file = Path(scenario_path)
     target_file = Path(target_path)
@@ -119,7 +125,9 @@ def build_run_manifest(
             "deployment_mode": metadata.get("deployment_mode"),
             "user_declared_config": metadata.get("user_declared_config"),
             "pricing_notes": metadata.get("pricing_notes"),
+            "adapter_capabilities": adapter_capabilities or {},
         },
+        "dry_run_plan": dry_run_plan,
     }
 
 
@@ -134,4 +142,3 @@ def sha256_file(path: str | Path) -> str:
 def sha256_mapping(data: dict[str, Any]) -> str:
     encoded = yaml.safe_dump(data, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-

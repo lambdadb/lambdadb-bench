@@ -55,6 +55,10 @@ metadata:
         scenario_path=scenario_path,
         target_path=target_path,
         output_dir=output_dir,
+        adapter_capabilities={
+            "supported_query_consistency": ["eventual", "strong"],
+        },
+        dry_run_plan={"status": "supported"},
     )
 
     manifest = json.loads(paths.run_manifest.read_text(encoding="utf-8"))
@@ -65,5 +69,8 @@ metadata:
     assert manifest["scenario"]["query"]["consistency"] == "strong"
     assert manifest["target"]["report_label"] == "lambdadb-ci"
     assert manifest["target"]["endpoint"] == "https://<redacted-host>"
+    assert manifest["target"]["adapter_capabilities"][
+        "supported_query_consistency"
+    ] == ["eventual", "strong"]
+    assert manifest["dry_run_plan"]["status"] == "supported"
     assert "api.lambdadb.example" not in redacted_target
-

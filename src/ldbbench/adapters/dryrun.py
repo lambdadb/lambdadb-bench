@@ -1,0 +1,67 @@
+"""Dry-run adapters used before real database SDKs are wired."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from ldbbench.adapters.base import AdapterCapabilities, CheckResult
+from ldbbench.config import TargetConfig
+
+
+@dataclass(frozen=True)
+class StaticAdapter:
+    vendor: str
+    capabilities: AdapterCapabilities
+
+    def check(self, target: TargetConfig) -> CheckResult:
+        if target.vendor != self.vendor:
+            return CheckResult(
+                ok=False,
+                message=f"adapter {self.vendor} cannot check target {target.vendor}",
+            )
+        return CheckResult(
+            ok=True,
+            message="target metadata is valid for dry-run checks",
+            details={"vendor": target.vendor, "target": target.name},
+        )
+
+
+LAMBDADB_DRYRUN = StaticAdapter(
+    vendor="lambdadb",
+    capabilities=AdapterCapabilities(
+        supported_write_modes=frozenset({"upsert", "bulk_upsert"}),
+        supported_query_consistency=frozenset({"eventual", "strong"}),
+        supports_read_after_write_strong=True,
+        vendor_consistency_options={"consistent_read": True},
+    ),
+)
+
+QDRANT_DRYRUN = StaticAdapter(
+    vendor="qdrant",
+    capabilities=AdapterCapabilities(
+        supported_write_modes=frozenset({"upsert"}),
+        supported_query_consistency=frozenset({"eventual"}),
+        supports_read_after_write_strong=False,
+        vendor_consistency_options={
+            "read_consistency": ["all", "majority", "quorum"],
+            "write_ordering": ["weak", "medium", "strong"],
+            "default_protocol": "grpc",
+        },
+    ),
+)
+
+PINECONE_DRYRUN = StaticAdapter(
+    vendor="pinecone",
+    capabilities=AdapterCapabilities(
+        supported_write_modes=frozenset({"upsert"}),
+        supported_query_consistency=frozenset({"eventual"}),
+        supports_read_after_write_strong=False,
+        vendor_consistency_options={"data_freshness_model": "eventual"},
+    ),
+)
+
+DRYRUN_ADAPTERS = {
+    adapter.vendor: adapter
+    for adapter in [LAMBDADB_DRYRUN, QDRANT_DRYRUN, PINECONE_DRYRUN]
+}
+

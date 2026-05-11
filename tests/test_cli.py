@@ -119,3 +119,119 @@ prepare:
     assert "run_manifest.json" in captured.out
     assert (output_dir / "run_manifest.json").exists()
     assert (output_dir / "target.redacted.yaml").exists()
+
+
+def test_target_check_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    target_path = tmp_path / "target.yaml"
+    target_path.write_text(
+        """
+vendor: qdrant
+name: qdrant-ci
+endpoint: https://api.example.test
+prepare:
+  mode: existing
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["target", "check", "--target", str(target_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "status: ok" in captured.out
+    assert '"supported_query_consistency": [' in captured.out
+
+
+def test_run_dry_run_writes_plan(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    target_path = tmp_path / "target.yaml"
+    output_dir = tmp_path / "result"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+    target_path.write_text(
+        """
+vendor: qdrant
+name: qdrant-ci
+endpoint: https://api.example.test
+prepare:
+  mode: existing
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "run",
+            "--dry-run",
+            "--scenario",
+            str(scenario_path),
+            "--target",
+            str(target_path),
+            "--out",
+            str(output_dir),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "dry_run: supported" in captured.out
+    assert (output_dir / "run_manifest.json").exists()
+
+
+def test_run_without_dry_run_fails(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    target_path = tmp_path / "target.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+    target_path.write_text(
+        """
+vendor: qdrant
+name: qdrant-ci
+endpoint: https://api.example.test
+prepare:
+  mode: existing
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "run",
+                "--scenario",
+                str(scenario_path),
+                "--target",
+                str(target_path),
+                "--out",
+                str(tmp_path / "result"),
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 2
+    assert "only --dry-run is supported" in captured.err

@@ -51,6 +51,23 @@ QDRANT_URL=https://example.qdrant.io \
     --out results/example-qdrant-1m
 ```
 
+Check target adapter capabilities:
+
+```bash
+QDRANT_URL=https://example.qdrant.io \
+  ldbbench target check --target configs/qdrant-cloud.example.yaml
+```
+
+Dry-run a benchmark plan without contacting a database:
+
+```bash
+QDRANT_URL=https://example.qdrant.io \
+  ldbbench run --dry-run \
+    --scenario scenarios/cohere-wikipedia-1m.yaml \
+    --target configs/qdrant-cloud.example.yaml \
+    --out results/example-qdrant-1m
+```
+
 Run tests and linting:
 
 ```bash
