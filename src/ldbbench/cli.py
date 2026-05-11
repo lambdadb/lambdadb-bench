@@ -14,7 +14,7 @@ from ldbbench.datasets import (
     prepare_ground_truth,
 )
 from ldbbench.manifest import initialize_run_artifacts
-from ldbbench.runner import build_run_plan
+from ldbbench.runner import build_run_plan, execute_benchmark
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -154,6 +154,27 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--target", required=True, help="Path to target YAML.")
     run.add_argument("--out", required=True, help="Output result directory.")
     run.add_argument(
+        "--dataset-dir",
+        help="Prepared dataset directory containing records.jsonl and queries.jsonl.",
+    )
+    run.add_argument(
+        "--ground-truth",
+        help=(
+            "Optional ground_truth.jsonl path. Defaults to "
+            "<dataset-dir>/ground_truth.jsonl."
+        ),
+    )
+    run.add_argument(
+        "--max-records",
+        type=int,
+        help="Limit records loaded in this run. Useful for smoke tests.",
+    )
+    run.add_argument(
+        "--max-queries",
+        type=int,
+        help="Limit queries executed in this run. Useful for smoke tests.",
+    )
+    run.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate the run plan and write artifacts without contacting a database.",
@@ -162,6 +183,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-destructive",
         action="store_true",
         help="Allow destructive preparation modes such as recreate.",
+    )
+    run.add_argument(
+        "--allow-large-run",
+        action="store_true",
+        help="Allow 1M+ real runs. Intended for explicit cost/time opt-in.",
     )
     run.set_defaults(func=run_benchmark)
 
@@ -274,20 +300,42 @@ def run_target_check(args: argparse.Namespace) -> int:
 
 
 def run_benchmark(args: argparse.Namespace) -> int:
-    if not args.dry_run:
-        raise ConfigError(
-            "only --dry-run is supported until real adapters are implemented"
-        )
-
     scenario = load_scenario(args.scenario)
     target = load_target(args.target)
-    adapter = get_adapter(target.vendor, dry_run=True)
+    adapter = get_adapter(target.vendor, dry_run=args.dry_run)
     plan = build_run_plan(
         scenario=scenario,
         target=target,
         capabilities=adapter.capabilities,
         allow_destructive=args.allow_destructive,
     )
+    if not args.dry_run:
+        if not args.dataset_dir:
+            raise ConfigError("run requires --dataset-dir unless --dry-run is set")
+        result = execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=adapter,
+            scenario_path=args.scenario,
+            target_path=args.target,
+            output_dir=args.out,
+            dataset_dir=args.dataset_dir,
+            ground_truth_path=args.ground_truth,
+            max_records=args.max_records,
+            max_queries=args.max_queries,
+            allow_destructive=args.allow_destructive,
+            allow_large_run=args.allow_large_run,
+        )
+        print("run: completed")
+        print(f"records: {result.summary['load']['records']}")
+        print(f"queries: {result.summary['query']['queries']}")
+        if result.summary["query"]["recall_at_k"] is not None:
+            print(f"recall_at_k: {result.summary['query']['recall_at_k']}")
+        print(f"wrote {result.ingest_events_path}")
+        print(f"wrote {result.query_events_path}")
+        print(f"wrote {result.summary_path}")
+        return 0
+
     paths = initialize_run_artifacts(
         scenario=scenario,
         target=target,

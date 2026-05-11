@@ -1,8 +1,8 @@
 # LambdaDB Bench Handoff
 
-Last updated: 2026-05-11
+Last updated: 2026-05-12
 
-This repository is ready to continue from Phase 2-6 in a new Codex session.
+This repository is ready to continue from Phase 2-6 stage 2 in a new Codex session.
 
 ## Current State
 
@@ -27,7 +27,7 @@ f2dcb0a Refine benchmark consistency and setup design
 23908ba Add initial benchmark design
 ```
 
-Current working tree contains the Phase 2-5 Qdrant adapter changes.
+Current working tree contains the Phase 2-6 stage 1 runner changes.
 
 ## Completed Work
 
@@ -168,6 +168,34 @@ Implementation choices:
 - unnamed Qdrant vectors are the default; setting `target.vector_field` switches create/upsert/query to named-vector mode.
 - Qdrant create mode maps benchmark metric `cosine|dot|dot_product|euclidean` to Qdrant distances `Cosine|Dot|Euclid`.
 
+### Phase 2-6 Stage 1
+
+Sequential dry-to-real runner surface is complete without requiring real endpoints
+for normal tests.
+
+- Added `src/ldbbench/runner/execute.py`.
+- `ldbbench run` now supports non-dry-run execution when `--dataset-dir` is provided.
+- Added run limits:
+  - `--max-records`
+  - `--max-queries`
+  - `--allow-large-run`
+- Real runs over 1M scenario rows require `--allow-large-run` unless `--max-records` keeps the run below the threshold.
+- Added optional `--ground-truth`; by default the runner uses `<dataset-dir>/ground_truth.jsonl` when present.
+- Implemented sequential `prepare -> load -> query` execution using the common adapter interface.
+- Wrote runner artifacts:
+  - `ingest_events.jsonl`
+  - `query_events.jsonl`
+  - `summary.json`
+- Summary includes load/query counts, duration, QPS, latency percentiles, and mean recall when ground truth is available.
+- Added fake-adapter unit/smoke tests for real runner behavior, output files, recall, limits, and large-run opt-in.
+
+Remaining Phase 2-6 work:
+
+- Add true concurrent query stages based on `scenario.query.stages`.
+- Add duration-based query loops rather than one pass over `queries.jsonl`.
+- Add richer error event handling and partial-run summaries.
+- Run real LambdaDB/Qdrant endpoint smoke tests once credentials are available.
+
 ## Validation Commands
 
 Use these from repo root:
@@ -179,10 +207,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after Phase 2-5:
+Current test count after Phase 2-6 stage 1:
 
 ```text
-53 passed, 2 skipped
+59 passed, 2 skipped
 ```
 
 Useful smoke commands:
@@ -206,7 +234,7 @@ QDRANT_URL=https://example.qdrant.io \
 
 ## Next Work
 
-Continue with Phase 2-6.
+Continue with Phase 2-6 stage 2.
 
 ## Qdrant SDK Notes
 
@@ -357,16 +385,13 @@ collections.docs.fetch(
 
 ## Phase 2 Remaining
 
-### Phase 2-6: 1M Dry-to-Real Runner
+### Phase 2-6 Stage 2: Concurrent/Duration Runner
 
-- Add real load stage.
-- Add real query stage.
-- Write `ingest_events.jsonl`.
-- Write `query_events.jsonl`.
-- Write `summary.json`.
-- Compute latency percentiles and QPS.
-- Compute recall using `ground_truth.jsonl`.
-- Keep 1M real run opt-in because it can incur cost/time.
+- Execute `scenario.query.stages` with configured concurrency and duration.
+- Keep sequential one-pass mode for smoke tests.
+- Preserve `ingest_events.jsonl`, `query_events.jsonl`, and `summary.json`.
+- Add robust error events and non-zero error-rate summaries.
+- Validate against real LambdaDB and Qdrant endpoints when credentials are available.
 
 ## Later Work
 

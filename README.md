@@ -156,6 +156,29 @@ QDRANT_URL=https://example.qdrant.io \
     --out results/example-qdrant-1m
 ```
 
+Run a small real smoke benchmark against a prepared dataset:
+
+```bash
+QDRANT_URL=https://example.qdrant.io \
+  ldbbench run \
+    --scenario scenarios/cohere-wikipedia-1m.yaml \
+    --target configs/qdrant-cloud.example.yaml \
+    --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+    --max-records 100 \
+    --max-queries 10 \
+    --out results/example-qdrant-smoke
+```
+
+Real runs write:
+
+- `ingest_events.jsonl`: one event per upsert batch.
+- `query_events.jsonl`: one event per query.
+- `summary.json`: load/query counts, latency percentiles, QPS, and recall when
+  `ground_truth.jsonl` is present.
+
+Runs at 1M rows or larger require `--allow-large-run` unless `--max-records`
+keeps the run below that threshold.
+
 Run tests and linting:
 
 ```bash

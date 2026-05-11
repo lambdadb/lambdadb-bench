@@ -332,4 +332,4 @@ prepare:
 
     captured = capsys.readouterr()
     assert exc.value.code == 2
-    assert "only --dry-run is supported" in captured.err
+    assert "requires --dataset-dir" in captured.err
