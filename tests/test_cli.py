@@ -115,6 +115,61 @@ query:
     assert (output_dir / "dataset_manifest.json").exists()
 
 
+def test_dataset_ground_truth_command(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    dataset_dir = tmp_path / "dataset"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  provider: huggingface
+  source: demo/source
+  rows: 3
+  dimensions: 2
+  id_field: _id
+  vector_field: emb
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+    from ldbbench.config import load_scenario
+    from ldbbench.datasets.prepare import prepare_dataset
+
+    prepare_dataset(
+        scenario=load_scenario(scenario_path),
+        output_dir=dataset_dir,
+        limit=2,
+        query_count=1,
+        source_rows=[
+            {"_id": "q", "emb": [1.0, 0.0]},
+            {"_id": "a", "emb": [1.0, 0.0]},
+            {"_id": "b", "emb": [0.0, 1.0]},
+        ],
+    )
+
+    exit_code = main(
+        [
+            "dataset",
+            "ground-truth",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--top-k",
+            "1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "status: prepared" in captured.out
+    assert (dataset_dir / "ground_truth.jsonl").exists()
+
+
 def test_manifest_init_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
     scenario_path = tmp_path / "scenario.yaml"
     target_path = tmp_path / "target.yaml"

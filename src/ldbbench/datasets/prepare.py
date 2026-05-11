@@ -282,6 +282,7 @@ def build_dataset_manifest(
             "rows": scenario.dataset.get("rows"),
             "dimensions": scenario.dataset.get("dimensions"),
             "vector_field": scenario.dataset.get("vector_field"),
+            "metric": scenario.dataset.get("metric", "cosine"),
             "id_field": scenario.dataset.get("id_field", "id"),
             "text_field": scenario.dataset.get("text_field"),
             "seed": scenario.dataset.get("seed"),

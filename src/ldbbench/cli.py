@@ -8,7 +8,11 @@ import json
 from ldbbench.__about__ import __version__
 from ldbbench.adapters import get_adapter
 from ldbbench.config import ConfigError, load_scenario, load_target
-from ldbbench.datasets import default_dataset_output_dir, prepare_dataset
+from ldbbench.datasets import (
+    default_dataset_output_dir,
+    prepare_dataset,
+    prepare_ground_truth,
+)
 from ldbbench.manifest import initialize_run_artifacts
 from ldbbench.runner import build_run_plan
 
@@ -92,6 +96,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write only the dataset manifest without downloading rows.",
     )
     prepare.set_defaults(func=run_dataset_prepare)
+    ground_truth = dataset_subcommands.add_parser(
+        "ground-truth",
+        help="Compute exact ground truth for prepared dataset artifacts.",
+    )
+    ground_truth.add_argument(
+        "--dataset-dir",
+        required=True,
+        help="Prepared dataset cache directory.",
+    )
+    ground_truth.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="Number of nearest neighbors to store per query.",
+    )
+    ground_truth.add_argument(
+        "--metric",
+        choices=["cosine", "dot"],
+        help="Distance/similarity metric. Defaults to dataset manifest metric.",
+    )
+    ground_truth.add_argument(
+        "--backend",
+        default="exact",
+        choices=["exact"],
+        help="Ground truth backend.",
+    )
+    ground_truth.add_argument(
+        "--limit-queries",
+        type=int,
+        help="Limit the number of query rows to process.",
+    )
+    ground_truth.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write only the ground truth manifest without computing neighbors.",
+    )
+    ground_truth.set_defaults(func=run_dataset_ground_truth)
 
     target = subcommands.add_parser(
         "target",
@@ -196,6 +237,27 @@ def run_dataset_prepare(args: argparse.Namespace) -> int:
     print(f"wrote {result.manifest_path}")
     if not args.dry_run:
         print(f"wrote {result.raw_records_path}")
+    return 0
+
+
+def run_dataset_ground_truth(args: argparse.Namespace) -> int:
+    result = prepare_ground_truth(
+        dataset_dir=args.dataset_dir,
+        top_k=args.top_k,
+        metric=args.metric,
+        backend=args.backend,
+        limit_queries=args.limit_queries,
+        dry_run=args.dry_run,
+    )
+    print(f"status: {result.manifest['status']}")
+    print(f"backend: {result.manifest['ground_truth']['backend']}")
+    print(f"metric: {result.manifest['ground_truth']['metric']}")
+    print(f"top_k: {result.manifest['ground_truth']['top_k']}")
+    print(f"records: {result.manifest['dataset']['records']}")
+    print(f"queries: {result.manifest['dataset']['queries']}")
+    print(f"wrote {result.manifest_path}")
+    if not args.dry_run:
+        print(f"wrote {result.ground_truth_path}")
     return 0
 
 

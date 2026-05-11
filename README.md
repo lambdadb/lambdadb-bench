@@ -59,6 +59,15 @@ artifacts:
 - `dataset_manifest.json`: dataset source, row counts, artifact paths, and
   checksums.
 
+Compute exact ground truth for a prepared smoke dataset:
+
+```bash
+ldbbench dataset ground-truth \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+  --top-k 10 \
+  --backend exact
+```
+
 Validate the example scenario and target config:
 
 ```bash
