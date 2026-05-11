@@ -29,3 +29,93 @@ def test_version_option(capsys: pytest.CaptureFixture[str]) -> None:
     assert exc.value.code == 0
     assert captured.out.startswith("ldbbench ")
 
+
+def test_config_validate_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    target_path = tmp_path / "target.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+    target_path.write_text(
+        """
+vendor: qdrant
+name: qdrant-ci
+prepare:
+  mode: existing
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "config",
+            "validate",
+            "--scenario",
+            str(scenario_path),
+            "--target",
+            str(target_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "scenario: smoke" in captured.out
+    assert "target: qdrant-ci (qdrant)" in captured.out
+
+
+def test_manifest_init_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    target_path = tmp_path / "target.yaml"
+    output_dir = tmp_path / "result"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+    target_path.write_text(
+        """
+vendor: lambdadb
+name: lambdadb-ci
+endpoint: https://api.example.test
+prepare:
+  mode: existing
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "manifest",
+            "init",
+            "--scenario",
+            str(scenario_path),
+            "--target",
+            str(target_path),
+            "--out",
+            str(output_dir),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "run_manifest.json" in captured.out
+    assert (output_dir / "run_manifest.json").exists()
+    assert (output_dir / "target.redacted.yaml").exists()

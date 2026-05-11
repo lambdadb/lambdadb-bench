@@ -32,6 +32,25 @@ Check the CLI:
 ldbbench doctor
 ```
 
+Validate the example scenario and target config:
+
+```bash
+QDRANT_URL=https://example.qdrant.io \
+  ldbbench config validate \
+    --scenario scenarios/cohere-wikipedia-1m.yaml \
+    --target configs/qdrant-cloud.example.yaml
+```
+
+Initialize a result directory with reproducibility artifacts:
+
+```bash
+QDRANT_URL=https://example.qdrant.io \
+  ldbbench manifest init \
+    --scenario scenarios/cohere-wikipedia-1m.yaml \
+    --target configs/qdrant-cloud.example.yaml \
+    --out results/example-qdrant-1m
+```
+
 Run tests and linting:
 
 ```bash

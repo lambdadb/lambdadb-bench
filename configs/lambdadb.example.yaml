@@ -1,0 +1,16 @@
+vendor: lambdadb
+name: lambdadb-user-project
+endpoint: ${LAMBDADB_ENDPOINT}
+api_key_env: LAMBDADB_API_KEY
+collection: cohere_wikipedia_1m
+region: us-east-1
+
+prepare:
+  mode: existing
+
+metadata:
+  deployment_mode: serverless
+  user_declared_config: "LambdaDB serverless project"
+  pricing_notes: "User-provided LambdaDB pricing assumptions"
+  report_label: lambdadb-serverless
+

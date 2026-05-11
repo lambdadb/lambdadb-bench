@@ -1,0 +1,16 @@
+vendor: qdrant
+name: qdrant-cloud-user-cluster
+endpoint: ${QDRANT_URL}
+api_key_env: QDRANT_API_KEY
+collection: cohere_wikipedia_1m
+region: us-east-1
+
+prepare:
+  mode: existing
+
+metadata:
+  deployment_mode: cloud
+  user_declared_config: "User-selected Qdrant Cloud cluster; gRPC enabled"
+  pricing_notes: "User-provided monthly cluster cost"
+  report_label: qdrant-cloud-grpc
+

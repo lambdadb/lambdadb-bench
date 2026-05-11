@@ -24,7 +24,9 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Software Development :: Testing"
 ]
-dependencies = []
+dependencies = [
+  "PyYAML>=6.0"
+]
 
 [project.optional-dependencies]
 dev = [
@@ -53,4 +55,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-
