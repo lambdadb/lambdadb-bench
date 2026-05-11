@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from uuid import UUID
 
 import pytest
 
-from ldbbench.adapters.qdrant import QdrantAdapter
+from ldbbench.adapters.qdrant import (
+    SOURCE_ID_PAYLOAD_KEY,
+    QdrantAdapter,
+    _qdrant_point_id,
+)
 from ldbbench.config import ConfigError, TargetConfig
 
 
@@ -64,15 +69,34 @@ class FakeClient:
         self.query_points_calls.append(kwargs)
         return FakeQueryResponse(
             [
-                FakePoint(point_id="a", payload={"text": "alpha"}, score=0.9),
-                FakePoint(point_id="b", payload={"text": "beta"}, score=0.8),
+                FakePoint(
+                    point_id=_qdrant_point_id("a"),
+                    payload={SOURCE_ID_PAYLOAD_KEY: "a", "text": "alpha"},
+                    score=0.9,
+                ),
+                FakePoint(
+                    point_id=_qdrant_point_id("b"),
+                    payload={SOURCE_ID_PAYLOAD_KEY: "b", "text": "beta"},
+                    score=0.8,
+                ),
             ]
         )
 
     def retrieve(self, **kwargs: Any) -> list[FakePoint]:
         self.retrieve_calls.append(kwargs)
+        original_ids = {
+            _qdrant_point_id("a"): "a",
+            _qdrant_point_id("b"): "b",
+        }
         return [
-            FakePoint(point_id=item, payload={"text": item}, vector=[0.1])
+            FakePoint(
+                point_id=item,
+                payload={
+                    SOURCE_ID_PAYLOAD_KEY: original_ids[item],
+                    "text": original_ids[item],
+                },
+                vector=[0.1],
+            )
             for item in kwargs["ids"]
         ]
 
@@ -177,7 +201,11 @@ def test_upsert_batch_maps_records_to_qdrant_points() -> None:
     result = adapter.upsert_batch(
         make_target(vector_field="dense"),
         [
-            {"id": "a", "vector": [0.1, 0.2], "metadata": {"text": "alpha"}},
+            {
+                "id": "20231101.en_34151850_6",
+                "vector": [0.1, 0.2],
+                "metadata": {"text": "alpha"},
+            },
             {"id": "b", "vector": [0.3, 0.4], "metadata": {}},
         ],
     )
@@ -186,9 +214,13 @@ def test_upsert_batch_maps_records_to_qdrant_points() -> None:
     call = client.upsert_calls[0]
     assert call["collection_name"] == "smoke"
     assert call["wait"] is True
-    assert call["points"][0].id == "a"
+    UUID(call["points"][0].id)
+    assert call["points"][0].id == _qdrant_point_id("20231101.en_34151850_6")
     assert call["points"][0].vector == {"dense": [0.1, 0.2]}
-    assert call["points"][0].payload == {"text": "alpha"}
+    assert call["points"][0].payload == {
+        SOURCE_ID_PAYLOAD_KEY: "20231101.en_34151850_6",
+        "text": "alpha",
+    }
 
 
 def test_query_uses_eventual_consistency_and_grpc_client() -> None:
@@ -259,7 +291,7 @@ def test_fetch_retrieves_points_by_id() -> None:
     assert client.retrieve_calls == [
         {
             "collection_name": "smoke",
-            "ids": ["a", "b"],
+            "ids": [_qdrant_point_id("a"), _qdrant_point_id("b")],
             "with_payload": True,
             "with_vectors": True,
         }
@@ -281,7 +313,7 @@ def test_operations_require_api_key_when_api_key_env_is_set() -> None:
     reason="set QDRANT_BENCH_RUN_INTEGRATION=1 to run Qdrant integration tests",
 )
 def test_qdrant_integration_existing_collection_check() -> None:
-    required = ["QDRANT_URL", "QDRANT_COLLECTION_NAME"]
+    required = ["QDRANT_ENDPOINT", "QDRANT_COLLECTION_NAME"]
     missing = [name for name in required if not os.getenv(name)]
     if missing:
         pytest.skip(f"missing Qdrant integration env vars: {', '.join(missing)}")
@@ -291,7 +323,7 @@ def test_qdrant_integration_existing_collection_check() -> None:
         {
             "vendor": "qdrant",
             "name": "qdrant-integration",
-            "endpoint": os.environ["QDRANT_URL"],
+            "endpoint": os.environ["QDRANT_ENDPOINT"],
             "api_key_env": "QDRANT_API_KEY"
             if os.getenv("QDRANT_API_KEY")
             else None,

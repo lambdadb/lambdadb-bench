@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -35,6 +36,7 @@ DISTANCE_MAP = {
     "dot_product": "DOT",
     "euclidean": "EUCLID",
 }
+SOURCE_ID_PAYLOAD_KEY = "__ldbbench_source_id"
 
 
 @dataclass(frozen=True)
@@ -193,7 +195,7 @@ class QdrantAdapter:
         settings = _settings_from_target(target)
         response = self._client(settings).retrieve(
             collection_name=settings.collection_name,
-            ids=list(ids),
+            ids=[_qdrant_point_id(item) for item in ids],
             with_payload=True,
             with_vectors=include_vectors,
         )
@@ -299,14 +301,19 @@ def _record_to_point(
             raise ConfigError("record metadata must be a mapping")
         payload = dict(metadata)
 
+    payload[SOURCE_ID_PAYLOAD_KEY] = record_id
     point_vector: Any = {vector_name: list(vector)} if vector_name else list(vector)
-    return models.PointStruct(id=record_id, vector=point_vector, payload=payload)
+    return models.PointStruct(
+        id=_qdrant_point_id(record_id),
+        vector=point_vector,
+        payload=payload,
+    )
 
 
 def _query_matches(response: Any) -> list[QueryMatch]:
     return [
         QueryMatch(
-            id=str(_point_id(point)),
+            id=_document_id(point),
             score=_score(point),
             document=_document_from_point(point),
         )
@@ -326,12 +333,26 @@ def _points(response: Any) -> Sequence[Any]:
 
 def _document_from_point(point: Any) -> Mapping[str, Any]:
     payload = _payload(point)
-    document = {"id": str(_point_id(point))}
-    document.update(payload)
+    source_id = payload.pop(SOURCE_ID_PAYLOAD_KEY, None)
+    document = dict(payload)
+    document["id"] = str(source_id if source_id is not None else _point_id(point))
     vector = _vector(point)
     if vector is not None:
         document["vector"] = vector
     return document
+
+
+def _document_id(point: Any) -> str:
+    payload = _payload(point)
+    source_id = payload.get(SOURCE_ID_PAYLOAD_KEY)
+    return str(source_id if source_id is not None else _point_id(point))
+
+
+def _qdrant_point_id(record_id: str) -> str:
+    try:
+        return str(uuid.UUID(record_id))
+    except ValueError:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"lambdadb-bench:qdrant:{record_id}"))
 
 
 def _point_id(point: Any) -> object:

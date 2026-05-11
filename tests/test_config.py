@@ -36,13 +36,13 @@ query:
 
 
 def test_load_target_expands_env_and_redacts_secrets(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("QDRANT_URL", "https://example.qdrant.io")
+    monkeypatch.setenv("QDRANT_ENDPOINT", "https://example.qdrant.io")
     target_path = tmp_path / "target.yaml"
     target_path.write_text(
         """
 vendor: qdrant
 name: qdrant-cloud
-endpoint: ${QDRANT_URL}
+endpoint: ${QDRANT_ENDPOINT}
 api_key: inline-secret
 api_key_env: QDRANT_API_KEY
 prepare:

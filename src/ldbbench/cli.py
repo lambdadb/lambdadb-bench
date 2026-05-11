@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 
 from ldbbench.__about__ import __version__
 from ldbbench.adapters import get_adapter
@@ -15,6 +17,10 @@ from ldbbench.datasets import (
 )
 from ldbbench.manifest import initialize_run_artifacts
 from ldbbench.runner import build_run_plan, execute_benchmark
+
+RESOURCE_TRACKER_WARNING_FILTER = (
+    "ignore:resource_tracker:UserWarning:multiprocessing.resource_tracker"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -243,6 +249,12 @@ def run_manifest_init(args: argparse.Namespace) -> int:
 def run_dataset_prepare(args: argparse.Namespace) -> int:
     scenario = load_scenario(args.scenario)
     output_dir = args.out or default_dataset_output_dir(scenario)
+    uses_huggingface = _uses_huggingface_provider(scenario.dataset)
+    if not args.dry_run and uses_huggingface:
+        _suppress_resource_tracker_warning()
+    print(f"dataset: {scenario.name}", flush=True)
+    if not args.dry_run:
+        print("status: preparing", flush=True)
     result = prepare_dataset(
         scenario=scenario,
         output_dir=output_dir,
@@ -250,7 +262,6 @@ def run_dataset_prepare(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         query_count=args.query_count,
     )
-    print(f"dataset: {scenario.name}")
     print(f"status: {result.manifest['status']}")
     print(
         "requested_source_rows: "
@@ -263,6 +274,9 @@ def run_dataset_prepare(args: argparse.Namespace) -> int:
     print(f"wrote {result.manifest_path}")
     if not args.dry_run:
         print(f"wrote {result.raw_records_path}")
+        print(f"wrote {result.records_path}")
+        print(f"wrote {result.queries_path}")
+        args._force_exit_after_return = uses_huggingface
     return 0
 
 
@@ -358,6 +372,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    cli_invocation = argv is None
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -366,9 +381,31 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        return args.func(args)
+        exit_code = args.func(args)
     except ConfigError as exc:
         parser.exit(status=2, message=f"error: {exc}\n")
+    if cli_invocation and getattr(args, "_force_exit_after_return", False):
+        # Hugging Face streaming can leave PyArrow worker threads waiting during
+        # interpreter shutdown on macOS after all dataset artifacts are written.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
+    return exit_code
+
+
+def _uses_huggingface_provider(dataset: dict[str, object]) -> bool:
+    return str(dataset.get("provider", "huggingface")) == "huggingface"
+
+
+def _suppress_resource_tracker_warning() -> None:
+    filters = [
+        item.strip()
+        for item in os.environ.get("PYTHONWARNINGS", "").split(",")
+        if item.strip()
+    ]
+    if RESOURCE_TRACKER_WARNING_FILTER not in filters:
+        filters.append(RESOURCE_TRACKER_WARNING_FILTER)
+        os.environ["PYTHONWARNINGS"] = ",".join(filters)
 
 
 if __name__ == "__main__":

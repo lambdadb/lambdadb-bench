@@ -225,7 +225,7 @@ uv run ldbbench dataset prepare \
 ```
 
 ```bash
-QDRANT_URL=https://example.qdrant.io \
+QDRANT_ENDPOINT=https://example.qdrant.io \
   uv run ldbbench run --dry-run \
     --scenario scenarios/cohere-wikipedia-1m.yaml \
     --target configs/qdrant-cloud.example.yaml \

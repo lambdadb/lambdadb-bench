@@ -10,7 +10,7 @@ the first target adapters.
 See [docs/DESIGN.md](docs/DESIGN.md) for the current design decisions, workload
 model, adapter contract, result format, and implementation phases.
 
-## Development
+## Quickstart
 
 Install the package in editable mode with development dependencies:
 
@@ -18,40 +18,31 @@ Install the package in editable mode with development dependencies:
 uv sync --extra dev
 ```
 
-Or create a virtual environment manually:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
-```
-
 Check the CLI:
 
 ```bash
-ldbbench doctor
+uv run ldbbench doctor
 ```
 
-Plan the dataset cache layout without downloading rows:
+### 1. Prepare a smoke dataset
+
+Start with a tiny row-limited dataset. This avoids a costly 1M-row run while
+verifying the end-to-end flow.
+
+This step does not use a LambdaDB or Qdrant target config. It reads the scenario
+dataset source and writes local files under `--out`. Set `HF_TOKEN` in your
+environment if you want authenticated Hugging Face downloads with higher rate
+limits.
 
 ```bash
-ldbbench dataset prepare \
-  --scenario scenarios/cohere-wikipedia-1m.yaml \
-  --dry-run
-```
-
-Prepare a tiny row-limited dataset cache for a smoke test:
-
-```bash
-ldbbench dataset prepare \
+uv run ldbbench dataset prepare \
   --scenario scenarios/cohere-wikipedia-1m.yaml \
   --limit 100 \
   --query-count 10 \
   --out data/datasets/cohere-wikipedia-1m-smoke
 ```
 
-Dataset preparation writes a raw source sample plus normalized benchmark
-artifacts:
+Dataset preparation writes:
 
 - `raw_records.jsonl`: source rows as received from the dataset provider.
 - `queries.jsonl`: held-out query vectors.
@@ -59,114 +50,114 @@ artifacts:
 - `dataset_manifest.json`: dataset source, row counts, artifact paths, and
   checksums.
 
-Compute exact ground truth for a prepared smoke dataset:
+Compute exact ground truth for the smoke dataset:
 
 ```bash
-ldbbench dataset ground-truth \
+uv run ldbbench dataset ground-truth \
   --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
   --top-k 10 \
   --backend exact
 ```
 
-Validate the example scenario and target config:
+### 2. Configure a target
+
+Use one target config per database. The checked-in files are examples:
+
+- `configs/lambdadb.example.yaml`
+- `configs/qdrant-cloud.example.yaml`
+
+For LambdaDB, set:
 
 ```bash
-QDRANT_URL=https://example.qdrant.io \
-  ldbbench config validate \
-    --scenario scenarios/cohere-wikipedia-1m.yaml \
-    --target configs/qdrant-cloud.example.yaml
+export LAMBDADB_ENDPOINT=https://api.lambdadb.ai
+export LAMBDADB_PROJECT_NAME=your-project
+export LAMBDADB_API_KEY=...
 ```
 
-Initialize a result directory with reproducibility artifacts:
+For Qdrant Cloud, set:
 
 ```bash
-QDRANT_URL=https://example.qdrant.io \
-  ldbbench manifest init \
-    --scenario scenarios/cohere-wikipedia-1m.yaml \
-    --target configs/qdrant-cloud.example.yaml \
-    --out results/example-qdrant-1m
+export QDRANT_ENDPOINT=https://example.qdrant.io
+export QDRANT_API_KEY=...
 ```
 
-Check target adapter capabilities:
+Before a real run, make sure the target config points at the collection you want
+to use. For smoke testing, `prepare.mode: create` can create the collection from
+the scenario dimensions. For existing collections, keep `prepare.mode: existing`.
+
+For a first Qdrant smoke run, copy the example target and switch it to create a
+fresh smoke collection:
 
 ```bash
-QDRANT_URL=https://example.qdrant.io \
-  ldbbench target check --target configs/qdrant-cloud.example.yaml
+cp configs/qdrant-cloud.example.yaml configs/qdrant-cloud.smoke.yaml
 ```
 
-The real Qdrant adapter uses the official `qdrant-client` package with gRPC
-preferred by default. Configure Qdrant targets with:
+Then edit `configs/qdrant-cloud.smoke.yaml`:
 
-- `endpoint`: Qdrant Cloud or self-managed Qdrant URL.
-- `api_key_env`: environment variable name containing the Qdrant API key.
-- `collection_name`: target collection. Existing `collection` configs are still
-  accepted.
-- `vector_field`: optional named vector to use. Omit this for Qdrant's default
-  unnamed vector.
-- `prefer_grpc`: boolean, defaults to `true`.
+```yaml
+collection_name: cohere_wikipedia_1m_smoke
 
-Normal unit tests do not contact Qdrant. Optional integration coverage is gated
-behind:
-
-```bash
-QDRANT_BENCH_RUN_INTEGRATION=1
-QDRANT_URL=https://example.qdrant.io
-QDRANT_API_KEY=...
-QDRANT_COLLECTION_NAME=...
+prepare:
+  mode: create
 ```
 
-Check a LambdaDB target config:
+### 3. Validate the target
+
+LambdaDB:
 
 ```bash
-LAMBDADB_ENDPOINT=https://api.lambdadb.ai \
-LAMBDADB_PROJECT_NAME=my-project \
-  ldbbench target check --target configs/lambdadb.example.yaml
+uv run ldbbench target check --target configs/lambdadb.example.yaml
 ```
 
-The real LambdaDB adapter uses the official `lambdadb` Python SDK. Configure
-LambdaDB targets with:
-
-- `endpoint`: API base URL, for example `https://api.lambdadb.ai`.
-- `project_name`: LambdaDB project name.
-- `api_key_env`: environment variable name containing the project API key.
-- `collection_name`: target collection.
-- `vector_field`: field that stores normalized benchmark vectors. Defaults to
-  `vector`.
-- `index_configs`: LambdaDB collection index config used by create/recreate
-  preparation modes.
-
-Normal unit tests do not contact LambdaDB. Optional integration coverage is
-gated behind:
+Qdrant:
 
 ```bash
-LAMBDADB_BENCH_RUN_INTEGRATION=1
-LAMBDADB_API_KEY=...
-LAMBDADB_ENDPOINT=https://api.lambdadb.ai
-LAMBDADB_PROJECT_NAME=...
-LAMBDADB_COLLECTION_NAME=...
+uv run ldbbench target check --target configs/qdrant-cloud.smoke.yaml
 ```
 
-Dry-run a benchmark plan without contacting a database:
+Validate the scenario plus target plan:
 
 ```bash
-QDRANT_URL=https://example.qdrant.io \
-  ldbbench run --dry-run \
-    --scenario scenarios/cohere-wikipedia-1m.yaml \
-    --target configs/qdrant-cloud.example.yaml \
-    --out results/example-qdrant-1m
+uv run ldbbench config validate \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.smoke.yaml
 ```
 
-Run a small real smoke benchmark against a prepared dataset:
+### 4. Dry-run the benchmark plan
+
+Dry-run writes run metadata without contacting the database:
 
 ```bash
-QDRANT_URL=https://example.qdrant.io \
-  ldbbench run \
-    --scenario scenarios/cohere-wikipedia-1m.yaml \
-    --target configs/qdrant-cloud.example.yaml \
-    --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
-    --max-records 100 \
-    --max-queries 10 \
-    --out results/example-qdrant-smoke
+uv run ldbbench run --dry-run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.smoke.yaml \
+  --out results/example-qdrant-dry-run
+```
+
+### 5. Run a real smoke benchmark
+
+Use the smoke dataset first. This contacts the configured database.
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.smoke.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+  --max-records 100 \
+  --max-queries 10 \
+  --out results/example-qdrant-smoke
+```
+
+For LambdaDB, use the LambdaDB target instead:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/lambdadb.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+  --max-records 100 \
+  --max-queries 10 \
+  --out results/example-lambdadb-smoke
 ```
 
 Real runs write:
@@ -178,6 +169,56 @@ Real runs write:
 
 Runs at 1M rows or larger require `--allow-large-run` unless `--max-records`
 keeps the run below that threshold.
+
+## Target Config Reference
+
+### LambdaDB
+
+The LambdaDB adapter uses the official `lambdadb` Python SDK. Configure
+LambdaDB targets with:
+
+- `endpoint`: API base URL, for example `https://api.lambdadb.ai`.
+- `project_name`: LambdaDB project name.
+- `api_key_env`: environment variable name containing the project API key.
+- `collection_name`: target collection.
+- `vector_field`: field that stores normalized benchmark vectors. Defaults to
+  `vector`.
+- `index_configs`: LambdaDB collection index config used by create/recreate
+  preparation modes.
+
+Optional integration coverage is gated behind:
+
+```bash
+LAMBDADB_BENCH_RUN_INTEGRATION=1
+LAMBDADB_API_KEY=...
+LAMBDADB_ENDPOINT=https://api.lambdadb.ai
+LAMBDADB_PROJECT_NAME=...
+LAMBDADB_COLLECTION_NAME=...
+```
+
+### Qdrant
+
+The Qdrant adapter uses the official `qdrant-client` package with gRPC
+preferred by default. Configure Qdrant targets with:
+
+- `endpoint`: Qdrant Cloud or self-managed Qdrant URL.
+- `api_key_env`: environment variable name containing the Qdrant API key.
+- `collection_name`: target collection. Existing `collection` configs are still
+  accepted.
+- `vector_field`: optional named vector to use. Omit this for Qdrant's default
+  unnamed vector.
+- `prefer_grpc`: boolean, defaults to `true`.
+
+Optional integration coverage is gated behind:
+
+```bash
+QDRANT_BENCH_RUN_INTEGRATION=1
+QDRANT_ENDPOINT=https://example.qdrant.io
+QDRANT_API_KEY=...
+QDRANT_COLLECTION_NAME=...
+```
+
+## Development
 
 Run tests and linting:
 

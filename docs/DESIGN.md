@@ -194,7 +194,7 @@ Example target config:
 ```yaml
 vendor: qdrant
 name: qdrant-cloud-user-cluster
-endpoint: ${QDRANT_URL}
+endpoint: ${QDRANT_ENDPOINT}
 api_key_env: QDRANT_API_KEY
 collection: cohere_wikipedia_1m
 region: us-east-1
