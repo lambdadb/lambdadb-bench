@@ -5,10 +5,12 @@ from __future__ import annotations
 from ldbbench.adapters.base import VectorDBAdapter
 from ldbbench.adapters.dryrun import DRYRUN_ADAPTERS
 from ldbbench.adapters.lambdadb import LambdaDBAdapter
+from ldbbench.adapters.qdrant import QdrantAdapter
 from ldbbench.config import ConfigError
 
 REAL_ADAPTERS = {
     "lambdadb": LambdaDBAdapter(),
+    "qdrant": QdrantAdapter(),
 }
 
 def get_adapter(vendor: str, *, dry_run: bool = False) -> VectorDBAdapter:

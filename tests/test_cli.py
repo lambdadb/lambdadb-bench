@@ -225,6 +225,7 @@ def test_target_check_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> N
 vendor: qdrant
 name: qdrant-ci
 endpoint: https://api.example.test
+collection_name: smoke
 prepare:
   mode: existing
 """,

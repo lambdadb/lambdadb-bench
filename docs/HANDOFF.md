@@ -2,7 +2,7 @@
 
 Last updated: 2026-05-11
 
-This repository is ready to continue from Phase 2-5 in a new Codex session.
+This repository is ready to continue from Phase 2-6 in a new Codex session.
 
 ## Current State
 
@@ -27,7 +27,7 @@ f2dcb0a Refine benchmark consistency and setup design
 23908ba Add initial benchmark design
 ```
 
-Current working tree contains the Phase 2-4 LambdaDB adapter changes.
+Current working tree contains the Phase 2-5 Qdrant adapter changes.
 
 ## Completed Work
 
@@ -141,6 +141,33 @@ Implementation choices:
 - `endpoint` is passed to the LambdaDB SDK as `base_url`.
 - `collection_name` is preferred in new YAML, but existing `collection` is still accepted.
 
+### Phase 2-5
+
+Qdrant adapter surface is complete.
+
+- Added `qdrant-client>=1.15.0`; local lock resolved `qdrant-client==1.18.0`.
+- Implemented `src/ldbbench/adapters/qdrant.py`.
+- Registered the real Qdrant adapter while preserving dry-run planning behavior for `ldbbench run --dry-run`.
+- Qdrant client construction uses `QdrantClient(url=..., api_key=..., prefer_grpc=True)` by default.
+- Added Qdrant target config support:
+  - `endpoint`
+  - `api_key_env`
+  - `collection_name` with legacy `collection` compatibility
+  - optional `vector_field` for named vectors
+  - optional `prefer_grpc`, defaulting to `true`
+- Implemented `existing`, `create`, and `recreate` preparation modes.
+- Implemented `upsert_batch`, `query`, and `fetch`.
+- Added fake-client unit tests for check, prepare, upsert, query, fetch, gRPC default, missing credential behavior, and strong-consistency rejection.
+- Added gated Qdrant integration coverage behind `QDRANT_BENCH_RUN_INTEGRATION=1`.
+- Updated `README.md` and `configs/qdrant-cloud.example.yaml`.
+
+Implementation choices:
+
+- Qdrant remains eventual-only in the portable benchmark consistency model.
+- benchmark `query.consistency: strong` should continue to plan as `N/A` for Qdrant.
+- unnamed Qdrant vectors are the default; setting `target.vector_field` switches create/upsert/query to named-vector mode.
+- Qdrant create mode maps benchmark metric `cosine|dot|dot_product|euclidean` to Qdrant distances `Cosine|Dot|Euclid`.
+
 ## Validation Commands
 
 Use these from repo root:
@@ -152,10 +179,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after Phase 2-4:
+Current test count after Phase 2-5:
 
 ```text
-42 passed, 1 skipped
+53 passed, 2 skipped
 ```
 
 Useful smoke commands:
@@ -179,7 +206,45 @@ QDRANT_URL=https://example.qdrant.io \
 
 ## Next Work
 
-Continue with Phase 2-5.
+Continue with Phase 2-6.
+
+## Qdrant SDK Notes
+
+Package check:
+
+- PyPI package: `qdrant-client`
+- Observed version from local install: `1.18.0`
+
+Local introspection command used:
+
+```bash
+uv run python - <<'PY'
+import inspect
+from qdrant_client import QdrantClient, models
+print(inspect.signature(QdrantClient))
+print(inspect.signature(QdrantClient.collection_exists))
+print(inspect.signature(QdrantClient.get_collection))
+print(inspect.signature(QdrantClient.create_collection))
+print(inspect.signature(QdrantClient.recreate_collection))
+print(inspect.signature(QdrantClient.upsert))
+print(inspect.signature(QdrantClient.query_points))
+print(inspect.signature(QdrantClient.retrieve))
+print(list(models.Distance))
+PY
+```
+
+Relevant observed calls:
+
+```text
+QdrantClient(url=..., api_key=..., prefer_grpc=True)
+client.collection_exists(collection_name=...)
+client.get_collection(collection_name=...)
+client.create_collection(collection_name=..., vectors_config=...)
+client.recreate_collection(collection_name=..., vectors_config=...)
+client.upsert(collection_name=..., points=..., wait=True)
+client.query_points(collection_name=..., query=..., using=..., limit=...)
+client.retrieve(collection_name=..., ids=...)
+```
 
 ## LambdaDB SDK Notes
 
@@ -291,17 +356,6 @@ collections.docs.fetch(
 ```
 
 ## Phase 2 Remaining
-
-### Phase 2-5: Qdrant Adapter
-
-- Add `qdrant-client`.
-- Use gRPC by default.
-- Implement create/existing target handling.
-- Implement upsert.
-- Implement query.
-- Keep `strong` consistency result as `N/A`.
-- Add unit tests with fake client.
-- Add gated integration tests for Qdrant Cloud.
 
 ### Phase 2-6: 1M Dry-to-Real Runner
 

@@ -94,6 +94,27 @@ QDRANT_URL=https://example.qdrant.io \
   ldbbench target check --target configs/qdrant-cloud.example.yaml
 ```
 
+The real Qdrant adapter uses the official `qdrant-client` package with gRPC
+preferred by default. Configure Qdrant targets with:
+
+- `endpoint`: Qdrant Cloud or self-managed Qdrant URL.
+- `api_key_env`: environment variable name containing the Qdrant API key.
+- `collection_name`: target collection. Existing `collection` configs are still
+  accepted.
+- `vector_field`: optional named vector to use. Omit this for Qdrant's default
+  unnamed vector.
+- `prefer_grpc`: boolean, defaults to `true`.
+
+Normal unit tests do not contact Qdrant. Optional integration coverage is gated
+behind:
+
+```bash
+QDRANT_BENCH_RUN_INTEGRATION=1
+QDRANT_URL=https://example.qdrant.io
+QDRANT_API_KEY=...
+QDRANT_COLLECTION_NAME=...
+```
+
 Check a LambdaDB target config:
 
 ```bash

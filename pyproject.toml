@@ -28,6 +28,7 @@ dependencies = [
   "datasets>=2.20",
   "lambdadb>=0.7.5",
   "PyYAML>=6.0",
+  "qdrant-client>=1.15.0",
 ]
 
 [project.optional-dependencies]
