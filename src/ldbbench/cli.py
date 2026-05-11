@@ -340,9 +340,12 @@ def run_benchmark(args: argparse.Namespace) -> int:
             allow_destructive=args.allow_destructive,
             allow_large_run=args.allow_large_run,
         )
-        print("run: completed")
+        print(f"run: {result.summary['status']}")
         print(f"records: {result.summary['load']['records']}")
         print(f"queries: {result.summary['query']['queries']}")
+        if result.summary["query"]["errors"]:
+            print(f"errors: {result.summary['query']['errors']}")
+            print(f"error_rate: {result.summary['query']['error_rate']}")
         if result.summary["query"]["recall_at_k"] is not None:
             print(f"recall_at_k: {result.summary['query']['recall_at_k']}")
         print(f"wrote {result.ingest_events_path}")

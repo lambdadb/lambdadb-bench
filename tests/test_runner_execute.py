@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+from threading import Lock
 from typing import Any
 
 import pytest
@@ -31,10 +33,19 @@ class FakeAdapter:
         supported_query_consistency=frozenset({"eventual"}),
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail_every: int = 0,
+        query_delay_seconds: float = 0.0,
+    ) -> None:
         self.prepared: dict[str, Any] | None = None
         self.upserted: list[list[VectorRecord]] = []
         self.queries: list[list[float]] = []
+        self.fail_every = fail_every
+        self.query_delay_seconds = query_delay_seconds
+        self.query_calls = 0
+        self._lock = Lock()
 
     def check(self, target: TargetConfig) -> CheckResult:
         return CheckResult(ok=True, message="ok")
@@ -71,7 +82,14 @@ class FakeAdapter:
         include_vectors: bool = False,
         filter_query: dict[str, Any] | None = None,
     ) -> QueryResult:
-        self.queries.append(vector)
+        if self.query_delay_seconds:
+            time.sleep(self.query_delay_seconds)
+        with self._lock:
+            self.query_calls += 1
+            call_number = self.query_calls
+            self.queries.append(vector)
+        if self.fail_every and call_number % self.fail_every == 0:
+            raise RuntimeError("planned query failure")
         return QueryResult(
             matches=[
                 QueryMatch(id="a", score=1.0, document={"id": "a"}),
@@ -90,7 +108,18 @@ class FakeAdapter:
         return [{"id": item} for item in ids]
 
 
-def make_scenario(*, rows: int = 3) -> ScenarioConfig:
+def make_scenario(
+    *,
+    rows: int = 3,
+    stages: list[dict[str, Any]] | None = None,
+) -> ScenarioConfig:
+    query: dict[str, Any] = {
+        "top_k": 2,
+        "query_count": 1,
+        "consistency": "eventual",
+    }
+    if stages is not None:
+        query["stages"] = stages
     return ScenarioConfig.from_mapping(
         {
             "name": "runner-smoke",
@@ -105,7 +134,7 @@ def make_scenario(*, rows: int = 3) -> ScenarioConfig:
                 "metric": "cosine",
             },
             "load": {"write_mode": "upsert", "batch_size": 2},
-            "query": {"top_k": 2, "query_count": 1, "consistency": "eventual"},
+            "query": query,
         }
     )
 
@@ -159,7 +188,13 @@ prepare:
     return scenario_path, target_path
 
 
-def prepare_fixture_dataset(tmp_path, scenario: ScenarioConfig):
+def prepare_fixture_dataset(
+    tmp_path,
+    scenario: ScenarioConfig,
+    *,
+    limit: int = 3,
+    query_count: int = 1,
+):
     rows = [
         {"_id": "query", "emb": [1.0, 0.0], "text": "query"},
         {"_id": "a", "emb": [1.0, 0.0], "text": "alpha"},
@@ -169,8 +204,8 @@ def prepare_fixture_dataset(tmp_path, scenario: ScenarioConfig):
     return prepare_dataset(
         scenario=scenario,
         output_dir=tmp_path / "dataset",
-        limit=3,
-        query_count=1,
+        limit=limit,
+        query_count=query_count,
         source_rows=rows,
     )
 
@@ -240,6 +275,69 @@ def test_execute_benchmark_can_limit_records_and_queries(tmp_path) -> None:
 
     assert result.summary["load"]["records"] == 1
     assert result.summary["query"]["queries"] == 1
+    assert result.summary["query"]["mode"] == "one_pass"
+
+
+def test_execute_benchmark_runs_duration_query_stages(tmp_path) -> None:
+    scenario = make_scenario(stages=[{"concurrency": 2, "duration": "50ms"}])
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario, limit=2, query_count=2)
+    adapter = FakeAdapter(query_delay_seconds=0.001)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result.summary["query"]["mode"] == "staged"
+    assert result.summary["query"]["queries"] > 2
+    assert result.summary["query"]["errors"] == 0
+    assert result.summary["query"]["stages"][0]["concurrency"] == 2
+    assert result.summary["query"]["stages"][0]["queries"] == len(query_events)
+    assert {event["query_stage_index"] for event in query_events} == {1}
+    assert {event["worker_index"] for event in query_events} == {1, 2}
+
+
+def test_execute_benchmark_records_query_errors(tmp_path) -> None:
+    scenario = make_scenario()
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario, limit=2, query_count=2)
+    adapter = FakeAdapter(fail_every=2)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        max_queries=2,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result.summary["status"] == "completed_with_errors"
+    assert result.summary["query"]["queries"] == 1
+    assert result.summary["query"]["errors"] == 1
+    assert result.summary["query"]["error_rate"] == 0.5
+    assert [event["status"] for event in query_events] == ["ok", "error"]
+    assert query_events[1]["error_type"] == "RuntimeError"
 
 
 def test_execute_benchmark_requires_large_run_opt_in(tmp_path) -> None:

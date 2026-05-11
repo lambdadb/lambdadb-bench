@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from ldbbench.adapters.base import VectorDBAdapter, VectorRecord
@@ -120,19 +122,23 @@ def execute_benchmark(
         batch_size=_batch_size(scenario),
         events_path=ingest_events_path,
     )
+    queries = list(read_records(queries_path, limit=max_queries))
     query_summary = run_query_stage(
         adapter=adapter,
         target=target,
-        queries=read_records(queries_path, limit=max_queries),
+        queries=queries,
         top_k=_top_k(scenario),
         consistency=str(scenario.query.get("consistency", "eventual")),
         include_vectors=bool(scenario.query.get("include_vectors", False)),
         ground_truth=ground_truth,
         events_path=query_events_path,
+        stages=None if max_queries is not None else _query_stages(scenario),
     )
 
     summary = {
-        "status": "completed",
+        "status": "completed"
+        if query_summary["errors"] == 0
+        else "completed_with_errors",
         "run_manifest": str(paths.run_manifest),
         "dataset_dir": str(dataset_path),
         "ground_truth": str(truth_path) if truth_path.exists() else None,
@@ -209,59 +215,301 @@ def run_query_stage(
     include_vectors: bool,
     ground_truth: Mapping[str, list[str]],
     events_path: str | Path,
+    stages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     events_output = Path(events_path)
     events_output.parent.mkdir(parents=True, exist_ok=True)
+    query_list = list(queries)
+    if not query_list:
+        events_output.write_text("", encoding="utf-8")
+        return _query_summary(
+            mode="staged" if stages else "one_pass",
+            started=time.perf_counter(),
+            latencies=[],
+            recalls=[],
+            query_count=0,
+            error_count=0,
+            stage_summaries=[],
+        )
 
-    query_count = 0
-    latencies: list[float] = []
-    recalls: list[float] = []
+    if stages:
+        return run_staged_query_stage(
+            adapter=adapter,
+            target=target,
+            queries=query_list,
+            top_k=top_k,
+            consistency=consistency,
+            include_vectors=include_vectors,
+            ground_truth=ground_truth,
+            events_path=events_output,
+            stages=stages,
+        )
+
+    state = QueryRunState()
     started = time.perf_counter()
     with events_output.open("w", encoding="utf-8") as file:
-        for query_index, query in enumerate(queries, start=1):
-            query_started = time.perf_counter()
-            result = adapter.query(
-                target,
-                vector=query.vector,
+        for query_index, query in enumerate(query_list, start=1):
+            event = execute_query_once(
+                adapter=adapter,
+                target=target,
+                query=query,
+                query_index=query_index,
+                query_stage_index=None,
+                worker_index=None,
                 top_k=top_k,
                 consistency=consistency,
                 include_vectors=include_vectors,
+                ground_truth=ground_truth,
             )
-            latency_ms = _elapsed_ms(query_started)
-            match_ids = [match.id for match in result.matches]
-            recall = recall_at_k(
-                actual=match_ids,
-                expected=ground_truth.get(query.id),
-                k=top_k,
+            state.record(event)
+            _write_event(file, event)
+
+    return _query_summary(
+        mode="one_pass",
+        started=started,
+        latencies=state.latencies,
+        recalls=state.recalls,
+        query_count=state.queries,
+        error_count=state.errors,
+        stage_summaries=[],
+    )
+
+
+def run_staged_query_stage(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    queries: list[VectorRecord],
+    top_k: int,
+    consistency: str,
+    include_vectors: bool,
+    ground_truth: Mapping[str, list[str]],
+    events_path: Path,
+    stages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    query_lock = Lock()
+    write_lock = Lock()
+    state = QueryRunState()
+    next_query_index = 1
+    started = time.perf_counter()
+    stage_summaries: list[dict[str, Any]] = []
+
+    with events_path.open("w", encoding="utf-8") as file:
+        for stage_index, stage in enumerate(stages, start=1):
+            concurrency = _stage_concurrency(stage, stage_index=stage_index)
+            duration_seconds = parse_duration_seconds(
+                _stage_duration(stage, stage_index=stage_index)
             )
-            if recall is not None:
-                recalls.append(recall)
-            latencies.append(latency_ms)
-            query_count += 1
-            file.write(
-                json.dumps(
-                    {
-                        "stage": "query",
-                        "query_index": query_index,
-                        "query_id": query.id,
-                        "matches": match_ids,
-                        "latency_ms": latency_ms,
-                        "recall_at_k": recall,
-                        "status": "ok",
-                    },
-                    sort_keys=True,
+            deadline = time.perf_counter() + duration_seconds
+            stage_state = QueryRunState()
+            stage_started = time.perf_counter()
+
+            def next_query(
+                stage_deadline: float = deadline,
+            ) -> tuple[int, VectorRecord] | None:
+                nonlocal next_query_index
+                with query_lock:
+                    if time.perf_counter() >= stage_deadline:
+                        return None
+                    query_index = next_query_index
+                    query = queries[(query_index - 1) % len(queries)]
+                    next_query_index += 1
+                    return query_index, query
+
+            def worker(
+                worker_index: int,
+                current_stage_index: int = stage_index,
+                current_stage_state: QueryRunState = stage_state,
+            ) -> None:
+                while True:
+                    item = next_query()
+                    if item is None:
+                        return
+                    query_index, query = item
+                    event = execute_query_once(
+                        adapter=adapter,
+                        target=target,
+                        query=query,
+                        query_index=query_index,
+                        query_stage_index=current_stage_index,
+                        worker_index=worker_index,
+                        top_k=top_k,
+                        consistency=consistency,
+                        include_vectors=include_vectors,
+                        ground_truth=ground_truth,
+                    )
+                    with write_lock:
+                        state.record(event)
+                        current_stage_state.record(event)
+                        _write_event(file, event)
+
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = [
+                    executor.submit(worker, index)
+                    for index in range(1, concurrency + 1)
+                ]
+                for future in futures:
+                    future.result()
+
+            stage_summaries.append(
+                _query_stage_summary(
+                    stage_index=stage_index,
+                    concurrency=concurrency,
+                    configured_duration_seconds=duration_seconds,
+                    elapsed_seconds=time.perf_counter() - stage_started,
+                    state=stage_state,
                 )
-                + "\n"
             )
 
+    return _query_summary(
+        mode="staged",
+        started=started,
+        latencies=state.latencies,
+        recalls=state.recalls,
+        query_count=state.queries,
+        error_count=state.errors,
+        stage_summaries=stage_summaries,
+    )
+
+
+@dataclass
+class QueryRunState:
+    queries: int = 0
+    errors: int = 0
+    latencies: list[float] = field(default_factory=list)
+    recalls: list[float] = field(default_factory=list)
+
+    def record(self, event: Mapping[str, Any]) -> None:
+        if event["status"] == "ok":
+            self.queries += 1
+            latency_ms = event.get("latency_ms")
+            if isinstance(latency_ms, int | float):
+                self.latencies.append(float(latency_ms))
+            recall = event.get("recall_at_k")
+            if isinstance(recall, int | float):
+                self.recalls.append(float(recall))
+        else:
+            self.errors += 1
+
+
+def execute_query_once(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    query: VectorRecord,
+    query_index: int,
+    query_stage_index: int | None,
+    worker_index: int | None,
+    top_k: int,
+    consistency: str,
+    include_vectors: bool,
+    ground_truth: Mapping[str, list[str]],
+) -> dict[str, Any]:
+    query_started = time.perf_counter()
+    base_event: dict[str, Any] = {
+        "stage": "query",
+        "query_index": query_index,
+        "query_id": query.id,
+    }
+    if query_stage_index is not None:
+        base_event["query_stage_index"] = query_stage_index
+    if worker_index is not None:
+        base_event["worker_index"] = worker_index
+
+    try:
+        result = adapter.query(
+            target,
+            vector=query.vector,
+            top_k=top_k,
+            consistency=consistency,
+            include_vectors=include_vectors,
+        )
+    except Exception as exc:  # noqa: BLE001
+        base_event.update(
+            {
+                "error_message": str(exc),
+                "error_type": type(exc).__name__,
+                "latency_ms": _elapsed_ms(query_started),
+                "status": "error",
+            }
+        )
+        return base_event
+
+    match_ids = [match.id for match in result.matches]
+    recall = recall_at_k(
+        actual=match_ids,
+        expected=ground_truth.get(query.id),
+        k=top_k,
+    )
+    base_event.update(
+        {
+            "matches": match_ids,
+            "latency_ms": _elapsed_ms(query_started),
+            "recall_at_k": recall,
+            "status": "ok",
+        }
+    )
+    return base_event
+
+
+def _write_event(file: Any, event: Mapping[str, Any]) -> None:
+    file.write(json.dumps(dict(event), sort_keys=True) + "\n")
+    file.flush()
+
+
+def _query_summary(
+    *,
+    mode: str,
+    started: float,
+    latencies: list[float],
+    recalls: list[float],
+    query_count: int,
+    error_count: int,
+    stage_summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
     duration_seconds = time.perf_counter() - started
-    return {
+    attempts = query_count + error_count
+    summary: dict[str, Any] = {
+        "mode": mode,
         "queries": query_count,
+        "errors": error_count,
+        "attempts": attempts,
+        "error_rate": _error_rate(error_count, attempts),
         "duration_seconds": duration_seconds,
         "queries_per_second": _rate(query_count, duration_seconds),
+        "attempts_per_second": _rate(attempts, duration_seconds),
         "latency_ms": latency_summary(latencies),
         "recall_at_k": _mean(recalls) if recalls else None,
         "recall_samples": len(recalls),
+    }
+    if stage_summaries:
+        summary["stages"] = stage_summaries
+    return summary
+
+
+def _query_stage_summary(
+    *,
+    stage_index: int,
+    concurrency: int,
+    configured_duration_seconds: float,
+    elapsed_seconds: float,
+    state: QueryRunState,
+) -> dict[str, Any]:
+    attempts = state.queries + state.errors
+    return {
+        "stage_index": stage_index,
+        "concurrency": concurrency,
+        "configured_duration_seconds": configured_duration_seconds,
+        "duration_seconds": elapsed_seconds,
+        "queries": state.queries,
+        "errors": state.errors,
+        "attempts": attempts,
+        "error_rate": _error_rate(state.errors, attempts),
+        "queries_per_second": _rate(state.queries, elapsed_seconds),
+        "attempts_per_second": _rate(attempts, elapsed_seconds),
+        "latency_ms": latency_summary(state.latencies),
+        "recall_at_k": _mean(state.recalls) if state.recalls else None,
+        "recall_samples": len(state.recalls),
     }
 
 
@@ -375,6 +623,68 @@ def _top_k(scenario: ScenarioConfig) -> int:
     return top_k
 
 
+def _query_stages(scenario: ScenarioConfig) -> list[dict[str, Any]] | None:
+    stages = scenario.query.get("stages")
+    if not stages:
+        return None
+    if not isinstance(stages, list):
+        raise ConfigError("scenario.query.stages must be a list")
+    return [
+        dict(_as_stage_mapping(stage, stage_index=index))
+        for index, stage in enumerate(stages, start=1)
+    ]
+
+
+def _as_stage_mapping(stage: Any, *, stage_index: int) -> Mapping[str, Any]:
+    if not isinstance(stage, Mapping):
+        raise ConfigError(f"scenario.query.stages[{stage_index}] must be a mapping")
+    return stage
+
+
+def _stage_concurrency(stage: Mapping[str, Any], *, stage_index: int) -> int:
+    concurrency = stage.get("concurrency")
+    if not isinstance(concurrency, int) or concurrency <= 0:
+        raise ConfigError(
+            f"scenario.query.stages[{stage_index}].concurrency "
+            "must be a positive integer"
+        )
+    return concurrency
+
+
+def _stage_duration(stage: Mapping[str, Any], *, stage_index: int) -> str:
+    duration = stage.get("duration")
+    if not isinstance(duration, str):
+        raise ConfigError(
+            f"scenario.query.stages[{stage_index}].duration must be a string"
+        )
+    return duration
+
+
+def parse_duration_seconds(value: str) -> float:
+    text = value.strip().lower()
+    units = {
+        "ms": 0.001,
+        "s": 1.0,
+        "m": 60.0,
+        "h": 3600.0,
+    }
+    multiplier = 1.0
+    for suffix, unit_multiplier in units.items():
+        if text.endswith(suffix):
+            number = text[: -len(suffix)].strip()
+            multiplier = unit_multiplier
+            break
+    else:
+        number = text
+    try:
+        seconds = float(number) * multiplier
+    except ValueError as exc:
+        raise ConfigError(f"invalid duration {value!r}") from exc
+    if seconds <= 0:
+        raise ConfigError(f"duration {value!r} must be positive")
+    return seconds
+
+
 def _dataset_dimensions(
     scenario: ScenarioConfig,
     dataset_manifest: Mapping[str, Any],
@@ -425,6 +735,12 @@ def _rate(count: int, duration_seconds: float) -> float:
     if duration_seconds <= 0:
         return 0.0
     return count / duration_seconds
+
+
+def _error_rate(error_count: int, attempts: int) -> float:
+    if attempts <= 0:
+        return 0.0
+    return error_count / attempts
 
 
 def _mean(values: list[float]) -> float:

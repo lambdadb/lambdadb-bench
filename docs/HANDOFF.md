@@ -2,7 +2,7 @@
 
 Last updated: 2026-05-12
 
-This repository is ready to continue from Phase 2-6 stage 2 in a new Codex session.
+This repository is ready to continue after Phase 2-6 stage 2 in a new Codex session.
 
 ## Current State
 
@@ -191,10 +191,9 @@ for normal tests.
 
 Remaining Phase 2-6 work:
 
-- Add true concurrent query stages based on `scenario.query.stages`.
-- Add duration-based query loops rather than one pass over `queries.jsonl`.
-- Add richer error event handling and partial-run summaries.
 - Run real LambdaDB/Qdrant endpoint smoke tests once credentials are available.
+- Decide whether load-stage failures should also write partial summaries before
+  exiting.
 
 ## Validation Commands
 
@@ -207,10 +206,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after Phase 2-6 stage 1:
+Current test count after Phase 2-6 stage 2:
 
 ```text
-59 passed, 2 skipped
+61 passed, 2 skipped
 ```
 
 Useful smoke commands:
@@ -387,11 +386,27 @@ collections.docs.fetch(
 
 ### Phase 2-6 Stage 2: Concurrent/Duration Runner
 
-- Execute `scenario.query.stages` with configured concurrency and duration.
-- Keep sequential one-pass mode for smoke tests.
-- Preserve `ingest_events.jsonl`, `query_events.jsonl`, and `summary.json`.
-- Add robust error events and non-zero error-rate summaries.
-- Validate against real LambdaDB and Qdrant endpoints when credentials are available.
+Concurrent/duration query execution is implemented for normal tests without
+requiring real endpoints.
+
+- `ldbbench run` keeps bounded one-pass query mode when `--max-queries` is set.
+- Without `--max-queries`, the runner executes `scenario.query.stages` by
+  cycling through prepared query rows for each configured concurrency/duration
+  stage.
+- Added threaded query execution with per-event `query_stage_index` and
+  `worker_index`.
+- `query_events.jsonl` now records query errors as structured events instead of
+  aborting the whole run.
+- `summary.json` now includes query mode, attempts, errors, error rate, and
+  per-stage summaries.
+- CLI output reports `completed_with_errors`, error count, and error rate when
+  query attempts fail.
+- Added fake-adapter tests for staged duration mode and query error summaries.
+
+Remaining validation:
+
+- Validate against real LambdaDB and Qdrant endpoints when credentials are
+  available.
 
 ## Later Work
 

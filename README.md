@@ -137,6 +137,9 @@ uv run ldbbench run --dry-run \
 ### 5. Run a real smoke benchmark
 
 Use the smoke dataset first. This contacts the configured database.
+Supplying `--max-queries` keeps the query step in bounded one-pass smoke mode.
+Without `--max-queries`, `run` uses `scenario.query.stages` and repeats the
+prepared query set for each configured concurrency/duration stage.
 
 ```bash
 uv run ldbbench run \
@@ -163,9 +166,9 @@ uv run ldbbench run \
 Real runs write:
 
 - `ingest_events.jsonl`: one event per upsert batch.
-- `query_events.jsonl`: one event per query.
-- `summary.json`: load/query counts, latency percentiles, QPS, and recall when
-  `ground_truth.jsonl` is present.
+- `query_events.jsonl`: one event per query attempt, including query errors.
+- `summary.json`: load/query counts, latency percentiles, QPS, per-stage query
+  summaries, error rate, and recall when `ground_truth.jsonl` is present.
 
 Runs at 1M rows or larger require `--allow-large-run` unless `--max-records`
 keeps the run below that threshold.
