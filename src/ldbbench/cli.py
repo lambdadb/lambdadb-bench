@@ -8,6 +8,7 @@ import json
 from ldbbench.__about__ import __version__
 from ldbbench.adapters import get_adapter
 from ldbbench.config import ConfigError, load_scenario, load_target
+from ldbbench.datasets import default_dataset_output_dir, prepare_dataset
 from ldbbench.manifest import initialize_run_artifacts
 from ldbbench.runner import build_run_plan
 
@@ -60,6 +61,32 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--target", required=True, help="Path to target YAML.")
     init.add_argument("--out", required=True, help="Output result directory.")
     init.set_defaults(func=run_manifest_init)
+
+    dataset = subcommands.add_parser(
+        "dataset",
+        help="Prepare benchmark datasets.",
+    )
+    dataset_subcommands = dataset.add_subparsers(dest="dataset_command")
+    prepare = dataset_subcommands.add_parser(
+        "prepare",
+        help="Prepare local dataset cache artifacts.",
+    )
+    prepare.add_argument("--scenario", required=True, help="Path to scenario YAML.")
+    prepare.add_argument(
+        "--out",
+        help="Output dataset cache directory. Defaults to data/datasets/<scenario>.",
+    )
+    prepare.add_argument(
+        "--limit",
+        type=int,
+        help="Limit rows to prepare. Useful for smoke tests.",
+    )
+    prepare.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write only the dataset manifest without downloading rows.",
+    )
+    prepare.set_defaults(func=run_dataset_prepare)
 
     target = subcommands.add_parser(
         "target",
@@ -138,6 +165,25 @@ def run_manifest_init(args: argparse.Namespace) -> int:
     print(f"wrote {paths.run_manifest}")
     print(f"wrote {paths.scenario_resolved}")
     print(f"wrote {paths.target_redacted}")
+    return 0
+
+
+def run_dataset_prepare(args: argparse.Namespace) -> int:
+    scenario = load_scenario(args.scenario)
+    output_dir = args.out or default_dataset_output_dir(scenario)
+    result = prepare_dataset(
+        scenario=scenario,
+        output_dir=output_dir,
+        limit=args.limit,
+        dry_run=args.dry_run,
+    )
+    print(f"dataset: {scenario.name}")
+    print(f"status: {result.manifest['status']}")
+    print(f"requested_rows: {result.manifest['dataset']['requested_rows']}")
+    print(f"written_rows: {result.manifest['dataset']['written_rows']}")
+    print(f"wrote {result.manifest_path}")
+    if not args.dry_run:
+        print(f"wrote {result.raw_records_path}")
     return 0
 
 

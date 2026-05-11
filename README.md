@@ -32,6 +32,23 @@ Check the CLI:
 ldbbench doctor
 ```
 
+Plan the dataset cache layout without downloading rows:
+
+```bash
+ldbbench dataset prepare \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --dry-run
+```
+
+Prepare a tiny row-limited dataset cache for a smoke test:
+
+```bash
+ldbbench dataset prepare \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --limit 100 \
+  --out data/datasets/cohere-wikipedia-1m-smoke
+```
+
 Validate the example scenario and target config:
 
 ```bash

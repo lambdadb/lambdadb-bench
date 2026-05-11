@@ -25,6 +25,7 @@ classifiers = [
   "Topic :: Software Development :: Testing"
 ]
 dependencies = [
+  "datasets>=2.20",
   "PyYAML>=6.0"
 ]
 

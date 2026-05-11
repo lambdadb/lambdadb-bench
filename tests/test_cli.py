@@ -73,6 +73,48 @@ prepare:
     assert "target: qdrant-ci (qdrant)" in captured.out
 
 
+def test_dataset_prepare_dry_run_command(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    output_dir = tmp_path / "dataset"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  provider: huggingface
+  source: demo/source
+  rows: 10
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "dataset",
+            "prepare",
+            "--scenario",
+            str(scenario_path),
+            "--out",
+            str(output_dir),
+            "--limit",
+            "3",
+            "--dry-run",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "status: planned" in captured.out
+    assert (output_dir / "dataset_manifest.json").exists()
+
+
 def test_manifest_init_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
     scenario_path = tmp_path / "scenario.yaml"
     target_path = tmp_path / "target.yaml"
