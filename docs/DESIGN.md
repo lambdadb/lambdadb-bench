@@ -21,6 +21,11 @@ latency, throughput, recall, write visibility, errors, and cost assumptions.
 - First meaningful dataset size: `1M` rows.
 - First public-scale dataset size: `10M` rows.
 - Cluster, index, and region setup are user-managed.
+- Target preparation supports `existing` and `create` from the first release.
+- `recreate` must require an explicit destructive flag.
+- Qdrant uses gRPC by default.
+- Public reports use a user-provided target label plus a redacted hostname.
+- `10M` exact ground truth generation is handled as a separate prepare step.
 - Public results must include redacted target metadata and user-declared
   deployment settings.
 
@@ -95,6 +100,46 @@ Follow-up workloads:
 - Idle-to-burst serverless workload.
 - Write visibility workload.
 
+### Write Modes
+
+Write workloads should make the write path explicit. This matters because
+different write APIs can have different acknowledgement and consistency
+semantics.
+
+Initial write modes:
+
+- `upsert`: regular per-record or batched SDK upsert path.
+- `bulk_upsert`: bulk loading path optimized for larger imports.
+
+For LambdaDB, the first write benchmark should prefer `upsert` because it
+matches the read-after-write path most users exercise in interactive agent and
+RAG applications. `bulk_upsert` should remain available as a separate scenario
+for large offline imports.
+
+Read consistency should also be explicit:
+
+- `eventual`: query using the default eventual-consistency path.
+- `strong`: query using the database's strong-consistency or consistent-read
+  option, when supported.
+
+For LambdaDB `upsert` with strong consistency enabled, query-time
+read-after-write consistency is expected, so the benchmark should not report
+query visibility lag as if it were an indexing delay. It should instead report
+the cost and latency of the strong-consistency read path separately from the
+default eventual-consistency query path.
+
+Not every adapter will support every consistency level. If a scenario requests
+`strong` and the target cannot provide a comparable read-after-write guarantee,
+the runner should mark that result as `N/A` rather than silently falling back to
+eventual reads or approximating strong consistency with a sleep.
+
+Vendor-specific consistency controls should be recorded separately from the
+portable `eventual`/`strong` scenario enum. For example, Qdrant exposes replica
+read-consistency settings such as `all`, `majority`, and `quorum` in distributed
+deployments; those settings should be captured in target metadata, but should
+not be treated as equivalent to LambdaDB's strong read-after-write query path
+unless the adapter can validate the same guarantee for this benchmark.
+
 ## Fairness Model
 
 The benchmark should compare user-visible outcomes under the same workload,
@@ -110,6 +155,8 @@ Required run metadata:
 - Vendor and adapter version.
 - SDK name and SDK version.
 - Protocol, when relevant, such as REST or gRPC.
+- Adapter capabilities, including supported consistency levels.
+- User-provided target label.
 - Endpoint hostname with secrets redacted.
 - User-declared deployment mode.
 - User-declared region.
@@ -137,8 +184,10 @@ Target preparation modes:
 - `recreate`: delete and create a clean target. This should require an explicit
   destructive flag.
 
-The initial public comparison should prefer `existing` mode. `create` is useful
-for local development and repeatable smoke testing.
+The first release should support both `existing` and `create`. `existing` keeps
+the benchmark useful for real user-managed deployments. `create` is important
+for convenient setup and repeatable smoke testing. `recreate` is useful, but it
+must require an explicit destructive flag.
 
 Example target config:
 
@@ -157,6 +206,7 @@ metadata:
   deployment_mode: cloud
   user_declared_config: "1 node, user-selected size, no quantization"
   pricing_notes: "User-provided monthly cluster cost"
+  report_label: "qdrant-cloud-grpc"
 ```
 
 ## Scenario Format
@@ -181,7 +231,7 @@ dataset:
   seed: 20260511
 
 load:
-  mode: bulk
+  write_mode: upsert
   batch_size: 500
   max_batch_bytes: 200MB
   wait_until_query_visible: true
@@ -190,6 +240,7 @@ query:
   top_k: 10
   query_count: 1000
   query_source: heldout_dataset_vectors
+  consistency: eventual
   include_vectors: false
   warmup:
     enabled: true
@@ -242,7 +293,8 @@ ldbbench report results/* --out reports/cohere-wikipedia-1m.md
 Recommended subcommands:
 
 - `dataset prepare`: download, sample, normalize, and cache dataset files.
-- `dataset ground-truth`: compute exact nearest neighbors for query vectors.
+- `dataset ground-truth`: compute exact nearest neighbors for query vectors as
+  a separate prepare step.
 - `target check`: validate credentials, endpoint reachability, and target
   metadata.
 - `load`: load records without running queries.
@@ -267,6 +319,20 @@ class VectorDBAdapter:
 Adapter implementations may use vendor-specific SDK features, but the runner
 should only depend on the common interface.
 
+Adapters should declare capabilities before a run starts:
+
+```python
+class AdapterCapabilities:
+    supported_write_modes: set[str]
+    supported_query_consistency: set[str]
+    supports_read_after_write_strong: bool
+    vendor_consistency_options: dict[str, object]
+```
+
+The runner should use these capabilities to decide whether a scenario is
+supported, unsupported, or partially reportable. Unsupported measurements should
+be reported as `N/A` with a short reason.
+
 ## Measurements
 
 ### Ingest
@@ -282,7 +348,10 @@ Measure:
 - Time to query-visible.
 
 Write visibility should be reported separately from API acknowledgement time.
-This matters for systems with asynchronous indexing.
+This matters for systems with asynchronous indexing. If a scenario uses a write
+mode and query consistency option that guarantees read-after-write visibility,
+the report should mark visibility as guaranteed by configuration rather than
+measuring it as a lagging background-indexing process.
 
 ### Query
 
@@ -295,6 +364,8 @@ Measure for each concurrency stage:
 - QPS.
 - p50, p95, and p99 latency.
 - Recall@10, when ground truth is available.
+- Consistency mode used for the query path.
+- Unsupported consistency results as `N/A`, with a reason.
 
 Latency should be measured client-side around the SDK call. The report should
 state that this includes network and SDK overhead.
@@ -359,6 +430,7 @@ but mark the result as not meeting the quality target.
 - Result directory and manifest writer.
 - Adapter base interface.
 - Dataset cache layout.
+- Target `existing` and `create` preparation modes.
 
 ### Phase 2: 1M Cohere Wikipedia
 
@@ -366,7 +438,7 @@ but mark the result as not meeting the quality target.
 - Held-out query sampling.
 - Exact ground truth generation for recall@10.
 - LambdaDB adapter.
-- Qdrant adapter.
+- Qdrant adapter using gRPC by default.
 - 1M ingest and query run.
 
 ### Phase 3: Pinecone Serverless
@@ -378,7 +450,8 @@ but mark the result as not meeting the quality target.
 ### Phase 4: 10M Scale Run
 
 - 10M dataset preparation.
-- Ground truth generation strategy that is practical for local or cloud runners.
+- Separate exact ground truth prepare step that can run on a suitable local
+  machine or cloud runner.
 - Long-running ingest and query reporting.
 - Public report template.
 
@@ -389,16 +462,14 @@ but mark the result as not meeting the quality target.
 - Write visibility workload.
 - Optional filtered search workload.
 
-## Open Questions
+## Resolved Decisions
 
-- Which LambdaDB Python SDK version should be the first supported minimum?
-- Should the first Qdrant adapter use REST, gRPC, or expose both as target config?
-- What is the expected largest local machine or cloud runner for exact ground
-  truth generation at 10M scale?
-- Should public reports include raw endpoint hostnames, redacted hostnames, or
-  user-provided labels only?
-- Should `create` mode be available in the first release, or should the first
-  version support only existing targets?
+- LambdaDB Python SDK: use the latest stable SDK as the first supported minimum.
+- Qdrant protocol: use gRPC by default.
+- `10M` exact ground truth: generate it as a separate prepare step.
+- Public endpoint display: use a user-provided target label plus a redacted
+  hostname.
+- Target setup: support `existing` and `create` in the first release.
 
 ## References
 
