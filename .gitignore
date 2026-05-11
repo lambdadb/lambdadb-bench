@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local benchmark artifacts can be very large.
+data/
+results/
+reports/
+
+# Local credentials/configs.
+.env
+configs/*.local.yaml
+
