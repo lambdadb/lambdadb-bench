@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lambdadb-bench"
+version = "0.1.0"
+description = "Reproducible benchmark harness for LambdaDB and comparable managed vector databases."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "LambdaDB" }
+]
+keywords = ["lambdadb", "benchmark", "vector-database", "rag"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database",
+  "Topic :: Software Development :: Testing"
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6.0"
+]
+
+[project.scripts]
+ldbbench = "ldbbench.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lambdadb/lambdadb-bench"
+Repository = "https://github.com/lambdadb/lambdadb-bench"
+Issues = "https://github.com/lambdadb/lambdadb-bench/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ldbbench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+

@@ -10,3 +10,31 @@ the first target adapters.
 See [docs/DESIGN.md](docs/DESIGN.md) for the current design decisions, workload
 model, adapter contract, result format, and implementation phases.
 
+## Development
+
+Install the package in editable mode with development dependencies:
+
+```bash
+uv sync --extra dev
+```
+
+Or create a virtual environment manually:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+Check the CLI:
+
+```bash
+ldbbench doctor
+```
+
+Run tests and linting:
+
+```bash
+uv run python -m pytest
+uv run ruff check .
+```
