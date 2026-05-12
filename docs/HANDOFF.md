@@ -53,6 +53,11 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - Dataset prepare computes artifact SHA256 digests while writing JSONL files,
   so full 1M prepares no longer pause silently after `wrote artifacts` to
   re-read large files for checksums.
+- LambdaDB, Qdrant, and Pinecone adapters cache SDK clients/index handles per
+  target settings instead of recreating them for every batch/query.
+- Load summaries now separate runner-side batching time from adapter upsert
+  attempt time with `records_read`, `batching_duration_seconds`,
+  `batching_records_per_second`, and `upsert_attempt_duration_seconds`.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
@@ -243,10 +248,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after Pinecone adapter work:
+Current test count after load generator observability work:
 
 ```text
-87 passed, 3 skipped
+90 passed, 3 skipped
 ```
 
 Useful smoke commands:

@@ -165,6 +165,29 @@ def test_prepare_existing_checks_index() -> None:
     assert client.describe_index_calls == ["smoke-index"]
 
 
+def test_adapter_reuses_client_and_index_for_same_target() -> None:
+    clients: list[FakeClient] = []
+    client = FakeClient()
+
+    def factory(**_kwargs: Any) -> FakeClient:
+        clients.append(client)
+        return client
+
+    adapter = PineconeAdapter(
+        client_factory=factory,
+        environ={"PINECONE_API_KEY": "secret"},
+    )
+    target = make_target()
+
+    adapter.prepare(target)
+    adapter.upsert_batch(target, [{"id": "a", "vector": [0.1], "metadata": {}}])
+    adapter.query(target, vector=[0.1], top_k=1, consistency="eventual")
+    adapter.fetch(target, ids=["a"], consistency="eventual")
+
+    assert len(clients) == 1
+    assert client.index_calls == [{"host": "https://index-host.pinecone.io"}]
+
+
 def test_prepare_existing_fails_when_index_is_missing() -> None:
     adapter = make_adapter(FakeClient(exists=False))
 

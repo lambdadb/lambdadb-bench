@@ -6,6 +6,7 @@ import os
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from ldbbench.adapters.base import (
@@ -61,6 +62,8 @@ class QdrantAdapter:
     ) -> None:
         self._client_factory = client_factory or self._default_client_factory
         self._environ = os.environ if environ is None else environ
+        self._clients: dict[tuple[object, ...], Any] = {}
+        self._client_lock = Lock()
 
     def check(self, target: TargetConfig) -> CheckResult:
         try:
@@ -202,9 +205,30 @@ class QdrantAdapter:
         return [_document_from_point(point) for point in response]
 
     def _client(self, settings: QdrantTargetSettings) -> Any:
+        api_key = _api_key(settings, self._environ)
+        cache_key = (
+            settings.url,
+            api_key,
+            settings.timeout,
+            settings.prefer_grpc,
+        )
+        with self._client_lock:
+            client = self._clients.get(cache_key)
+            if client is not None:
+                return client
+            client = self._new_client(settings, api_key=api_key)
+            self._clients[cache_key] = client
+            return client
+
+    def _new_client(
+        self,
+        settings: QdrantTargetSettings,
+        *,
+        api_key: str | None,
+    ) -> Any:
         kwargs: dict[str, Any] = {
             "url": settings.url,
-            "api_key": _api_key(settings, self._environ),
+            "api_key": api_key,
             "prefer_grpc": settings.prefer_grpc,
         }
         if settings.timeout is not None:

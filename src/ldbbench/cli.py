@@ -381,6 +381,14 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 "load_records_per_second: "
                 f"{result.summary['load']['records_per_second']}"
             )
+            print(
+                "load_batching_seconds: "
+                f"{result.summary['load']['batching_duration_seconds']}"
+            )
+            print(
+                "load_upsert_attempt_seconds: "
+                f"{result.summary['load']['upsert_attempt_duration_seconds']}"
+            )
         if result.summary["load"]["errors"]:
             print(f"load_errors: {result.summary['load']['errors']}")
             print(f"load_error_rate: {result.summary['load']['error_rate']}")

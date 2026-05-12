@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from ldbbench.adapters.base import (
@@ -66,6 +67,10 @@ class PineconeAdapter:
     ) -> None:
         self._client_factory = client_factory or self._default_client_factory
         self._environ = os.environ if environ is None else environ
+        self._clients: dict[tuple[object, ...], Any] = {}
+        self._indexes: dict[tuple[object, ...], Any] = {}
+        self._client_lock = Lock()
+        self._index_lock = Lock()
 
     def check(self, target: TargetConfig) -> CheckResult:
         try:
@@ -204,12 +209,46 @@ class PineconeAdapter:
         return _documents(response, include_vectors=include_vectors)
 
     def _client(self, settings: PineconeTargetSettings) -> Any:
-        kwargs: dict[str, Any] = {"api_key": _api_key(settings, self._environ)}
+        api_key = _api_key(settings, self._environ)
+        cache_key = (api_key, settings.timeout)
+        with self._client_lock:
+            client = self._clients.get(cache_key)
+            if client is not None:
+                return client
+            client = self._new_client(settings, api_key=api_key)
+            self._clients[cache_key] = client
+            return client
+
+    def _new_client(
+        self,
+        settings: PineconeTargetSettings,
+        *,
+        api_key: str,
+    ) -> Any:
+        kwargs: dict[str, Any] = {"api_key": api_key}
         if settings.timeout is not None:
             kwargs["timeout"] = settings.timeout
         return self._client_factory(**kwargs)
 
     def _index(self, settings: PineconeTargetSettings) -> Any:
+        api_key = _api_key(settings, self._environ)
+        cache_key = (
+            api_key,
+            settings.timeout,
+            settings.index_host,
+            settings.index_name,
+            settings.pool_threads,
+            settings.connection_pool_maxsize,
+        )
+        with self._index_lock:
+            index = self._indexes.get(cache_key)
+            if index is not None:
+                return index
+            index = self._new_index(settings)
+            self._indexes[cache_key] = index
+            return index
+
+    def _new_index(self, settings: PineconeTargetSettings) -> Any:
         kwargs: dict[str, Any] = {}
         if settings.pool_threads is not None:
             kwargs["pool_threads"] = settings.pool_threads

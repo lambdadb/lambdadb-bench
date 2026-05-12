@@ -292,6 +292,11 @@ def test_execute_benchmark_writes_events_and_summary(tmp_path) -> None:
     assert query_events[0]["matches"] == ["a", "c"]
     assert query_events[0]["recall_at_k"] == 1.0
     assert result.summary["load"]["records"] == 3
+    assert result.summary["load"]["records_read"] == 3
+    assert result.summary["load"]["batching_duration_seconds"] >= 0
+    assert result.summary["load"]["batching_records_per_second"] >= 0
+    assert result.summary["load"]["upsert_attempt_duration_seconds"] >= 0
+    assert result.summary["load"]["attempt_latency_ms"]["max"] is not None
     assert result.summary["query"]["queries"] == 1
     assert result.summary["query"]["recall_at_k"] == 1.0
     assert result.summary_path.exists()
@@ -366,6 +371,7 @@ def test_execute_benchmark_loads_batches_concurrently(tmp_path) -> None:
 
     assert result.summary["load"]["concurrency"] == 2
     assert result.summary["load"]["records"] == 4
+    assert result.summary["load"]["records_read"] == 4
     assert result.summary["load"]["batches"] == 2
     assert result.summary["load"]["attempts"] == 2
     assert result.summary["load"]["errors"] == 0

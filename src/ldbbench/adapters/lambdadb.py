@@ -6,6 +6,7 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from ldbbench.adapters.base import (
@@ -63,6 +64,8 @@ class LambdaDBAdapter:
     ) -> None:
         self._client_factory = client_factory or self._default_client_factory
         self._environ = os.environ if environ is None else environ
+        self._clients: dict[tuple[object, ...], Any] = {}
+        self._client_lock = Lock()
 
     def check(self, target: TargetConfig) -> CheckResult:
         try:
@@ -196,6 +199,26 @@ class LambdaDBAdapter:
 
     def _client(self, settings: LambdaDBTargetSettings) -> Any:
         api_key = _api_key(settings, self._environ)
+        cache_key = (
+            settings.base_url,
+            settings.project_name,
+            api_key,
+            settings.timeout_ms,
+        )
+        with self._client_lock:
+            client = self._clients.get(cache_key)
+            if client is not None:
+                return client
+            client = self._new_client(settings, api_key=api_key)
+            self._clients[cache_key] = client
+            return client
+
+    def _new_client(
+        self,
+        settings: LambdaDBTargetSettings,
+        *,
+        api_key: str,
+    ) -> Any:
         kwargs: dict[str, Any] = {
             "project_api_key": api_key,
         }

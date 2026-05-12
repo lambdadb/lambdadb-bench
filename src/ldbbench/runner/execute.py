@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -274,13 +274,17 @@ def run_load_stage(
     )
 
     records_loaded = 0
+    records_read = 0
     skipped_records = 0
     load_errors = 0
     latencies: list[float] = []
+    attempt_latencies: list[float] = []
+    upsert_attempt_duration_seconds = 0.0
     visibility_samples: list[VectorRecord] = []
     successful_batches = 0
     skipped_batches = 0
     attempted_batches = 0
+    batching_duration_seconds = 0.0
     successful_batch_indexes: set[int] = set()
     highest_contiguous_successful_batch_index = resumed_from_batch_index
     started = time.perf_counter()
@@ -305,6 +309,9 @@ def run_load_stage(
         skipped_batches=skipped_batches,
         skipped_records=skipped_records,
         records_loaded=records_loaded,
+        records_read=records_read,
+        batching_duration_seconds=batching_duration_seconds,
+        upsert_attempt_duration_seconds=upsert_attempt_duration_seconds,
         errors=load_errors,
     )
     events_mode = "a" if resume_load else "w"
@@ -315,7 +322,13 @@ def run_load_stage(
         )
 
         if concurrency == 1:
-            for batch_index, batch in batch_iter:
+            while True:
+                item = _next_load_batch(batch_iter)
+                if item is None:
+                    break
+                batch_index, batch, batching_duration = item
+                batching_duration_seconds += batching_duration
+                records_read += len(batch)
                 if batch_index <= resumed_from_batch_index:
                     skipped_batches += 1
                     skipped_records += len(batch)
@@ -328,6 +341,9 @@ def run_load_stage(
                 )
                 attempted_batches += 1
                 _write_event(file, event)
+                event_latency = float(event["latency_ms"])
+                attempt_latencies.append(event_latency)
+                upsert_attempt_duration_seconds += event_latency / 1000
                 if event["status"] != "ok":
                     load_errors += 1
                     _write_load_checkpoint(
@@ -344,6 +360,11 @@ def run_load_stage(
                         skipped_batches=skipped_batches,
                         skipped_records=skipped_records,
                         records_loaded=records_loaded,
+                        records_read=records_read,
+                        batching_duration_seconds=batching_duration_seconds,
+                        upsert_attempt_duration_seconds=(
+                            upsert_attempt_duration_seconds
+                        ),
                         errors=load_errors,
                     )
                     break
@@ -368,11 +389,16 @@ def run_load_stage(
                     successful_batch_indexes=successful_batch_indexes,
                     attempted_batches=attempted_batches,
                     successful_batches=successful_batches,
-                    skipped_batches=skipped_batches,
-                    skipped_records=skipped_records,
-                    records_loaded=records_loaded,
-                    errors=load_errors,
-                )
+                        skipped_batches=skipped_batches,
+                        skipped_records=skipped_records,
+                        records_loaded=records_loaded,
+                        records_read=records_read,
+                        batching_duration_seconds=batching_duration_seconds,
+                        upsert_attempt_duration_seconds=(
+                            upsert_attempt_duration_seconds
+                        ),
+                        errors=load_errors,
+                    )
                 ticker.maybe(
                     "load: progress "
                     f"records={records_loaded} batches={successful_batches} "
@@ -388,14 +414,19 @@ def run_load_stage(
             accepting = True
 
             def submit_next(executor: ThreadPoolExecutor) -> bool:
-                nonlocal attempted_batches, skipped_batches, skipped_records
+                nonlocal attempted_batches
+                nonlocal batching_duration_seconds, records_read
+                nonlocal skipped_batches, skipped_records
+                nonlocal upsert_attempt_duration_seconds
                 if not accepting:
                     return False
                 while True:
-                    try:
-                        batch_index, batch = next(batch_iter)
-                    except StopIteration:
+                    item = _next_load_batch(batch_iter)
+                    if item is None:
                         return False
+                    batch_index, batch, batching_duration = item
+                    batching_duration_seconds += batching_duration
+                    records_read += len(batch)
                     if batch_index <= resumed_from_batch_index:
                         skipped_batches += 1
                         skipped_records += len(batch)
@@ -422,6 +453,9 @@ def run_load_stage(
                         pending.pop(future)
                         event, batch = future.result()
                         _write_event(file, event)
+                        event_latency = float(event["latency_ms"])
+                        attempt_latencies.append(event_latency)
+                        upsert_attempt_duration_seconds += event_latency / 1000
                         if event["status"] != "ok":
                             load_errors += 1
                             accepting = False
@@ -439,6 +473,11 @@ def run_load_stage(
                                 skipped_batches=skipped_batches,
                                 skipped_records=skipped_records,
                                 records_loaded=records_loaded,
+                                records_read=records_read,
+                                batching_duration_seconds=batching_duration_seconds,
+                                upsert_attempt_duration_seconds=(
+                                    upsert_attempt_duration_seconds
+                                ),
                                 errors=load_errors,
                             )
                             continue
@@ -466,6 +505,11 @@ def run_load_stage(
                             skipped_batches=skipped_batches,
                             skipped_records=skipped_records,
                             records_loaded=records_loaded,
+                            records_read=records_read,
+                            batching_duration_seconds=batching_duration_seconds,
+                            upsert_attempt_duration_seconds=(
+                                upsert_attempt_duration_seconds
+                            ),
                             errors=load_errors,
                         )
                         ticker.maybe(
@@ -498,6 +542,9 @@ def run_load_stage(
         skipped_batches=skipped_batches,
         skipped_records=skipped_records,
         records_loaded=records_loaded,
+        records_read=records_read,
+        batching_duration_seconds=batching_duration_seconds,
+        upsert_attempt_duration_seconds=upsert_attempt_duration_seconds,
         errors=load_errors,
     )
     ticker.emit(
@@ -508,6 +555,7 @@ def run_load_stage(
         summary={
             "status": final_status,
             "records": records_loaded,
+            "records_read": records_read,
             "skipped_records": skipped_records,
             "batches": successful_batches,
             "skipped_batches": skipped_batches,
@@ -524,9 +572,16 @@ def run_load_stage(
                 ),
             },
             "duration_seconds": duration_seconds,
+            "batching_duration_seconds": batching_duration_seconds,
+            "upsert_attempt_duration_seconds": upsert_attempt_duration_seconds,
             "records_per_second": _rate(records_loaded, duration_seconds),
+            "batching_records_per_second": _rate(
+                records_read,
+                batching_duration_seconds,
+            ),
             "attempts_per_second": _rate(attempted_batches, duration_seconds),
             "latency_ms": latency_summary(latencies),
+            "attempt_latency_ms": latency_summary(attempt_latencies),
         },
         visibility_samples=visibility_samples,
     )
@@ -547,6 +602,17 @@ def _execute_load_batch_with_records(
         ),
         batch,
     )
+
+
+def _next_load_batch(
+    batch_iter: Iterator[tuple[int, list[VectorRecord]]],
+) -> tuple[int, list[VectorRecord], float] | None:
+    started = time.perf_counter()
+    try:
+        batch_index, batch = next(batch_iter)
+    except StopIteration:
+        return None
+    return batch_index, batch, time.perf_counter() - started
 
 
 def execute_load_batch(
@@ -644,6 +710,9 @@ def _write_load_checkpoint(
     skipped_batches: int,
     skipped_records: int,
     records_loaded: int,
+    records_read: int,
+    batching_duration_seconds: float,
+    upsert_attempt_duration_seconds: float,
     errors: int,
 ) -> None:
     if checkpoint_path is None:
@@ -665,6 +734,9 @@ def _write_load_checkpoint(
         "skipped_batches": skipped_batches,
         "skipped_records": skipped_records,
         "records_loaded": records_loaded,
+        "records_read": records_read,
+        "batching_duration_seconds": batching_duration_seconds,
+        "upsert_attempt_duration_seconds": upsert_attempt_duration_seconds,
         "errors": errors,
     }
     checkpoint_path.write_text(
@@ -1022,13 +1094,20 @@ def skipped_load_summary(*, reason: str) -> dict[str, Any]:
         "status": "skipped",
         "skip_reason": reason,
         "records": 0,
+        "records_read": 0,
+        "skipped_records": 0,
         "batches": 0,
+        "skipped_batches": 0,
         "attempts": 0,
         "errors": 0,
         "error_rate": 0.0,
         "duration_seconds": 0.0,
+        "batching_duration_seconds": 0.0,
+        "upsert_attempt_duration_seconds": 0.0,
         "records_per_second": 0.0,
+        "batching_records_per_second": 0.0,
         "latency_ms": latency_summary([]),
+        "attempt_latency_ms": latency_summary([]),
     }
 
 

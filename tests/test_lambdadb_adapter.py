@@ -145,6 +145,27 @@ def test_prepare_existing_checks_collection() -> None:
     assert client.collections.gets == [{"collection_name": "smoke"}]
 
 
+def test_adapter_reuses_client_for_same_target() -> None:
+    clients: list[FakeClient] = []
+
+    def factory(**_kwargs: Any) -> FakeClient:
+        client = FakeClient()
+        clients.append(client)
+        return client
+
+    adapter = LambdaDBAdapter(
+        client_factory=factory,
+        environ={"LAMBDADB_API_KEY": "secret"},
+    )
+    target = make_target()
+
+    adapter.prepare(target)
+    adapter.upsert_batch(target, [{"id": "a", "vector": [0.1], "metadata": {}}])
+    adapter.fetch(target, ids=["a"], consistency="eventual")
+
+    assert len(clients) == 1
+
+
 def test_prepare_recreate_deletes_before_create() -> None:
     client = FakeClient(missing_after_gets=2)
     adapter = make_adapter(client)

@@ -262,7 +262,8 @@ Real runs write:
 - `load_checkpoint.json`: resumable load watermark and matching load context.
 - `query_events.jsonl`: one event per query attempt, including query errors.
 - `summary.json`: load/query counts, latency percentiles, QPS, per-stage query
-  summaries, error rates, and recall when `ground_truth.jsonl` is present.
+  summaries, load batching/upsert timing, error rates, and recall when
+  `ground_truth.jsonl` is present.
 
 Runs at 1M rows or larger require `--allow-large-run` unless `--max-records`
 keeps the run below that threshold.
