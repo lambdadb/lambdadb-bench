@@ -18,6 +18,13 @@ Install the package in editable mode with development dependencies:
 uv sync --extra dev
 ```
 
+For FAISS-backed ground truth generation on larger datasets, install the
+optional ground truth dependencies too:
+
+```bash
+uv sync --extra dev --extra groundtruth
+```
+
 Check the CLI:
 
 ```bash
@@ -57,6 +64,18 @@ uv run ldbbench dataset ground-truth \
   --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
   --top-k 10 \
   --backend exact
+```
+
+For larger datasets, use the FAISS backend. It builds an in-memory
+`IndexFlatIP`; cosine ground truth normalizes vectors before indexing and
+querying.
+
+```bash
+uv run --extra groundtruth ldbbench dataset ground-truth \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --top-k 10 \
+  --backend faiss \
+  --batch-size 100
 ```
 
 ### 2. Configure a target

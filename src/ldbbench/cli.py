@@ -104,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.set_defaults(func=run_dataset_prepare)
     ground_truth = dataset_subcommands.add_parser(
         "ground-truth",
-        help="Compute exact ground truth for prepared dataset artifacts.",
+        help="Compute ground truth for prepared dataset artifacts.",
     )
     ground_truth.add_argument(
         "--dataset-dir",
@@ -125,8 +125,14 @@ def build_parser() -> argparse.ArgumentParser:
     ground_truth.add_argument(
         "--backend",
         default="exact",
-        choices=["exact"],
+        choices=["exact", "faiss"],
         help="Ground truth backend.",
+    )
+    ground_truth.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="Query batch size for FAISS ground truth search.",
     )
     ground_truth.add_argument(
         "--limit-queries",
@@ -297,6 +303,7 @@ def run_dataset_ground_truth(args: argparse.Namespace) -> int:
         metric=args.metric,
         backend=args.backend,
         limit_queries=args.limit_queries,
+        batch_size=args.batch_size,
         dry_run=args.dry_run,
     )
     print(f"status: {result.manifest['status']}")

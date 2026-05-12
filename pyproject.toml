@@ -36,6 +36,10 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.6.0"
 ]
+groundtruth = [
+  "faiss-cpu>=1.8.0",
+  "numpy>=1.26"
+]
 
 [project.scripts]
 ldbbench = "ldbbench.cli:main"

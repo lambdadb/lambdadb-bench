@@ -38,6 +38,8 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - The runner can wait for loaded records to become query-visible before query
   stages start.
 - `--load-only` and `--query-only` support separate load/query validation.
+- FAISS-backed ground truth is available through `--backend faiss` with the
+  optional `groundtruth` extra.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
@@ -105,22 +107,29 @@ The Cohere Wikipedia scenario now maps:
 
 ### Phase 2-3
 
-Exact ground truth generation is complete for small/local datasets.
+Ground truth generation is complete for small/local datasets and has a FAISS
+backend for larger datasets.
 
 - `ldbbench dataset ground-truth`
 - `--top-k`
 - `--metric cosine|dot`
 - `--backend exact`
+- `--backend faiss`
+- `--batch-size` for FAISS query search batches
 - `--limit-queries`
 - `--dry-run`
 - reads `records.jsonl`
 - reads `queries.jsonl`
 - writes `ground_truth.jsonl`
 - writes `ground_truth_manifest.json`
-- deterministic ranking by `score desc`, then `id asc`
+- exact backend ranking is deterministic by `score desc`, then `id asc`
 - excludes same-id matches
 
-This is brute-force exact search. It is good for fixtures and small smoke datasets. A scalable FAISS/cloud runner strategy is still needed before serious 1M/10M ground truth runs.
+The `exact` backend is brute-force Python search. It is good for fixtures and
+small smoke datasets. The `faiss` backend uses optional `faiss-cpu` dependencies
+from `uv sync --extra groundtruth`, builds an in-memory `IndexFlatIP`, normalizes
+vectors for cosine search, and records index/batch/normalization settings in
+`ground_truth_manifest.json`.
 
 ### Phase 2-4
 
@@ -227,10 +236,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after Phase 2-6 stage 2 follow-up hardening:
+Current test count after FAISS ground truth backend work:
 
 ```text
-71 passed, 2 skipped
+73 passed, 2 skipped
 ```
 
 Useful smoke commands:
@@ -493,6 +502,11 @@ full 1M workload with `--allow-large-run` after cost/resource approval.
 
 ## Later Work
 
+- CLI progress reporting for long-running commands. Treat this as a cross-cutting
+  UX task rather than a FAISS-only fix. Add periodic progress/status logs for
+  `dataset prepare`, `dataset ground-truth` record loading/index/search phases,
+  and `run` load/query stages so users can tell whether work is still active,
+  how far it has progressed, and which phase is currently running.
 - Resumable load/checkpoint support for interrupted large ingests. Current
   behavior re-reads `records.jsonl` from the beginning on rerun; with
   `prepare.mode: existing`, this means already-written IDs are upserted again.
@@ -500,10 +514,7 @@ full 1M workload with `--allow-large-run` after cost/resource approval.
   highest contiguous successful batch watermark, because concurrent load events
   may complete out of order.
 - Pinecone Serverless adapter.
-- FAISS-backed or cloud-runner ground truth for 1M/10M. This should be
-  prioritized before relying on 1M recall, because the current `exact` backend
-  performs a Python brute-force scan over all records for every query and is too
-  slow for the full Cohere Wikipedia 1M scenario.
+- Cloud-runner or persisted-index ground truth for 10M+ workloads.
 - 10M scenario.
 - filtered search scenario.
 - search-under-ingest scenario.
