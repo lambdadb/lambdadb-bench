@@ -21,6 +21,7 @@ from ldbbench.datasets.ground_truth import prepare_ground_truth
 from ldbbench.datasets.prepare import prepare_dataset
 from ldbbench.runner.execute import (
     _batches,
+    _record_size_bytes,
     execute_benchmark,
     latency_summary,
     parse_size_bytes,
@@ -792,3 +793,13 @@ def test_batches_allows_single_record_larger_than_byte_limit() -> None:
     batches = list(_batches(records, batch_size=10, max_batch_bytes=10))
 
     assert batches == [records]
+
+
+def test_record_size_bytes_uses_precomputed_estimate() -> None:
+    record = VectorRecord(
+        id="large",
+        vector=[1.0] * 128,
+        estimated_size_bytes=123,
+    )
+
+    assert _record_size_bytes(record) == 123

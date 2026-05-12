@@ -326,12 +326,17 @@ def _record_to_point(
         payload = dict(metadata)
 
     payload[SOURCE_ID_PAYLOAD_KEY] = record_id
-    point_vector: Any = {vector_name: list(vector)} if vector_name else list(vector)
+    vector_values = _vector_values(vector)
+    point_vector: Any = {vector_name: vector_values} if vector_name else vector_values
     return models.PointStruct(
         id=_qdrant_point_id(record_id),
         vector=point_vector,
         payload=payload,
     )
+
+
+def _vector_values(vector: Sequence[float]) -> Sequence[float]:
+    return vector if isinstance(vector, list) else list(vector)
 
 
 def _query_matches(response: Any) -> list[QueryMatch]:

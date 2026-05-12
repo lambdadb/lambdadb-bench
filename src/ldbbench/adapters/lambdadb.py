@@ -379,7 +379,7 @@ def _record_to_doc(
     if isinstance(record, VectorRecord):
         return {
             "id": record.id,
-            vector_field: list(record.vector),
+            vector_field: _vector_values(record.vector),
             "metadata": dict(record.metadata),
         }
 
@@ -394,9 +394,13 @@ def _record_to_doc(
         raise ConfigError("record metadata must be a mapping")
     return {
         "id": record_id,
-        vector_field: list(vector),
+        vector_field: _vector_values(vector),
         "metadata": dict(metadata),
     }
+
+
+def _vector_values(vector: Sequence[float]) -> Sequence[float]:
+    return vector if isinstance(vector, list) else list(vector)
 
 
 def _consistent_read(consistency: str) -> bool:

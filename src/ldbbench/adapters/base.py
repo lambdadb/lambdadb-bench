@@ -48,6 +48,7 @@ class VectorRecord:
     id: str
     vector: Sequence[float]
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    estimated_size_bytes: int | None = None
 
 
 @dataclass(frozen=True)

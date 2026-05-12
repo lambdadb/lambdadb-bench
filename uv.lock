@@ -701,6 +701,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "lambdadb" },
+    { name = "orjson" },
     { name = "pinecone" },
     { name = "pyyaml" },
     { name = "qdrant-client" },
@@ -722,6 +723,7 @@ requires-dist = [
     { name = "faiss-cpu", marker = "extra == 'groundtruth'", specifier = ">=1.8.0" },
     { name = "lambdadb", specifier = ">=0.7.5" },
     { name = "numpy", marker = "extra == 'groundtruth'", specifier = ">=1.26" },
+    { name = "orjson", specifier = ">=3.11" },
     { name = "pinecone", specifier = ">=9.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pyyaml", specifier = ">=6.0" },

@@ -363,7 +363,7 @@ def _record_to_vector(record: Mapping[str, Any] | VectorRecord) -> dict[str, Any
     if isinstance(record, VectorRecord):
         return {
             "id": record.id,
-            "values": list(record.vector),
+            "values": _vector_values(record.vector),
             "metadata": dict(record.metadata),
         }
 
@@ -378,9 +378,13 @@ def _record_to_vector(record: Mapping[str, Any] | VectorRecord) -> dict[str, Any
         raise ConfigError("record metadata must be a mapping")
     return {
         "id": record_id,
-        "values": list(vector),
+        "values": _vector_values(vector),
         "metadata": dict(metadata),
     }
+
+
+def _vector_values(vector: Sequence[float]) -> Sequence[float]:
+    return vector if isinstance(vector, list) else list(vector)
 
 
 def _query_matches(response: Any) -> list[QueryMatch]:

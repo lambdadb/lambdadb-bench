@@ -18,12 +18,16 @@ from ldbbench.datasets.ground_truth import (
     GROUND_TRUTH_FILENAME,
     artifact_path,
     load_dataset_manifest,
-    parse_vector_item,
 )
 from ldbbench.datasets.prepare import QUERIES_FILENAME, RECORDS_FILENAME
 from ldbbench.manifest import initialize_run_artifacts
 from ldbbench.progress import ProgressCallback, ProgressTicker
 from ldbbench.runner.plan import build_run_plan
+
+try:
+    import orjson
+except ImportError:  # pragma: no cover - kept for source-tree reuse without deps.
+    orjson = None  # type: ignore[assignment]
 
 INGEST_EVENTS_FILENAME = "ingest_events.jsonl"
 QUERY_EVENTS_FILENAME = "query_events.jsonl"
@@ -1262,31 +1266,27 @@ def read_records(
     *,
     limit: int | None = None,
 ) -> Iterable[VectorRecord]:
-    with Path(path).open("r", encoding="utf-8") as file:
+    source_path = Path(path)
+    with source_path.open("rb") as file:
         for index, line in enumerate(file, start=1):
             if limit is not None and index > limit:
                 break
             if not line.strip():
                 continue
-            item = parse_vector_item(
-                json.loads(line),
-                path=Path(path),
+            yield _parse_record_line(
+                line,
+                path=source_path,
                 line_number=index,
-            )
-            yield VectorRecord(
-                id=item.id,
-                vector=item.vector,
-                metadata=item.metadata,
             )
 
 
 def load_ground_truth(path: str | Path) -> dict[str, list[str]]:
     truth: dict[str, list[str]] = {}
-    with Path(path).open("r", encoding="utf-8") as file:
+    with Path(path).open("rb") as file:
         for line_number, line in enumerate(file, start=1):
             if not line.strip():
                 continue
-            raw = json.loads(line)
+            raw = _loads_json(line)
             query_id = raw.get("query_id")
             matches = raw.get("matches")
             if not isinstance(query_id, str) or not isinstance(matches, list):
@@ -1297,6 +1297,33 @@ def load_ground_truth(path: str | Path) -> dict[str, list[str]]:
                 if isinstance(match, dict) and "id" in match
             ]
     return truth
+
+
+def _parse_record_line(line: bytes, *, path: Path, line_number: int) -> VectorRecord:
+    raw = _loads_json(line)
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}:{line_number} record row must be a JSON object")
+    record_id = raw.get("id")
+    vector = raw.get("vector")
+    metadata = raw.get("metadata", {})
+    if not isinstance(record_id, str) or not record_id:
+        raise ConfigError(f"{path}:{line_number} missing non-empty id")
+    if not isinstance(vector, list) or not vector:
+        raise ConfigError(f"{path}:{line_number} missing vector list")
+    if not isinstance(metadata, dict):
+        raise ConfigError(f"{path}:{line_number} metadata must be a mapping")
+    return VectorRecord(
+        id=record_id,
+        vector=vector,
+        metadata=metadata,
+        estimated_size_bytes=len(line.rstrip(b"\r\n")) + 2,
+    )
+
+
+def _loads_json(line: bytes) -> Any:
+    if orjson is not None:
+        return orjson.loads(line)
+    return json.loads(line)
 
 
 def _load_checkpoint_context(
@@ -1393,6 +1420,8 @@ def _batches(
 
 
 def _record_size_bytes(record: VectorRecord) -> int:
+    if record.estimated_size_bytes is not None:
+        return record.estimated_size_bytes
     payload = {
         "id": record.id,
         "metadata": dict(record.metadata),

@@ -58,6 +58,9 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - Load summaries now separate runner-side batching time from adapter upsert
   attempt time with `records_read`, `batching_duration_seconds`,
   `batching_records_per_second`, and `upsert_attempt_duration_seconds`.
+- Load record reading uses `orjson` and reuses prepared JSONL line byte sizes for
+  `load.max_batch_bytes`, avoiding per-record float normalization/norm
+  calculation and per-record `json.dumps` during batching.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
@@ -248,10 +251,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after load generator observability work:
+Current test count after load-path optimization work:
 
 ```text
-90 passed, 3 skipped
+91 passed, 3 skipped
 ```
 
 Useful smoke commands:

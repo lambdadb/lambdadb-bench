@@ -34,6 +34,8 @@ uv run ldbbench doctor
 Long-running commands print `progress:` lines for major phases and periodic
 counts. This includes dataset preparation, ground-truth generation, load,
 visibility wait, and query stages.
+The load path uses `orjson` and prepared-record byte estimates so large JSONL
+loads do not reserialize every record just to form size-capped batches.
 
 ### 1. Prepare a smoke dataset
 
