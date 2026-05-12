@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,8 @@ from ldbbench.adapters.base import (
 from ldbbench.config import ConfigError, TargetConfig
 
 DEFAULT_VECTOR_FIELD = "vector"
+DEFAULT_DELETE_WAIT_TIMEOUT_SECONDS = 60.0
+DEFAULT_DELETE_WAIT_POLL_SECONDS = 1.0
 SUPPORTED_METRIC_MAP = {
     "cosine": "cosine",
     "dot": "dot_product",
@@ -44,6 +47,8 @@ class LambdaDBTargetSettings:
     vector_field: str
     index_configs: dict[str, Any]
     timeout_ms: int | None
+    delete_wait_timeout_seconds: float
+    delete_wait_poll_seconds: float
 
 
 class LambdaDBAdapter:
@@ -105,7 +110,7 @@ class LambdaDBAdapter:
             )
 
         if target.prepare_mode == "recreate":
-            self._delete_if_present(client, settings.collection_name)
+            self._delete_if_present(client, settings)
 
         index_configs = _index_configs(settings, dimensions=dimensions, metric=metric)
         response = client.collections.create(
@@ -206,14 +211,41 @@ class LambdaDBAdapter:
 
         return LambdaDB(**kwargs)
 
-    @staticmethod
-    def _delete_if_present(client: Any, collection_name: str) -> None:
+    def _delete_if_present(
+        self,
+        client: Any,
+        settings: LambdaDBTargetSettings,
+    ) -> None:
         try:
-            client.collections.delete(collection_name=collection_name)
+            client.collections.delete(collection_name=settings.collection_name)
         except Exception as exc:
             if _is_not_found_error(exc):
                 return
             raise
+        self._wait_until_deleted(client, settings)
+
+    @staticmethod
+    def _wait_until_deleted(client: Any, settings: LambdaDBTargetSettings) -> None:
+        deadline = time.monotonic() + settings.delete_wait_timeout_seconds
+        last_error: Exception | None = None
+        while time.monotonic() <= deadline:
+            try:
+                client.collections.get(collection_name=settings.collection_name)
+            except Exception as exc:
+                if _is_not_found_error(exc):
+                    return
+                last_error = exc
+            time.sleep(settings.delete_wait_poll_seconds)
+        if last_error is not None:
+            raise ConfigError(
+                "timed out waiting for LambdaDB collection "
+                f"{settings.collection_name!r} deletion; last status check failed: "
+                f"{last_error}"
+            )
+        raise ConfigError(
+            "timed out waiting for LambdaDB collection "
+            f"{settings.collection_name!r} deletion"
+        )
 
 
 def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
@@ -234,6 +266,17 @@ def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
     ):
         raise ConfigError("target.timeout_ms must be a positive integer")
 
+    delete_wait_timeout_seconds = _optional_positive_float(
+        target.raw,
+        "delete_wait_timeout_seconds",
+        DEFAULT_DELETE_WAIT_TIMEOUT_SECONDS,
+    )
+    delete_wait_poll_seconds = _optional_positive_float(
+        target.raw,
+        "delete_wait_poll_seconds",
+        DEFAULT_DELETE_WAIT_POLL_SECONDS,
+    )
+
     return LambdaDBTargetSettings(
         base_url=target.endpoint,
         project_name=target.project_name,
@@ -242,7 +285,20 @@ def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
         vector_field=target.vector_field or DEFAULT_VECTOR_FIELD,
         index_configs=target.index_configs,
         timeout_ms=timeout_ms,
+        delete_wait_timeout_seconds=delete_wait_timeout_seconds,
+        delete_wait_poll_seconds=delete_wait_poll_seconds,
     )
+
+
+def _optional_positive_float(
+    raw: Mapping[str, Any],
+    key: str,
+    default: float,
+) -> float:
+    value = raw.get(key, default)
+    if not isinstance(value, int | float) or value <= 0:
+        raise ConfigError(f"target.{key} must be a positive number")
+    return float(value)
 
 
 def _is_not_found_error(exc: Exception) -> bool:

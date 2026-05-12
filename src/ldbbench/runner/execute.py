@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -38,6 +38,12 @@ class BenchmarkRunResult:
     summary: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class LoadStageResult:
+    summary: dict[str, Any]
+    visibility_samples: list[VectorRecord]
+
+
 def execute_benchmark(
     *,
     scenario: ScenarioConfig,
@@ -50,10 +56,17 @@ def execute_benchmark(
     ground_truth_path: str | Path | None = None,
     max_records: int | None = None,
     max_queries: int | None = None,
+    load_only: bool = False,
+    query_only: bool = False,
     allow_destructive: bool = False,
     allow_large_run: bool = False,
 ) -> BenchmarkRunResult:
     """Execute a small or explicitly opted-in benchmark run sequentially."""
+
+    if load_only and query_only:
+        raise ConfigError("--load-only and --query-only cannot be used together")
+    if query_only and target.prepare_mode != "existing":
+        raise ConfigError("--query-only requires target prepare.mode: existing")
 
     _validate_limits(max_records=max_records, max_queries=max_queries)
     if _is_large_run(scenario, max_records=max_records) and not allow_large_run:
@@ -115,30 +128,51 @@ def execute_benchmark(
         metric=_dataset_metric(scenario, dataset_manifest),
     )
 
-    ingest_summary = run_load_stage(
-        adapter=adapter,
-        target=target,
-        records=read_records(records_path, limit=max_records),
-        batch_size=_batch_size(scenario),
-        events_path=ingest_events_path,
-    )
-    queries = list(read_records(queries_path, limit=max_queries))
-    query_summary = run_query_stage(
-        adapter=adapter,
-        target=target,
-        queries=queries,
-        top_k=_top_k(scenario),
-        consistency=str(scenario.query.get("consistency", "eventual")),
-        include_vectors=bool(scenario.query.get("include_vectors", False)),
-        ground_truth=ground_truth,
-        events_path=query_events_path,
-        stages=None if max_queries is not None else _query_stages(scenario),
-    )
+    if query_only:
+        ingest_events_path.write_text("", encoding="utf-8")
+        ingest_summary = skipped_load_summary(reason="query_only")
+    else:
+        load_result = run_load_stage(
+            adapter=adapter,
+            target=target,
+            records=read_records(records_path, limit=max_records),
+            batch_size=_batch_size(scenario),
+            max_batch_bytes=_max_batch_bytes(scenario),
+            concurrency=_load_concurrency(scenario),
+            events_path=ingest_events_path,
+        )
+        ingest_summary = load_result.summary
+        if ingest_summary["errors"] == 0 and _wait_until_query_visible(scenario):
+            ingest_summary["visibility"] = wait_until_query_visible(
+                adapter=adapter,
+                target=target,
+                records=load_result.visibility_samples,
+                top_k=_top_k(scenario),
+                consistency=str(scenario.query.get("consistency", "eventual")),
+                timeout_seconds=_visibility_timeout_seconds(scenario),
+                poll_interval_seconds=_visibility_poll_interval_seconds(scenario),
+            )
+
+    skip_reason = _query_skip_reason(load_summary=ingest_summary, load_only=load_only)
+    if skip_reason is not None:
+        query_events_path.write_text("", encoding="utf-8")
+        query_summary = skipped_query_summary(reason=skip_reason)
+    else:
+        queries = list(read_records(queries_path, limit=max_queries))
+        query_summary = run_query_stage(
+            adapter=adapter,
+            target=target,
+            queries=queries,
+            top_k=_top_k(scenario),
+            consistency=str(scenario.query.get("consistency", "eventual")),
+            include_vectors=bool(scenario.query.get("include_vectors", False)),
+            ground_truth=ground_truth,
+            events_path=query_events_path,
+            stages=None if max_queries is not None else _query_stages(scenario),
+        )
 
     summary = {
-        "status": "completed"
-        if query_summary["errors"] == 0
-        else "completed_with_errors",
+        "status": run_status(load_summary=ingest_summary, query_summary=query_summary),
         "run_manifest": str(paths.run_manifest),
         "dataset_dir": str(dataset_path),
         "ground_truth": str(truth_path) if truth_path.exists() else None,
@@ -165,44 +199,173 @@ def run_load_stage(
     target: TargetConfig,
     records: Iterable[VectorRecord],
     batch_size: int,
+    max_batch_bytes: int | None,
+    concurrency: int,
     events_path: str | Path,
-) -> dict[str, Any]:
+    visibility_sample_size: int = 10,
+) -> LoadStageResult:
     events_output = Path(events_path)
     events_output.parent.mkdir(parents=True, exist_ok=True)
 
     records_loaded = 0
+    load_errors = 0
     latencies: list[float] = []
+    visibility_samples: list[VectorRecord] = []
+    successful_batches = 0
+    attempted_batches = 0
     started = time.perf_counter()
     with events_output.open("w", encoding="utf-8") as file:
-        for batch_index, batch in enumerate(_batches(records, batch_size), start=1):
-            batch_started = time.perf_counter()
-            result = adapter.upsert_batch(target, batch)
-            latency_ms = _elapsed_ms(batch_started)
-            count = result.count
-            records_loaded += count
-            latencies.append(latency_ms)
-            file.write(
-                json.dumps(
-                    {
-                        "stage": "load",
-                        "batch_index": batch_index,
-                        "records": count,
-                        "latency_ms": latency_ms,
-                        "status": "ok",
-                    },
-                    sort_keys=True,
+        batch_iter = enumerate(
+            _batches(records, batch_size, max_batch_bytes=max_batch_bytes),
+            start=1,
+        )
+
+        if concurrency == 1:
+            for batch_index, batch in batch_iter:
+                event = execute_load_batch(
+                    adapter=adapter,
+                    target=target,
+                    batch=batch,
+                    batch_index=batch_index,
                 )
-                + "\n"
-            )
+                attempted_batches += 1
+                _write_event(file, event)
+                if event["status"] != "ok":
+                    load_errors += 1
+                    break
+                successful_batches += 1
+                records_loaded += int(event["records"])
+                latencies.append(float(event["latency_ms"]))
+                _extend_visibility_samples(
+                    visibility_samples,
+                    batch,
+                    visibility_sample_size=visibility_sample_size,
+                )
+        else:
+            pending: dict[Future[tuple[dict[str, Any], list[VectorRecord]]], None] = {}
+            accepting = True
+
+            def submit_next(executor: ThreadPoolExecutor) -> bool:
+                nonlocal attempted_batches
+                if not accepting:
+                    return False
+                try:
+                    batch_index, batch = next(batch_iter)
+                except StopIteration:
+                    return False
+                attempted_batches += 1
+                future = executor.submit(
+                    _execute_load_batch_with_records,
+                    adapter,
+                    target,
+                    batch,
+                    batch_index,
+                )
+                pending[future] = None
+                return True
+
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                for _ in range(concurrency):
+                    if not submit_next(executor):
+                        break
+
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        pending.pop(future)
+                        event, batch = future.result()
+                        _write_event(file, event)
+                        if event["status"] != "ok":
+                            load_errors += 1
+                            accepting = False
+                            continue
+                        successful_batches += 1
+                        records_loaded += int(event["records"])
+                        latencies.append(float(event["latency_ms"]))
+                        _extend_visibility_samples(
+                            visibility_samples,
+                            batch,
+                            visibility_sample_size=visibility_sample_size,
+                        )
+                    while load_errors == 0 and len(pending) < concurrency:
+                        if not submit_next(executor):
+                            break
 
     duration_seconds = time.perf_counter() - started
+    return LoadStageResult(
+        summary={
+            "status": "completed" if load_errors == 0 else "failed",
+            "records": records_loaded,
+            "batches": successful_batches,
+            "attempts": attempted_batches,
+            "errors": load_errors,
+            "error_rate": _error_rate(load_errors, attempted_batches),
+            "concurrency": concurrency,
+            "duration_seconds": duration_seconds,
+            "records_per_second": _rate(records_loaded, duration_seconds),
+            "attempts_per_second": _rate(attempted_batches, duration_seconds),
+            "latency_ms": latency_summary(latencies),
+        },
+        visibility_samples=visibility_samples,
+    )
+
+
+def _execute_load_batch_with_records(
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    batch: list[VectorRecord],
+    batch_index: int,
+) -> tuple[dict[str, Any], list[VectorRecord]]:
+    return (
+        execute_load_batch(
+            adapter=adapter,
+            target=target,
+            batch=batch,
+            batch_index=batch_index,
+        ),
+        batch,
+    )
+
+
+def execute_load_batch(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    batch: list[VectorRecord],
+    batch_index: int,
+) -> dict[str, Any]:
+    batch_started = time.perf_counter()
+    try:
+        result = adapter.upsert_batch(target, batch)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "stage": "load",
+            "batch_index": batch_index,
+            "records": len(batch),
+            "latency_ms": _elapsed_ms(batch_started),
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
     return {
-        "records": records_loaded,
-        "batches": len(latencies),
-        "duration_seconds": duration_seconds,
-        "records_per_second": _rate(records_loaded, duration_seconds),
-        "latency_ms": latency_summary(latencies),
+        "stage": "load",
+        "batch_index": batch_index,
+        "records": result.count,
+        "latency_ms": _elapsed_ms(batch_started),
+        "status": "ok",
     }
+
+
+def _extend_visibility_samples(
+    visibility_samples: list[VectorRecord],
+    batch: list[VectorRecord],
+    *,
+    visibility_sample_size: int,
+) -> None:
+    if len(visibility_samples) >= visibility_sample_size:
+        return
+    remaining = visibility_sample_size - len(visibility_samples)
+    visibility_samples.extend(batch[:remaining])
 
 
 def run_query_stage(
@@ -487,6 +650,140 @@ def _query_summary(
     return summary
 
 
+def skipped_query_summary(*, reason: str) -> dict[str, Any]:
+    summary = _query_summary(
+        mode="skipped",
+        started=time.perf_counter(),
+        latencies=[],
+        recalls=[],
+        query_count=0,
+        error_count=0,
+        stage_summaries=[],
+    )
+    summary["skip_reason"] = reason
+    return summary
+
+
+def skipped_load_summary(*, reason: str) -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "skip_reason": reason,
+        "records": 0,
+        "batches": 0,
+        "attempts": 0,
+        "errors": 0,
+        "error_rate": 0.0,
+        "duration_seconds": 0.0,
+        "records_per_second": 0.0,
+        "latency_ms": latency_summary([]),
+    }
+
+
+def wait_until_query_visible(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    records: list[VectorRecord],
+    top_k: int,
+    consistency: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+) -> dict[str, Any]:
+    if not records:
+        return {
+            "enabled": True,
+            "status": "skipped",
+            "skip_reason": "no_loaded_records",
+            "samples": 0,
+            "visible": 0,
+            "pending_ids": [],
+            "attempts": 0,
+            "duration_seconds": 0.0,
+            "latency_ms": latency_summary([]),
+        }
+
+    pending = {record.id: record for record in records}
+    attempts = 0
+    latencies: list[float] = []
+    started = time.perf_counter()
+    deadline = started + timeout_seconds
+    last_error: dict[str, str] | None = None
+
+    while pending and time.perf_counter() <= deadline:
+        for record_id, record in list(pending.items()):
+            query_started = time.perf_counter()
+            attempts += 1
+            try:
+                result = adapter.query(
+                    target,
+                    vector=record.vector,
+                    top_k=top_k,
+                    consistency=consistency,
+                    include_vectors=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = {
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+                continue
+            latencies.append(_elapsed_ms(query_started))
+            if record_id in {match.id for match in result.matches}:
+                pending.pop(record_id, None)
+
+        if pending:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval_seconds, remaining))
+
+    duration_seconds = time.perf_counter() - started
+    status = "visible" if not pending else "timeout"
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "status": status,
+        "samples": len(records),
+        "visible": len(records) - len(pending),
+        "pending_ids": sorted(pending),
+        "attempts": attempts,
+        "duration_seconds": duration_seconds,
+        "latency_ms": latency_summary(latencies),
+    }
+    if last_error is not None:
+        summary.update(last_error)
+    return summary
+
+
+def run_status(
+    *,
+    load_summary: Mapping[str, Any],
+    query_summary: Mapping[str, Any],
+) -> str:
+    if load_summary.get("errors", 0):
+        return "failed"
+    visibility = load_summary.get("visibility")
+    if isinstance(visibility, Mapping) and visibility.get("status") == "timeout":
+        return "failed"
+    if query_summary.get("errors", 0):
+        return "completed_with_errors"
+    return "completed"
+
+
+def _query_skip_reason(
+    *,
+    load_summary: Mapping[str, Any],
+    load_only: bool,
+) -> str | None:
+    if load_summary.get("errors", 0):
+        return "load_failed"
+    visibility = load_summary.get("visibility")
+    if isinstance(visibility, Mapping) and visibility.get("status") == "timeout":
+        return "visibility_timeout"
+    if load_only:
+        return "load_only"
+    return None
+
+
 def _query_stage_summary(
     *,
     stage_index: int,
@@ -598,15 +895,38 @@ def percentile(ordered_values: list[float], percentile_value: int) -> float:
 def _batches(
     records: Iterable[VectorRecord],
     batch_size: int,
+    *,
+    max_batch_bytes: int | None = None,
 ) -> Iterable[list[VectorRecord]]:
     batch: list[VectorRecord] = []
+    batch_bytes = 0
     for record in records:
+        record_bytes = _record_size_bytes(record)
+        if (
+            batch
+            and max_batch_bytes is not None
+            and batch_bytes + record_bytes > max_batch_bytes
+        ):
+            yield batch
+            batch = []
+            batch_bytes = 0
         batch.append(record)
+        batch_bytes += record_bytes
         if len(batch) >= batch_size:
             yield batch
             batch = []
+            batch_bytes = 0
     if batch:
         yield batch
+
+
+def _record_size_bytes(record: VectorRecord) -> int:
+    payload = {
+        "id": record.id,
+        "metadata": dict(record.metadata),
+        "vector": list(record.vector),
+    }
+    return len(json.dumps(payload, sort_keys=True).encode("utf-8")) + 2
 
 
 def _batch_size(scenario: ScenarioConfig) -> int:
@@ -614,6 +934,81 @@ def _batch_size(scenario: ScenarioConfig) -> int:
     if not isinstance(batch_size, int) or batch_size <= 0:
         raise ConfigError("scenario.load.batch_size must be a positive integer")
     return batch_size
+
+
+def _load_concurrency(scenario: ScenarioConfig) -> int:
+    concurrency = scenario.load.get("concurrency", 1)
+    if not isinstance(concurrency, int) or concurrency <= 0:
+        raise ConfigError("scenario.load.concurrency must be a positive integer")
+    return concurrency
+
+
+def _max_batch_bytes(scenario: ScenarioConfig) -> int | None:
+    value = scenario.load.get("max_batch_bytes")
+    if value is None:
+        return None
+    if isinstance(value, int):
+        if value <= 0:
+            raise ConfigError("scenario.load.max_batch_bytes must be positive")
+        return value
+    if isinstance(value, str):
+        return parse_size_bytes(value)
+    raise ConfigError("scenario.load.max_batch_bytes must be an integer or string")
+
+
+def parse_size_bytes(value: str) -> int:
+    text = value.strip().lower()
+    units = {
+        "kb": 1_000,
+        "kib": 1024,
+        "mb": 1_000_000,
+        "mib": 1024 * 1024,
+        "gb": 1_000_000_000,
+        "gib": 1024 * 1024 * 1024,
+        "b": 1,
+    }
+    multiplier = 1
+    for suffix, unit_multiplier in sorted(
+        units.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)].strip()
+            multiplier = unit_multiplier
+            break
+    else:
+        number = text
+    try:
+        size = float(number) * multiplier
+    except ValueError as exc:
+        raise ConfigError(f"invalid byte size {value!r}") from exc
+    if size <= 0:
+        raise ConfigError(f"byte size {value!r} must be positive")
+    return int(size)
+
+
+def _wait_until_query_visible(scenario: ScenarioConfig) -> bool:
+    value = scenario.load.get("wait_until_query_visible", False)
+    if not isinstance(value, bool):
+        raise ConfigError("scenario.load.wait_until_query_visible must be a boolean")
+    return value
+
+
+def _visibility_timeout_seconds(scenario: ScenarioConfig) -> float:
+    value = scenario.load.get("query_visibility_timeout", "60s")
+    if not isinstance(value, str):
+        raise ConfigError("scenario.load.query_visibility_timeout must be a string")
+    return parse_duration_seconds(value)
+
+
+def _visibility_poll_interval_seconds(scenario: ScenarioConfig) -> float:
+    value = scenario.load.get("query_visibility_poll_interval", "1s")
+    if not isinstance(value, str):
+        raise ConfigError(
+            "scenario.load.query_visibility_poll_interval must be a string"
+        )
+    return parse_duration_seconds(value)
 
 
 def _top_k(scenario: ScenarioConfig) -> int:

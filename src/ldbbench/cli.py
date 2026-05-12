@@ -181,6 +181,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Limit queries executed in this run. Useful for smoke tests.",
     )
     run.add_argument(
+        "--load-only",
+        action="store_true",
+        help="Load records and skip query execution.",
+    )
+    run.add_argument(
+        "--query-only",
+        action="store_true",
+        help="Skip loading and run queries against an existing prepared target.",
+    )
+    run.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate the run plan and write artifacts without contacting a database.",
@@ -337,11 +347,26 @@ def run_benchmark(args: argparse.Namespace) -> int:
             ground_truth_path=args.ground_truth,
             max_records=args.max_records,
             max_queries=args.max_queries,
+            load_only=args.load_only,
+            query_only=args.query_only,
             allow_destructive=args.allow_destructive,
             allow_large_run=args.allow_large_run,
         )
         print(f"run: {result.summary['status']}")
         print(f"records: {result.summary['load']['records']}")
+        if result.summary["load"]["status"] == "skipped":
+            print(f"load: skipped ({result.summary['load']['skip_reason']})")
+        else:
+            print(f"load_concurrency: {result.summary['load']['concurrency']}")
+            print(
+                "load_records_per_second: "
+                f"{result.summary['load']['records_per_second']}"
+            )
+        if result.summary["load"]["errors"]:
+            print(f"load_errors: {result.summary['load']['errors']}")
+            print(f"load_error_rate: {result.summary['load']['error_rate']}")
+        if "visibility" in result.summary["load"]:
+            print(f"visibility: {result.summary['load']['visibility']['status']}")
         print(f"queries: {result.summary['query']['queries']}")
         if result.summary["query"]["errors"]:
             print(f"errors: {result.summary['query']['errors']}")

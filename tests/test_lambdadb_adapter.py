@@ -24,12 +24,13 @@ class FakeDocs:
 
 
 class FakeCollections:
-    def __init__(self) -> None:
+    def __init__(self, *, missing_after_gets: int | None = None) -> None:
         self.docs = FakeDocs()
         self.creates: list[dict[str, Any]] = []
         self.gets: list[dict[str, Any]] = []
         self.deletes: list[dict[str, Any]] = []
         self.queries: list[dict[str, Any]] = []
+        self.missing_after_gets = missing_after_gets
 
     def create(self, **kwargs: Any) -> dict[str, Any]:
         self.creates.append(kwargs)
@@ -37,6 +38,13 @@ class FakeCollections:
 
     def get(self, **kwargs: Any) -> dict[str, Any]:
         self.gets.append(kwargs)
+        if (
+            self.missing_after_gets is not None
+            and len(self.gets) >= self.missing_after_gets
+        ):
+            exc = RuntimeError("not found")
+            exc.status_code = 404
+            raise exc
         return {"name": kwargs["collection_name"]}
 
     def delete(self, **kwargs: Any) -> dict[str, Any]:
@@ -54,8 +62,8 @@ class FakeCollections:
 
 
 class FakeClient:
-    def __init__(self) -> None:
-        self.collections = FakeCollections()
+    def __init__(self, *, missing_after_gets: int | None = None) -> None:
+        self.collections = FakeCollections(missing_after_gets=missing_after_gets)
 
 
 def make_target(**overrides: Any) -> TargetConfig:
@@ -138,23 +146,45 @@ def test_prepare_existing_checks_collection() -> None:
 
 
 def test_prepare_recreate_deletes_before_create() -> None:
-    client = FakeClient()
+    client = FakeClient(missing_after_gets=2)
     adapter = make_adapter(client)
     target = make_target(
         prepare={"mode": "recreate"},
         index_configs={"dense": {"type": "vector", "dimensions": 3}},
+        delete_wait_timeout_seconds=1,
+        delete_wait_poll_seconds=0.001,
     )
 
     result = adapter.prepare(target)
 
     assert result.ok
     assert client.collections.deletes == [{"collection_name": "smoke"}]
+    assert client.collections.gets == [
+        {"collection_name": "smoke"},
+        {"collection_name": "smoke"},
+    ]
     assert client.collections.creates == [
         {
             "collection_name": "smoke",
             "index_configs": {"dense": {"type": "vector", "dimensions": 3}},
         }
     ]
+
+
+def test_prepare_recreate_times_out_waiting_for_delete() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(
+        prepare={"mode": "recreate"},
+        delete_wait_timeout_seconds=0.002,
+        delete_wait_poll_seconds=0.001,
+    )
+
+    with pytest.raises(ConfigError, match="timed out"):
+        adapter.prepare(target, dimensions=3, metric="cosine")
+
+    assert client.collections.deletes == [{"collection_name": "smoke"}]
+    assert client.collections.creates == []
 
 
 def test_upsert_batch_maps_normalized_records_to_documents() -> None:

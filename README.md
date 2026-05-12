@@ -140,6 +140,9 @@ Use the smoke dataset first. This contacts the configured database.
 Supplying `--max-queries` keeps the query step in bounded one-pass smoke mode.
 Without `--max-queries`, `run` uses `scenario.query.stages` and repeats the
 prepared query set for each configured concurrency/duration stage.
+If `scenario.load.wait_until_query_visible` is true, the runner waits for a
+small sample of loaded records to be returned by vector query before starting
+the query stage.
 
 ```bash
 uv run ldbbench run \
@@ -163,15 +166,81 @@ uv run ldbbench run \
   --out results/example-lambdadb-smoke
 ```
 
+To load records without running queries, add `--load-only`:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.smoke.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+  --max-records 100 \
+  --load-only \
+  --out results/example-qdrant-load-only
+```
+
+To query an already-loaded collection without loading records again, use
+`--query-only`. The target must use `prepare.mode: existing` so the command does
+not create or recreate collections before querying.
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.smoke.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+  --max-queries 10 \
+  --query-only \
+  --out results/example-qdrant-query-only
+```
+
 Real runs write:
 
-- `ingest_events.jsonl`: one event per upsert batch.
+- `ingest_events.jsonl`: one event per upsert batch, including load errors.
 - `query_events.jsonl`: one event per query attempt, including query errors.
 - `summary.json`: load/query counts, latency percentiles, QPS, per-stage query
-  summaries, error rate, and recall when `ground_truth.jsonl` is present.
+  summaries, error rates, and recall when `ground_truth.jsonl` is present.
 
 Runs at 1M rows or larger require `--allow-large-run` unless `--max-records`
 keeps the run below that threshold.
+
+### 6. Scale validation
+
+After both targets pass the 100-row smoke run, scale up gradually before the
+full 1M run:
+
+```bash
+uv run ldbbench dataset prepare \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --limit 1000 \
+  --query-count 100 \
+  --out data/datasets/cohere-wikipedia-1m-1k
+```
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.smoke.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-1k \
+  --max-records 1000 \
+  --max-queries 100 \
+  --out results/example-qdrant-1k
+```
+
+For the full scenario, prepare the full dataset and opt into the large run:
+
+```bash
+uv run ldbbench dataset prepare \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --out data/datasets/cohere-wikipedia-1m
+```
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --allow-large-run \
+  --out results/example-qdrant-1m
+```
 
 ## Target Config Reference
 
@@ -188,6 +257,22 @@ LambdaDB targets with:
   `vector`.
 - `index_configs`: LambdaDB collection index config used by create/recreate
   preparation modes.
+- `delete_wait_timeout_seconds`: recreate-mode deletion wait timeout. Defaults
+  to `60`.
+- `delete_wait_poll_seconds`: recreate-mode deletion polling interval. Defaults
+  to `1`.
+
+Useful load settings:
+
+- `batch_size`: maximum records per upsert request.
+- `concurrency`: number of concurrent upsert workers. Defaults to `1`.
+- `max_batch_bytes`: optional approximate request payload cap. The runner
+  splits batches by both `batch_size` and this byte limit to avoid oversized
+  requests.
+- `wait_until_query_visible`: when true, wait for a loaded-record sample to be
+  visible through vector query before the query stage starts.
+- `query_visibility_timeout`: optional duration string, defaults to `60s`.
+- `query_visibility_poll_interval`: optional duration string, defaults to `1s`.
 
 Optional integration coverage is gated behind:
 

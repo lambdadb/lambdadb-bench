@@ -2,7 +2,8 @@
 
 Last updated: 2026-05-12
 
-This repository is ready to continue after Phase 2-6 stage 2 in a new Codex session.
+This repository includes Phase 2-6 runner follow-up work and is ready for
+real LambdaDB/Qdrant Phase 2 validation.
 
 ## Current State
 
@@ -14,20 +15,32 @@ Current branch:
 
 - `main`
 
-Latest committed work:
+Recent committed milestones:
 
 ```text
+aff49a9 Add concurrent duration query runner
+9e019a6 Polish smoke benchmark workflow
+24660f9 Add sequential benchmark runner
+2adb193 Add Qdrant adapter
+06e5ec9 Add LambdaDB adapter
+95ac266 Add handoff notes for benchmark phases
 f0d36ee Add exact ground truth generation
 8979cab Add normalized dataset record outputs
 f011802 Add dataset prepare skeleton
-6501a9a Add dry-run adapter planning
-7886ca4 Add config and manifest core
-6155d6b Add Python project skeleton
-f2dcb0a Refine benchmark consistency and setup design
-23908ba Add initial benchmark design
 ```
 
-Current working tree contains the Phase 2-6 stage 1 runner changes.
+Current code includes Phase 2-6 stage 2 plus follow-up hardening:
+
+- LambdaDB recreate waits for asynchronous collection deletion.
+- Load failures write partial `summary.json` and skip query execution cleanly.
+- Load batches can be capped by approximate payload size.
+- Load can run with concurrent upsert workers via `load.concurrency`.
+- The runner can wait for loaded records to become query-visible before query
+  stages start.
+- `--load-only` and `--query-only` support separate load/query validation.
+
+Any remaining local files should be benchmark artifacts or local configs ignored
+by `.gitignore`.
 
 ## Completed Work
 
@@ -167,6 +180,10 @@ Implementation choices:
 - benchmark `query.consistency: strong` should continue to plan as `N/A` for Qdrant.
 - unnamed Qdrant vectors are the default; setting `target.vector_field` switches create/upsert/query to named-vector mode.
 - Qdrant create mode maps benchmark metric `cosine|dot|dot_product|euclidean` to Qdrant distances `Cosine|Dot|Euclid`.
+- LambdaDB recreate mode waits for asynchronous collection deletion to become
+  visible before creating the replacement collection. Configure with
+  `delete_wait_timeout_seconds` and `delete_wait_poll_seconds` in the target if
+  needed.
 
 ### Phase 2-6 Stage 1
 
@@ -189,11 +206,15 @@ for normal tests.
 - Summary includes load/query counts, duration, QPS, latency percentiles, and mean recall when ground truth is available.
 - Added fake-adapter unit/smoke tests for real runner behavior, output files, recall, limits, and large-run opt-in.
 
-Remaining Phase 2-6 work:
+Phase 2-6 local implementation is complete. Remaining Phase 2 work is endpoint
+validation and scale validation:
 
-- Run real LambdaDB/Qdrant endpoint smoke tests once credentials are available.
-- Decide whether load-stage failures should also write partial summaries before
-  exiting.
+- Run real Qdrant endpoint smoke tests.
+- Run real LambdaDB endpoint smoke tests.
+- Run staged query validation without `--max-queries`.
+- Step from 100 rows to 1k/10k before the 1M run.
+- Run the full 1M ingest/query workload once cost and target resources are
+  approved.
 
 ## Validation Commands
 
@@ -206,10 +227,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after Phase 2-6 stage 2:
+Current test count after Phase 2-6 stage 2 follow-up hardening:
 
 ```text
-61 passed, 2 skipped
+71 passed, 2 skipped
 ```
 
 Useful smoke commands:
@@ -233,7 +254,8 @@ QDRANT_ENDPOINT=https://example.qdrant.io \
 
 ## Next Work
 
-Continue with Phase 2-6 stage 2.
+Run real endpoint validation. Start with the smoke dataset and one-pass query
+mode, then run staged query mode, then scale to 1k/10k/1M.
 
 ## Qdrant SDK Notes
 
@@ -402,16 +424,86 @@ requiring real endpoints.
 - CLI output reports `completed_with_errors`, error count, and error rate when
   query attempts fail.
 - Added fake-adapter tests for staged duration mode and query error summaries.
+- Load failures now write partial `ingest_events.jsonl` and `summary.json`,
+  skip query execution, and report run status `failed`.
+- `load.max_batch_bytes` is now enforced by the runner. This was added after a
+  real LambdaDB 1M run failed on the first 500-record batch with HTTP 413
+  `Request Too Long`.
+- `load.concurrency` now controls concurrent upsert workers so load throughput
+  can be measured under parallel writes instead of single-threaded batch
+  submission.
+- `load.wait_until_query_visible: true` now waits for a loaded-record sample to
+  be visible via vector query before query execution starts.
+- `ldbbench run --load-only` loads records and writes a skipped query summary
+  without executing query attempts. The scenario still needs a `query` section
+  because query rows and compatibility validation are scenario-level concerns.
+- `ldbbench run --query-only` skips loading and runs query attempts against an
+  existing target. It requires `prepare.mode: existing` to avoid accidental
+  collection creation or recreation before querying.
 
 Remaining validation:
 
 - Validate against real LambdaDB and Qdrant endpoints when credentials are
   available.
 
+## User Validation Checklist
+
+Set credentials:
+
+```bash
+export QDRANT_ENDPOINT=...
+export QDRANT_API_KEY=...
+export LAMBDADB_ENDPOINT=https://api.lambdadb.ai
+export LAMBDADB_PROJECT_NAME=...
+export LAMBDADB_API_KEY=...
+```
+
+Run target checks:
+
+```bash
+uv run ldbbench target check --target configs/qdrant-cloud.local.yaml
+uv run ldbbench target check --target configs/lambdadb.local.yaml
+```
+
+Run one-pass smoke tests:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.local.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+  --max-records 100 \
+  --max-queries 10 \
+  --out results/qdrant-smoke
+```
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/lambdadb.local.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+  --max-records 100 \
+  --max-queries 10 \
+  --out results/lambdadb-smoke
+```
+
+Run staged query validation by removing `--max-queries` after the smoke run is
+stable. For scale validation, prepare 1k/10k datasets first and only run the
+full 1M workload with `--allow-large-run` after cost/resource approval.
+
 ## Later Work
 
+- Resumable load/checkpoint support for interrupted large ingests. Current
+  behavior re-reads `records.jsonl` from the beginning on rerun; with
+  `prepare.mode: existing`, this means already-written IDs are upserted again.
+  A future implementation should persist a load checkpoint and resume from the
+  highest contiguous successful batch watermark, because concurrent load events
+  may complete out of order.
 - Pinecone Serverless adapter.
-- FAISS-backed or cloud-runner ground truth for 1M/10M.
+- FAISS-backed or cloud-runner ground truth for 1M/10M. This should be
+  prioritized before relying on 1M recall, because the current `exact` backend
+  performs a Python brute-force scan over all records for every query and is too
+  slow for the full Cohere Wikipedia 1M scenario.
 - 10M scenario.
 - filtered search scenario.
 - search-under-ingest scenario.
