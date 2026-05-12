@@ -197,6 +197,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip loading and run queries against an existing prepared target.",
     )
     run.add_argument(
+        "--resume-load",
+        action="store_true",
+        help=(
+            "Resume loading from an existing load_checkpoint.json in --out. "
+            "Requires target prepare.mode: existing."
+        ),
+    )
+    run.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate the run plan and write artifacts without contacting a database.",
@@ -358,6 +366,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             max_queries=args.max_queries,
             load_only=args.load_only,
             query_only=args.query_only,
+            resume_load=args.resume_load,
             allow_destructive=args.allow_destructive,
             allow_large_run=args.allow_large_run,
             progress=print_progress,
@@ -385,6 +394,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
             print(f"recall_at_k: {result.summary['query']['recall_at_k']}")
         print(f"wrote {result.ingest_events_path}")
         print(f"wrote {result.query_events_path}")
+        if result.load_checkpoint_path.exists():
+            print(f"wrote {result.load_checkpoint_path}")
         print(f"wrote {result.summary_path}")
         return 0
 

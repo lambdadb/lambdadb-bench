@@ -2,8 +2,8 @@
 
 Last updated: 2026-05-12
 
-This repository includes Phase 2-6 runner follow-up work and is ready for
-real LambdaDB/Qdrant Phase 2 validation.
+This repository includes Phase 2-6 runner follow-up work. Real LambdaDB/Qdrant
+Phase 2 endpoint validation has been completed by the user.
 
 ## Current State
 
@@ -35,6 +35,8 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - Load failures write partial `summary.json` and skip query execution cleanly.
 - Load batches can be capped by approximate payload size.
 - Load can run with concurrent upsert workers via `load.concurrency`.
+- Load writes `load_checkpoint.json` and can resume interrupted large ingests
+  with `--resume-load` from the highest contiguous successful batch watermark.
 - The runner can wait for loaded records to become query-visible before query
   stages start.
 - `--load-only` and `--query-only` support separate load/query validation.
@@ -217,15 +219,9 @@ for normal tests.
 - Summary includes load/query counts, duration, QPS, latency percentiles, and mean recall when ground truth is available.
 - Added fake-adapter unit/smoke tests for real runner behavior, output files, recall, limits, and large-run opt-in.
 
-Phase 2-6 local implementation is complete. Remaining Phase 2 work is endpoint
-validation and scale validation:
-
-- Run real Qdrant endpoint smoke tests.
-- Run real LambdaDB endpoint smoke tests.
-- Run staged query validation without `--max-queries`.
-- Step from 100 rows to 1k/10k before the 1M run.
-- Run the full 1M ingest/query workload once cost and target resources are
-  approved.
+Phase 2-6 implementation is complete. Real LambdaDB/Qdrant endpoint validation
+has been completed by the user. There are no remaining Phase 2 implementation
+items tracked in this handoff.
 
 ## Validation Commands
 
@@ -238,10 +234,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after FAISS ground truth backend work:
+Current test count after resumable load/checkpoint work:
 
 ```text
-73 passed, 2 skipped
+76 passed, 2 skipped
 ```
 
 Useful smoke commands:
@@ -265,8 +261,8 @@ QDRANT_ENDPOINT=https://example.qdrant.io \
 
 ## Next Work
 
-Run real endpoint validation. Start with the smoke dataset and one-pass query
-mode, then run staged query mode, then scale to 1k/10k/1M.
+Pick up the next implementation item from Later Work, starting with the Pinecone
+Serverless adapter unless priorities change.
 
 ## Qdrant SDK Notes
 
@@ -415,7 +411,7 @@ collections.docs.fetch(
 )
 ```
 
-## Phase 2 Remaining
+## Phase 2 Status
 
 ### Phase 2-6 Stage 2: Concurrent/Duration Runner
 
@@ -451,13 +447,22 @@ requiring real endpoints.
 - `ldbbench run --query-only` skips loading and runs query attempts against an
   existing target. It requires `prepare.mode: existing` to avoid accidental
   collection creation or recreation before querying.
+- `ldbbench run --resume-load` resumes from the existing `load_checkpoint.json`
+  in the result directory. It requires `prepare.mode: existing`, validates that
+  dataset/target/load settings match the checkpoint context, appends new ingest
+  events, and skips only the highest contiguous successful batch watermark so
+  out-of-order concurrent successes cannot hide a failed earlier batch.
 
-Remaining validation:
+Completed validation:
 
-- Validate against real LambdaDB and Qdrant endpoints when credentials are
-  available.
+- Real LambdaDB and Qdrant endpoint validation was completed directly by the
+  user.
 
-## User Validation Checklist
+## Optional Scale Validation Checklist
+
+The user has already completed real LambdaDB/Qdrant endpoint validation. Keep
+these commands only as a reference if scale validation needs to be rerun or
+extended later.
 
 Set credentials:
 
@@ -498,18 +503,12 @@ uv run ldbbench run \
   --out results/lambdadb-smoke
 ```
 
-Run staged query validation by removing `--max-queries` after the smoke run is
-stable. For scale validation, prepare 1k/10k datasets first and only run the
-full 1M workload with `--allow-large-run` after cost/resource approval.
+For optional future scale checks, remove `--max-queries` after a smoke run is
+stable. Prepare 1k/10k datasets before any full 1M workload, and use
+`--allow-large-run` only after cost/resource approval.
 
 ## Later Work
 
-- Resumable load/checkpoint support for interrupted large ingests. Current
-  behavior re-reads `records.jsonl` from the beginning on rerun; with
-  `prepare.mode: existing`, this means already-written IDs are upserted again.
-  A future implementation should persist a load checkpoint and resume from the
-  highest contiguous successful batch watermark, because concurrent load events
-  may complete out of order.
 - Pinecone Serverless adapter.
 - Cloud-runner or persisted-index ground truth for 10M+ workloads.
 - 10M scenario.

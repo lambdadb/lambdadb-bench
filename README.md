@@ -201,6 +201,23 @@ uv run ldbbench run \
   --out results/example-qdrant-load-only
 ```
 
+Load runs write `load_checkpoint.json` in the result directory. If a large load
+is interrupted or fails after some batches succeed, rerun with the same
+`--out`, same dataset/load settings, and `--resume-load` to skip the highest
+contiguous successful batch watermark. The target config must use
+`prepare.mode: existing` for the resume command so the already-loaded collection
+is not recreated.
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m.yaml \
+  --target configs/qdrant-cloud.smoke.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m-smoke \
+  --load-only \
+  --resume-load \
+  --out results/example-qdrant-load-only
+```
+
 To query an already-loaded collection without loading records again, use
 `--query-only`. The target must use `prepare.mode: existing` so the command does
 not create or recreate collections before querying.
@@ -218,6 +235,7 @@ uv run ldbbench run \
 Real runs write:
 
 - `ingest_events.jsonl`: one event per upsert batch, including load errors.
+- `load_checkpoint.json`: resumable load watermark and matching load context.
 - `query_events.jsonl`: one event per query attempt, including query errors.
 - `summary.json`: load/query counts, latency percentiles, QPS, per-stage query
   summaries, error rates, and recall when `ground_truth.jsonl` is present.

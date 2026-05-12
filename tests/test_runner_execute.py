@@ -144,6 +144,7 @@ def make_scenario(
     *,
     rows: int = 3,
     stages: list[dict[str, Any]] | None = None,
+    batch_size: int = 2,
     load_concurrency: int | None = None,
     wait_until_query_visible: bool = False,
 ) -> ScenarioConfig:
@@ -168,7 +169,7 @@ def make_scenario(
         },
         "load": {
             "write_mode": "upsert",
-            "batch_size": 2,
+            "batch_size": batch_size,
             "max_batch_bytes": "1MB",
             "wait_until_query_visible": wait_until_query_visible,
             "query_visibility_timeout": "50ms",
@@ -597,6 +598,130 @@ def test_execute_benchmark_writes_partial_summary_on_load_error(tmp_path) -> Non
     assert result.query_events_path.read_text(encoding="utf-8") == ""
     assert [event["status"] for event in ingest_events] == ["ok", "error"]
     assert ingest_events[1]["error_type"] == "RuntimeError"
+
+
+def test_execute_benchmark_can_resume_load_from_checkpoint(tmp_path) -> None:
+    scenario = make_scenario()
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    output_dir = tmp_path / "result"
+
+    failed = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=FakeAdapter(fail_load_batch=2),
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=output_dir,
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+    first_checkpoint = json.loads(
+        failed.load_checkpoint_path.read_text(encoding="utf-8")
+    )
+
+    resumed_adapter = FakeAdapter()
+    resumed = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=resumed_adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=output_dir,
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+        resume_load=True,
+    )
+    final_checkpoint = json.loads(
+        resumed.load_checkpoint_path.read_text(encoding="utf-8")
+    )
+    ingest_events = [
+        json.loads(line)
+        for line in resumed.ingest_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert first_checkpoint["status"] == "failed"
+    assert first_checkpoint["highest_contiguous_successful_batch_index"] == 1
+    assert [len(batch) for batch in resumed_adapter.upserted] == [1]
+    assert resumed.summary["status"] == "completed"
+    assert resumed.summary["load"]["records"] == 1
+    assert resumed.summary["load"]["skipped_records"] == 2
+    assert resumed.summary["load"]["skipped_batches"] == 1
+    assert resumed.summary["load"]["checkpoint"]["resume_enabled"] is True
+    assert resumed.summary["load"]["checkpoint"]["resumed_from_batch_index"] == 1
+    assert final_checkpoint["status"] == "completed"
+    assert final_checkpoint["highest_contiguous_successful_batch_index"] == 2
+    assert [event["status"] for event in ingest_events] == ["ok", "error", "ok"]
+    assert [event["batch_index"] for event in ingest_events] == [1, 2, 2]
+
+
+def test_load_checkpoint_uses_contiguous_watermark_for_concurrent_loads(
+    tmp_path,
+) -> None:
+    class OutOfOrderFailureAdapter(FakeAdapter):
+        def upsert_batch(
+            self,
+            target: TargetConfig,
+            records: list[VectorRecord],
+        ) -> UpsertResult:
+            if records[0].id == "b":
+                time.sleep(0.02)
+                raise RuntimeError("planned out-of-order failure")
+            return super().upsert_batch(target, records)
+
+    scenario = make_scenario(rows=4, batch_size=1, load_concurrency=2)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_dataset(
+        scenario=scenario,
+        output_dir=tmp_path / "dataset",
+        limit=4,
+        query_count=0,
+        source_rows=[
+            {"_id": "a", "emb": [1.0, 0.0], "text": "alpha"},
+            {"_id": "b", "emb": [0.0, 1.0], "text": "beta"},
+            {"_id": "c", "emb": [0.8, 0.2], "text": "gamma"},
+            {"_id": "d", "emb": [0.2, 0.8], "text": "delta"},
+        ],
+    )
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=OutOfOrderFailureAdapter(),
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+    checkpoint = json.loads(result.load_checkpoint_path.read_text(encoding="utf-8"))
+
+    assert result.summary["status"] == "failed"
+    assert result.summary["load"]["errors"] == 1
+    assert checkpoint["highest_contiguous_successful_batch_index"] == 1
+    assert set(checkpoint["successful_batch_indexes"]).issuperset({1, 3})
+
+
+def test_execute_benchmark_resume_load_requires_checkpoint(tmp_path) -> None:
+    scenario = make_scenario()
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+
+    with pytest.raises(ConfigError, match="load checkpoint"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+            load_only=True,
+            resume_load=True,
+        )
 
 
 def test_execute_benchmark_requires_large_run_opt_in(tmp_path) -> None:

@@ -7,6 +7,7 @@ import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -27,7 +28,9 @@ from ldbbench.runner.plan import build_run_plan
 INGEST_EVENTS_FILENAME = "ingest_events.jsonl"
 QUERY_EVENTS_FILENAME = "query_events.jsonl"
 SUMMARY_FILENAME = "summary.json"
+LOAD_CHECKPOINT_FILENAME = "load_checkpoint.json"
 LARGE_RUN_ROW_THRESHOLD = 1_000_000
+LOAD_CHECKPOINT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,7 @@ class BenchmarkRunResult:
     output_dir: Path
     ingest_events_path: Path
     query_events_path: Path
+    load_checkpoint_path: Path
     summary_path: Path
     summary: dict[str, Any]
 
@@ -59,6 +63,7 @@ def execute_benchmark(
     max_queries: int | None = None,
     load_only: bool = False,
     query_only: bool = False,
+    resume_load: bool = False,
     allow_destructive: bool = False,
     allow_large_run: bool = False,
     progress: ProgressCallback | None = None,
@@ -69,6 +74,10 @@ def execute_benchmark(
         raise ConfigError("--load-only and --query-only cannot be used together")
     if query_only and target.prepare_mode != "existing":
         raise ConfigError("--query-only requires target prepare.mode: existing")
+    if resume_load and query_only:
+        raise ConfigError("--resume-load cannot be used with --query-only")
+    if resume_load and target.prepare_mode != "existing":
+        raise ConfigError("--resume-load requires target prepare.mode: existing")
 
     _validate_limits(max_records=max_records, max_queries=max_queries)
     if _is_large_run(scenario, max_records=max_records) and not allow_large_run:
@@ -122,6 +131,7 @@ def execute_benchmark(
 
     ingest_events_path = out / INGEST_EVENTS_FILENAME
     query_events_path = out / QUERY_EVENTS_FILENAME
+    load_checkpoint_path = out / LOAD_CHECKPOINT_FILENAME
     summary_path = out / SUMMARY_FILENAME
 
     ticker = ProgressTicker(progress)
@@ -149,6 +159,17 @@ def execute_benchmark(
             max_batch_bytes=_max_batch_bytes(scenario),
             concurrency=_load_concurrency(scenario),
             events_path=ingest_events_path,
+            checkpoint_path=load_checkpoint_path,
+            checkpoint_context=_load_checkpoint_context(
+                records_path=records_path,
+                dataset_manifest=dataset_manifest,
+                scenario=scenario,
+                target=target,
+                batch_size=_batch_size(scenario),
+                max_batch_bytes=_max_batch_bytes(scenario),
+                max_records=max_records,
+            ),
+            resume_load=resume_load,
             progress=progress,
         )
         ingest_summary = load_result.summary
@@ -221,6 +242,7 @@ def execute_benchmark(
         output_dir=out,
         ingest_events_path=ingest_events_path,
         query_events_path=query_events_path,
+        load_checkpoint_path=load_checkpoint_path,
         summary_path=summary_path,
         summary=summary,
     )
@@ -235,22 +257,58 @@ def run_load_stage(
     max_batch_bytes: int | None,
     concurrency: int,
     events_path: str | Path,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_context: Mapping[str, Any] | None = None,
+    resume_load: bool = False,
     visibility_sample_size: int = 10,
     progress: ProgressCallback | None = None,
 ) -> LoadStageResult:
     events_output = Path(events_path)
     events_output.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_output = Path(checkpoint_path) if checkpoint_path is not None else None
+    checkpoint_context_dict = dict(checkpoint_context or {})
+    resumed_from_batch_index = _resume_batch_index(
+        checkpoint_output,
+        context=checkpoint_context_dict,
+        resume_load=resume_load,
+    )
 
     records_loaded = 0
+    skipped_records = 0
     load_errors = 0
     latencies: list[float] = []
     visibility_samples: list[VectorRecord] = []
     successful_batches = 0
+    skipped_batches = 0
     attempted_batches = 0
+    successful_batch_indexes: set[int] = set()
+    highest_contiguous_successful_batch_index = resumed_from_batch_index
     started = time.perf_counter()
     ticker = ProgressTicker(progress)
-    ticker.emit(f"load: starting batch_size={batch_size} concurrency={concurrency}")
-    with events_output.open("w", encoding="utf-8") as file:
+    ticker.emit(
+        f"load: starting batch_size={batch_size} concurrency={concurrency} "
+        f"resume={resume_load}"
+    )
+    if resumed_from_batch_index:
+        ticker.emit(f"load: resuming after batch={resumed_from_batch_index}")
+    _write_load_checkpoint(
+        checkpoint_output,
+        context=checkpoint_context_dict,
+        status="in_progress",
+        resumed_from_batch_index=resumed_from_batch_index,
+        highest_contiguous_successful_batch_index=(
+            highest_contiguous_successful_batch_index
+        ),
+        successful_batch_indexes=successful_batch_indexes,
+        attempted_batches=attempted_batches,
+        successful_batches=successful_batches,
+        skipped_batches=skipped_batches,
+        skipped_records=skipped_records,
+        records_loaded=records_loaded,
+        errors=load_errors,
+    )
+    events_mode = "a" if resume_load else "w"
+    with events_output.open(events_mode, encoding="utf-8") as file:
         batch_iter = enumerate(
             _batches(records, batch_size, max_batch_bytes=max_batch_bytes),
             start=1,
@@ -258,6 +316,10 @@ def run_load_stage(
 
         if concurrency == 1:
             for batch_index, batch in batch_iter:
+                if batch_index <= resumed_from_batch_index:
+                    skipped_batches += 1
+                    skipped_records += len(batch)
+                    continue
                 event = execute_load_batch(
                     adapter=adapter,
                     target=target,
@@ -268,10 +330,49 @@ def run_load_stage(
                 _write_event(file, event)
                 if event["status"] != "ok":
                     load_errors += 1
+                    _write_load_checkpoint(
+                        checkpoint_output,
+                        context=checkpoint_context_dict,
+                        status="failed",
+                        resumed_from_batch_index=resumed_from_batch_index,
+                        highest_contiguous_successful_batch_index=(
+                            highest_contiguous_successful_batch_index
+                        ),
+                        successful_batch_indexes=successful_batch_indexes,
+                        attempted_batches=attempted_batches,
+                        successful_batches=successful_batches,
+                        skipped_batches=skipped_batches,
+                        skipped_records=skipped_records,
+                        records_loaded=records_loaded,
+                        errors=load_errors,
+                    )
                     break
                 successful_batches += 1
+                successful_batch_indexes.add(batch_index)
+                highest_contiguous_successful_batch_index = (
+                    _advance_contiguous_watermark(
+                        highest_contiguous_successful_batch_index,
+                        successful_batch_indexes,
+                    )
+                )
                 records_loaded += int(event["records"])
                 latencies.append(float(event["latency_ms"]))
+                _write_load_checkpoint(
+                    checkpoint_output,
+                    context=checkpoint_context_dict,
+                    status="in_progress",
+                    resumed_from_batch_index=resumed_from_batch_index,
+                    highest_contiguous_successful_batch_index=(
+                        highest_contiguous_successful_batch_index
+                    ),
+                    successful_batch_indexes=successful_batch_indexes,
+                    attempted_batches=attempted_batches,
+                    successful_batches=successful_batches,
+                    skipped_batches=skipped_batches,
+                    skipped_records=skipped_records,
+                    records_loaded=records_loaded,
+                    errors=load_errors,
+                )
                 ticker.maybe(
                     "load: progress "
                     f"records={records_loaded} batches={successful_batches} "
@@ -287,23 +388,28 @@ def run_load_stage(
             accepting = True
 
             def submit_next(executor: ThreadPoolExecutor) -> bool:
-                nonlocal attempted_batches
+                nonlocal attempted_batches, skipped_batches, skipped_records
                 if not accepting:
                     return False
-                try:
-                    batch_index, batch = next(batch_iter)
-                except StopIteration:
-                    return False
-                attempted_batches += 1
-                future = executor.submit(
-                    _execute_load_batch_with_records,
-                    adapter,
-                    target,
-                    batch,
-                    batch_index,
-                )
-                pending[future] = None
-                return True
+                while True:
+                    try:
+                        batch_index, batch = next(batch_iter)
+                    except StopIteration:
+                        return False
+                    if batch_index <= resumed_from_batch_index:
+                        skipped_batches += 1
+                        skipped_records += len(batch)
+                        continue
+                    attempted_batches += 1
+                    future = executor.submit(
+                        _execute_load_batch_with_records,
+                        adapter,
+                        target,
+                        batch,
+                        batch_index,
+                    )
+                    pending[future] = None
+                    return True
 
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 for _ in range(concurrency):
@@ -319,10 +425,49 @@ def run_load_stage(
                         if event["status"] != "ok":
                             load_errors += 1
                             accepting = False
+                            _write_load_checkpoint(
+                                checkpoint_output,
+                                context=checkpoint_context_dict,
+                                status="failed",
+                                resumed_from_batch_index=resumed_from_batch_index,
+                                highest_contiguous_successful_batch_index=(
+                                    highest_contiguous_successful_batch_index
+                                ),
+                                successful_batch_indexes=successful_batch_indexes,
+                                attempted_batches=attempted_batches,
+                                successful_batches=successful_batches,
+                                skipped_batches=skipped_batches,
+                                skipped_records=skipped_records,
+                                records_loaded=records_loaded,
+                                errors=load_errors,
+                            )
                             continue
                         successful_batches += 1
+                        successful_batch_indexes.add(int(event["batch_index"]))
+                        highest_contiguous_successful_batch_index = (
+                            _advance_contiguous_watermark(
+                                highest_contiguous_successful_batch_index,
+                                successful_batch_indexes,
+                            )
+                        )
                         records_loaded += int(event["records"])
                         latencies.append(float(event["latency_ms"]))
+                        _write_load_checkpoint(
+                            checkpoint_output,
+                            context=checkpoint_context_dict,
+                            status="in_progress",
+                            resumed_from_batch_index=resumed_from_batch_index,
+                            highest_contiguous_successful_batch_index=(
+                                highest_contiguous_successful_batch_index
+                            ),
+                            successful_batch_indexes=successful_batch_indexes,
+                            attempted_batches=attempted_batches,
+                            successful_batches=successful_batches,
+                            skipped_batches=skipped_batches,
+                            skipped_records=skipped_records,
+                            records_loaded=records_loaded,
+                            errors=load_errors,
+                        )
                         ticker.maybe(
                             "load: progress "
                             f"records={records_loaded} batches={successful_batches} "
@@ -338,19 +483,46 @@ def run_load_stage(
                             break
 
     duration_seconds = time.perf_counter() - started
+    final_status = "completed" if load_errors == 0 else "failed"
+    _write_load_checkpoint(
+        checkpoint_output,
+        context=checkpoint_context_dict,
+        status=final_status,
+        resumed_from_batch_index=resumed_from_batch_index,
+        highest_contiguous_successful_batch_index=(
+            highest_contiguous_successful_batch_index
+        ),
+        successful_batch_indexes=successful_batch_indexes,
+        attempted_batches=attempted_batches,
+        successful_batches=successful_batches,
+        skipped_batches=skipped_batches,
+        skipped_records=skipped_records,
+        records_loaded=records_loaded,
+        errors=load_errors,
+    )
     ticker.emit(
         "load: finished "
         f"records={records_loaded} batches={successful_batches} errors={load_errors}"
     )
     return LoadStageResult(
         summary={
-            "status": "completed" if load_errors == 0 else "failed",
+            "status": final_status,
             "records": records_loaded,
+            "skipped_records": skipped_records,
             "batches": successful_batches,
+            "skipped_batches": skipped_batches,
             "attempts": attempted_batches,
             "errors": load_errors,
             "error_rate": _error_rate(load_errors, attempted_batches),
             "concurrency": concurrency,
+            "checkpoint": {
+                "path": str(checkpoint_output) if checkpoint_output else None,
+                "resume_enabled": resume_load,
+                "resumed_from_batch_index": resumed_from_batch_index,
+                "highest_contiguous_successful_batch_index": (
+                    highest_contiguous_successful_batch_index
+                ),
+            },
             "duration_seconds": duration_seconds,
             "records_per_second": _rate(records_loaded, duration_seconds),
             "attempts_per_second": _rate(attempted_batches, duration_seconds),
@@ -416,6 +588,99 @@ def _extend_visibility_samples(
         return
     remaining = visibility_sample_size - len(visibility_samples)
     visibility_samples.extend(batch[:remaining])
+
+
+def _resume_batch_index(
+    checkpoint_path: Path | None,
+    *,
+    context: Mapping[str, Any],
+    resume_load: bool,
+) -> int:
+    if not resume_load:
+        return 0
+    if checkpoint_path is None:
+        raise ConfigError("--resume-load requires a load checkpoint path")
+    if not checkpoint_path.exists():
+        raise ConfigError(f"load checkpoint {checkpoint_path} does not exist")
+    checkpoint = _read_load_checkpoint(checkpoint_path)
+    checkpoint_context = checkpoint.get("context")
+    if checkpoint_context != dict(context):
+        raise ConfigError(
+            "load checkpoint does not match this run's dataset, target, or "
+            "load settings"
+        )
+    batch_index = checkpoint.get("highest_contiguous_successful_batch_index")
+    if not isinstance(batch_index, int) or batch_index < 0:
+        raise ConfigError(
+            f"load checkpoint {checkpoint_path} has an invalid batch watermark"
+        )
+    return batch_index
+
+
+def _read_load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
+    try:
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ConfigError(f"could not read load checkpoint {checkpoint_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"could not parse load checkpoint {checkpoint_path}") from exc
+    if not isinstance(checkpoint, dict):
+        raise ConfigError(f"load checkpoint {checkpoint_path} must be a JSON object")
+    if checkpoint.get("schema_version") != LOAD_CHECKPOINT_SCHEMA_VERSION:
+        raise ConfigError(f"load checkpoint {checkpoint_path} has unsupported schema")
+    return checkpoint
+
+
+def _write_load_checkpoint(
+    checkpoint_path: Path | None,
+    *,
+    context: Mapping[str, Any],
+    status: str,
+    resumed_from_batch_index: int,
+    highest_contiguous_successful_batch_index: int,
+    successful_batch_indexes: set[int],
+    attempted_batches: int,
+    successful_batches: int,
+    skipped_batches: int,
+    skipped_records: int,
+    records_loaded: int,
+    errors: int,
+) -> None:
+    if checkpoint_path is None:
+        return
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": LOAD_CHECKPOINT_SCHEMA_VERSION,
+        "stage": "load",
+        "status": status,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "context": dict(context),
+        "resumed_from_batch_index": resumed_from_batch_index,
+        "highest_contiguous_successful_batch_index": (
+            highest_contiguous_successful_batch_index
+        ),
+        "successful_batch_indexes": sorted(successful_batch_indexes),
+        "attempted_batches": attempted_batches,
+        "successful_batches": successful_batches,
+        "skipped_batches": skipped_batches,
+        "skipped_records": skipped_records,
+        "records_loaded": records_loaded,
+        "errors": errors,
+    }
+    checkpoint_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _advance_contiguous_watermark(
+    current_watermark: int,
+    successful_batch_indexes: set[int],
+) -> int:
+    watermark = current_watermark
+    while watermark + 1 in successful_batch_indexes:
+        watermark += 1
+    return watermark
 
 
 def run_query_stage(
@@ -953,6 +1218,31 @@ def load_ground_truth(path: str | Path) -> dict[str, list[str]]:
                 if isinstance(match, dict) and "id" in match
             ]
     return truth
+
+
+def _load_checkpoint_context(
+    *,
+    records_path: Path,
+    dataset_manifest: Mapping[str, Any],
+    scenario: ScenarioConfig,
+    target: TargetConfig,
+    batch_size: int,
+    max_batch_bytes: int | None,
+    max_records: int | None,
+) -> dict[str, Any]:
+    artifacts = dataset_manifest.get("artifacts", {})
+    artifact_checksums = artifacts if isinstance(artifacts, Mapping) else {}
+    return {
+        "scenario_name": scenario.name,
+        "target_vendor": target.vendor,
+        "target_name": target.name,
+        "target_collection_name": target.collection_name,
+        "records_path": str(records_path),
+        "records_sha256": artifact_checksums.get("records_sha256"),
+        "batch_size": batch_size,
+        "max_batch_bytes": max_batch_bytes,
+        "max_records": max_records,
+    }
 
 
 def recall_at_k(
