@@ -6,6 +6,7 @@ import pytest
 
 from ldbbench.config import ConfigError, ScenarioConfig
 from ldbbench.datasets import default_dataset_output_dir, prepare_dataset
+from ldbbench.manifest import sha256_file
 
 
 def make_scenario() -> ScenarioConfig:
@@ -88,6 +89,15 @@ def test_prepare_dataset_writes_normalized_records_and_queries(tmp_path) -> None
     assert result.manifest["artifacts"]["raw_records_sha256"]
     assert result.manifest["artifacts"]["records_sha256"]
     assert result.manifest["artifacts"]["queries_sha256"]
+    assert result.manifest["artifacts"]["raw_records_sha256"] == sha256_file(
+        result.raw_records_path
+    )
+    assert result.manifest["artifacts"]["records_sha256"] == sha256_file(
+        result.records_path
+    )
+    assert result.manifest["artifacts"]["queries_sha256"] == sha256_file(
+        result.queries_path
+    )
     assert raw == rows[:3]
     assert queries[0]["id"] == "q"
     assert records == [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -11,7 +12,6 @@ from typing import Any
 
 from ldbbench.__about__ import __version__
 from ldbbench.config import ConfigError, ScenarioConfig
-from ldbbench.manifest import sha256_file
 from ldbbench.progress import ProgressCallback, ProgressTicker
 
 RAW_RECORDS_FILENAME = "raw_records.jsonl"
@@ -119,6 +119,13 @@ def prepare_dataset(
         written_queries=written_queries,
         dry_run=dry_run,
         status=status,
+        artifact_checksums=None
+        if dry_run
+        else {
+            "raw_records_sha256": prepared.raw_records_sha256,
+            "records_sha256": prepared.records_sha256,
+            "queries_sha256": prepared.queries_sha256,
+        },
     )
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -140,6 +147,9 @@ class PreparedCounts:
     source_rows: int
     records: int
     queries: int
+    raw_records_sha256: str
+    records_sha256: str
+    queries_sha256: str
 
 
 def load_huggingface_rows(
@@ -200,11 +210,14 @@ def write_prepared_records(
     source_rows = 0
     record_rows = 0
     query_rows = 0
+    raw_digest = hashlib.sha256()
+    records_digest = hashlib.sha256()
+    queries_digest = hashlib.sha256()
     ticker = ProgressTicker(progress)
     with (
-        raw_output.open("w", encoding="utf-8") as raw_file,
-        records_output.open("w", encoding="utf-8") as records_file,
-        queries_output.open("w", encoding="utf-8") as queries_file,
+        raw_output.open("wb") as raw_file,
+        records_output.open("wb") as records_file,
+        queries_output.open("wb") as queries_file,
     ):
         for row in rows:
             if record_rows >= record_limit and query_rows >= query_count:
@@ -217,17 +230,17 @@ def write_prepared_records(
                 vector_field=vector_field,
                 text_field=text_field,
             )
-            raw_file.write(json.dumps(raw, sort_keys=True) + "\n")
+            _write_json_line(raw_file, raw_digest, raw)
             if query_rows < query_count:
                 query = {
                     "id": normalized["id"],
                     "vector": normalized["vector"],
                     "metadata": normalized["metadata"],
                 }
-                queries_file.write(json.dumps(query, sort_keys=True) + "\n")
+                _write_json_line(queries_file, queries_digest, query)
                 query_rows += 1
             elif record_rows < record_limit:
-                records_file.write(json.dumps(normalized, sort_keys=True) + "\n")
+                _write_json_line(records_file, records_digest, normalized)
                 record_rows += 1
             source_rows += 1
             ticker.maybe(
@@ -239,7 +252,16 @@ def write_prepared_records(
         source_rows=source_rows,
         records=record_rows,
         queries=query_rows,
+        raw_records_sha256=raw_digest.hexdigest(),
+        records_sha256=records_digest.hexdigest(),
+        queries_sha256=queries_digest.hexdigest(),
     )
+
+
+def _write_json_line(file: Any, digest: Any, value: Mapping[str, Any]) -> None:
+    line = (json.dumps(value, sort_keys=True) + "\n").encode("utf-8")
+    file.write(line)
+    digest.update(line)
 
 
 def normalize_record(
@@ -285,6 +307,7 @@ def build_dataset_manifest(
     written_queries: int,
     dry_run: bool,
     status: str,
+    artifact_checksums: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     raw_records_path = output_dir / RAW_RECORDS_FILENAME
     records_path = output_dir / RECORDS_FILENAME
@@ -328,12 +351,8 @@ def build_dataset_manifest(
             "queries_sha256": None,
         },
     }
-    if raw_records_path.exists():
-        manifest["artifacts"]["raw_records_sha256"] = sha256_file(raw_records_path)
-    if records_path.exists():
-        manifest["artifacts"]["records_sha256"] = sha256_file(records_path)
-    if queries_path.exists():
-        manifest["artifacts"]["queries_sha256"] = sha256_file(queries_path)
+    if artifact_checksums:
+        manifest["artifacts"].update(dict(artifact_checksums))
     return manifest
 
 

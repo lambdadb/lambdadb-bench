@@ -50,6 +50,9 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - `.env.example` and `scripts/run-integration-tests.sh` provide an explicit
   local path for gated LambdaDB/Qdrant/Pinecone integration tests without
   auto-loading secrets during normal pytest runs.
+- Dataset prepare computes artifact SHA256 digests while writing JSONL files,
+  so full 1M prepares no longer pause silently after `wrote artifacts` to
+  re-read large files for checksums.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
