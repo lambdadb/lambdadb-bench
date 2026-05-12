@@ -40,10 +40,10 @@ visibility wait, and query stages.
 Start with a tiny row-limited dataset. This avoids a costly 1M-row run while
 verifying the end-to-end flow.
 
-This step does not use a LambdaDB or Qdrant target config. It reads the scenario
-dataset source and writes local files under `--out`. Set `HF_TOKEN` in your
-environment if you want authenticated Hugging Face downloads with higher rate
-limits.
+This step does not use a LambdaDB, Qdrant, or Pinecone target config. It reads
+the scenario dataset source and writes local files under `--out`. Set `HF_TOKEN`
+in your environment if you want authenticated Hugging Face downloads with higher
+rate limits.
 
 ```bash
 uv run ldbbench dataset prepare \
@@ -88,6 +88,7 @@ Use one target config per database. The checked-in files are examples:
 
 - `configs/lambdadb.example.yaml`
 - `configs/qdrant-cloud.example.yaml`
+- `configs/pinecone-serverless.example.yaml`
 
 For LambdaDB, set:
 
@@ -102,6 +103,23 @@ For Qdrant Cloud, set:
 ```bash
 export QDRANT_ENDPOINT=https://example.qdrant.io
 export QDRANT_API_KEY=...
+```
+
+For Pinecone Serverless, set:
+
+```bash
+export PINECONE_INDEX_HOST=https://example-index.svc.us-east-1-aws.pinecone.io
+export PINECONE_API_KEY=...
+```
+
+For local integration-test credentials, copy `.env.example` to `.env`, fill in
+the target credentials, and set only the gates you want to run to `1`. `.env` is
+ignored by git. The helper script loads `.env` explicitly:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+scripts/run-integration-tests.sh
 ```
 
 Before a real run, make sure the target config points at the collection you want
@@ -136,6 +154,12 @@ Qdrant:
 
 ```bash
 uv run ldbbench target check --target configs/qdrant-cloud.smoke.yaml
+```
+
+Pinecone:
+
+```bash
+uv run ldbbench target check --target configs/pinecone-serverless.example.yaml
 ```
 
 Validate the scenario plus target plan:

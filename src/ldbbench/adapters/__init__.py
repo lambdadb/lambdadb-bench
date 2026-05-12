@@ -11,6 +11,7 @@ from ldbbench.adapters.base import (
     VectorRecord,
 )
 from ldbbench.adapters.lambdadb import LambdaDBAdapter
+from ldbbench.adapters.pinecone import PineconeAdapter
 from ldbbench.adapters.qdrant import QdrantAdapter
 from ldbbench.adapters.registry import get_adapter
 
@@ -18,6 +19,7 @@ __all__ = [
     "AdapterCapabilities",
     "CheckResult",
     "LambdaDBAdapter",
+    "PineconeAdapter",
     "PrepareResult",
     "QdrantAdapter",
     "QueryMatch",

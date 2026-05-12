@@ -443,7 +443,7 @@ but mark the result as not meeting the quality target.
 
 ### Phase 3: Pinecone Serverless
 
-- Pinecone adapter.
+- Pinecone adapter. (Implemented)
 - Same 1M workload.
 - Report comparing LambdaDB, Qdrant Cloud, and Pinecone Serverless.
 

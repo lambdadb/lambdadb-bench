@@ -1,0 +1,19 @@
+vendor: pinecone
+name: pinecone-serverless-user-index
+endpoint: ${PINECONE_INDEX_HOST}
+api_key_env: PINECONE_API_KEY
+collection_name: cohere-wikipedia-1m
+region: us-east-1
+cloud: aws
+namespace: ""
+pool_threads: 50
+connection_pool_maxsize: 50
+
+prepare:
+  mode: existing
+
+metadata:
+  deployment_mode: serverless
+  user_declared_config: "User-selected Pinecone Serverless index"
+  pricing_notes: "User-provided Pinecone Serverless pricing assumptions"
+  report_label: pinecone-serverless

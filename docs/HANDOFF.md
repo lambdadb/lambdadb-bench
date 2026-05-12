@@ -2,8 +2,9 @@
 
 Last updated: 2026-05-12
 
-This repository includes Phase 2-6 runner follow-up work. Real LambdaDB/Qdrant
-Phase 2 endpoint validation has been completed by the user.
+This repository includes Phase 2-6 runner follow-up work and the Phase 3
+Pinecone Serverless adapter. Real LambdaDB/Qdrant Phase 2 endpoint validation
+has been completed by the user.
 
 ## Current State
 
@@ -44,6 +45,11 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
   optional `groundtruth` extra.
 - Long-running CLI commands emit `progress:` logs for dataset prepare,
   ground-truth generation, load, visibility wait, and query stages.
+- Pinecone Serverless is registered as a real adapter using the official
+  `pinecone>=9.0.0` SDK.
+- `.env.example` and `scripts/run-integration-tests.sh` provide an explicit
+  local path for gated LambdaDB/Qdrant/Pinecone integration tests without
+  auto-loading secrets during normal pytest runs.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
@@ -234,10 +240,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after resumable load/checkpoint work:
+Current test count after Pinecone adapter work:
 
 ```text
-76 passed, 2 skipped
+87 passed, 3 skipped
 ```
 
 Useful smoke commands:
@@ -261,8 +267,8 @@ QDRANT_ENDPOINT=https://example.qdrant.io \
 
 ## Next Work
 
-Pick up the next implementation item from Later Work, starting with the Pinecone
-Serverless adapter unless priorities change.
+Run gated Pinecone endpoint validation when credentials are available, then move
+to the report generator or another Later Work item unless priorities change.
 
 ## Qdrant SDK Notes
 
@@ -411,6 +417,70 @@ collections.docs.fetch(
 )
 ```
 
+## Pinecone SDK Notes
+
+Package check:
+
+- PyPI package: `pinecone`
+- Observed version from local lock: `9.0.0`
+
+Local introspection confirmed:
+
+```text
+Pinecone(api_key=..., timeout=..., connection_pool_maxsize=...)
+Pinecone.create_index(name=..., dimension=..., metric=..., spec=..., timeout=...)
+Pinecone.delete_index(name=..., timeout=...)
+Pinecone.has_index(name=...)
+Pinecone.describe_index(name=...)
+Pinecone.Index(name=..., host=..., pool_threads=..., connection_pool_maxsize=...)
+Index.upsert(vectors=..., namespace=...)
+Index.query(vector=..., top_k=..., namespace=..., include_values=..., include_metadata=..., filter=...)
+Index.fetch(ids=..., namespace=...)
+ServerlessSpec(cloud=..., region=..., read_capacity=..., schema=...)
+```
+
+## Phase 3 Status
+
+Pinecone Serverless adapter surface is complete for normal tests without
+requiring real endpoints.
+
+- Added `pinecone>=9.0.0`; local lock resolved `pinecone==9.0.0`.
+- Implemented `src/ldbbench/adapters/pinecone.py`.
+- Registered the real Pinecone adapter while preserving dry-run planning
+  behavior for `ldbbench run --dry-run`.
+- Added Pinecone target config support:
+  - `endpoint` as optional index host for data-plane calls.
+  - `api_key_env`
+  - `collection_name` with legacy `collection` compatibility as index name.
+  - `region`
+  - optional `cloud`, defaulting to `aws`.
+  - optional `namespace`, defaulting to the default namespace.
+  - optional `pool_threads` and `connection_pool_maxsize`.
+  - optional `spec`, `tags`, `create_timeout_seconds`, and
+    `delete_timeout_seconds`.
+- Implemented `existing`, `create`, and `recreate` preparation modes for
+  serverless dense-vector indexes.
+- Implemented `upsert_batch`, `query`, and `fetch`.
+- Added fake-client unit tests for check, prepare, upsert, query, fetch,
+  missing credential behavior, and strong-consistency rejection.
+- Added gated Pinecone integration coverage behind
+  `PINECONE_BENCH_RUN_INTEGRATION=1`.
+- Added `configs/pinecone-serverless.example.yaml`.
+- Added `.env.example` and `scripts/run-integration-tests.sh` for explicit
+  local integration-test env loading.
+- Updated `README.md` and `docs/DESIGN.md`.
+
+Implementation choices:
+
+- Pinecone remains eventual-only in the portable benchmark consistency model.
+- benchmark `query.consistency: strong` should continue to plan as `N/A` for
+  Pinecone.
+- `target.endpoint` maps to the Pinecone index host. If omitted, the adapter
+  targets the index by `collection_name`, which causes the SDK to resolve the
+  host through the control plane.
+- Pinecone create mode maps benchmark metric `cosine|dot|dot_product|euclidean`
+  to Pinecone metrics `cosine|dotproduct|euclidean`.
+
 ## Phase 2 Status
 
 ### Phase 2-6 Stage 2: Concurrent/Duration Runner
@@ -457,6 +527,8 @@ Completed validation:
 
 - Real LambdaDB and Qdrant endpoint validation was completed directly by the
   user.
+- Pinecone adapter unit coverage was added. Real Pinecone endpoint validation is
+  gated behind `PINECONE_BENCH_RUN_INTEGRATION=1`.
 
 ## Optional Scale Validation Checklist
 
@@ -509,7 +581,6 @@ stable. Prepare 1k/10k datasets before any full 1M workload, and use
 
 ## Later Work
 
-- Pinecone Serverless adapter.
 - Cloud-runner or persisted-index ground truth for 10M+ workloads.
 - 10M scenario.
 - filtered search scenario.
