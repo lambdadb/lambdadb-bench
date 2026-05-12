@@ -40,6 +40,8 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - `--load-only` and `--query-only` support separate load/query validation.
 - FAISS-backed ground truth is available through `--backend faiss` with the
   optional `groundtruth` extra.
+- Long-running CLI commands emit `progress:` logs for dataset prepare,
+  ground-truth generation, load, visibility wait, and query stages.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
@@ -502,11 +504,6 @@ full 1M workload with `--allow-large-run` after cost/resource approval.
 
 ## Later Work
 
-- CLI progress reporting for long-running commands. Treat this as a cross-cutting
-  UX task rather than a FAISS-only fix. Add periodic progress/status logs for
-  `dataset prepare`, `dataset ground-truth` record loading/index/search phases,
-  and `run` load/query stages so users can tell whether work is still active,
-  how far it has progressed, and which phase is currently running.
 - Resumable load/checkpoint support for interrupted large ingests. Current
   behavior re-reads `records.jsonl` from the beginning on rerun; with
   `prepare.mode: existing`, this means already-written IDs are upserted again.

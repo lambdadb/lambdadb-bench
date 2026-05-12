@@ -277,6 +277,7 @@ def run_dataset_prepare(args: argparse.Namespace) -> int:
         limit=args.limit,
         dry_run=args.dry_run,
         query_count=args.query_count,
+        progress=print_progress,
     )
     print(f"status: {result.manifest['status']}")
     print(
@@ -305,6 +306,7 @@ def run_dataset_ground_truth(args: argparse.Namespace) -> int:
         limit_queries=args.limit_queries,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
+        progress=print_progress,
     )
     print(f"status: {result.manifest['status']}")
     print(f"backend: {result.manifest['ground_truth']['backend']}")
@@ -358,6 +360,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             query_only=args.query_only,
             allow_destructive=args.allow_destructive,
             allow_large_run=args.allow_large_run,
+            progress=print_progress,
         )
         print(f"run: {result.summary['status']}")
         print(f"records: {result.summary['load']['records']}")
@@ -441,6 +444,10 @@ def _suppress_resource_tracker_warning() -> None:
     if RESOURCE_TRACKER_WARNING_FILTER not in filters:
         filters.append(RESOURCE_TRACKER_WARNING_FILTER)
         os.environ["PYTHONWARNINGS"] = ",".join(filters)
+
+
+def print_progress(message: str) -> None:
+    print(f"progress: {message}", flush=True)
 
 
 if __name__ == "__main__":

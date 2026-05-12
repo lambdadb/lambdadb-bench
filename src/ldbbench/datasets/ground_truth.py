@@ -18,6 +18,7 @@ from ldbbench.datasets.prepare import (
     RECORDS_FILENAME,
 )
 from ldbbench.manifest import sha256_file
+from ldbbench.progress import ProgressCallback, ProgressTicker
 
 GROUND_TRUTH_FILENAME = "ground_truth.jsonl"
 GROUND_TRUTH_MANIFEST_FILENAME = "ground_truth_manifest.json"
@@ -51,6 +52,7 @@ def prepare_ground_truth(
     limit_queries: int | None = None,
     batch_size: int = DEFAULT_FAISS_BATCH_SIZE,
     dry_run: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> GroundTruthResult:
     if top_k <= 0:
         raise ConfigError("ground truth top_k must be a positive integer")
@@ -85,11 +87,20 @@ def prepare_ground_truth(
         metric=selected_metric,
         batch_size=batch_size,
     )
+    ticker = ProgressTicker(progress)
     if dry_run:
+        ticker.emit(
+            f"ground_truth: planning backend={backend} metric={selected_metric}"
+        )
         status = "planned"
     else:
+        ticker.emit(
+            f"ground_truth: starting backend={backend} metric={selected_metric}"
+        )
         if backend == "exact":
+            ticker.emit("ground_truth: loading records for exact search")
             records = list(read_vector_items(records_path))
+            ticker.emit(f"ground_truth: loaded records={len(records)}")
             queries = read_vector_items(queries_path)
             query_count = write_exact_ground_truth(
                 records=records,
@@ -98,6 +109,7 @@ def prepare_ground_truth(
                 top_k=top_k,
                 metric=selected_metric,
                 limit_queries=limit_queries,
+                progress=progress,
             )
             record_count = len(records)
         elif backend == "faiss":
@@ -110,10 +122,14 @@ def prepare_ground_truth(
                 limit_queries=limit_queries,
                 batch_size=batch_size,
                 dataset_manifest=dataset_manifest,
+                progress=progress,
             )
             query_count = result["queries"]
             record_count = result["records"]
             backend_details.update(result["backend_details"])
+        ticker.emit(
+            f"ground_truth: computed records={record_count} queries={query_count}"
+        )
         status = "prepared"
 
     manifest = build_ground_truth_manifest(
@@ -152,10 +168,12 @@ def write_exact_ground_truth(
     top_k: int,
     metric: str,
     limit_queries: int | None = None,
+    progress: ProgressCallback | None = None,
 ) -> int:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     count = 0
+    ticker = ProgressTicker(progress)
     with output.open("w", encoding="utf-8") as file:
         for query in queries:
             if limit_queries is not None and count >= limit_queries:
@@ -177,6 +195,7 @@ def write_exact_ground_truth(
                 + "\n"
             )
             count += 1
+            ticker.maybe(f"ground_truth: exact queries={count}")
     return count
 
 
@@ -190,22 +209,32 @@ def write_faiss_ground_truth(
     limit_queries: int | None,
     batch_size: int,
     dataset_manifest: Mapping[str, Any],
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     faiss, np = import_faiss_dependencies()
     dimensions = dataset_dimensions(dataset_manifest)
     expected_records = dataset_record_count(dataset_manifest)
+    ticker = ProgressTicker(progress)
+    ticker.emit(
+        "ground_truth: loading records for faiss "
+        f"expected_records={expected_records or 'unknown'} dimensions={dimensions}"
+    )
     record_ids, record_vectors = read_faiss_records(
         records_path=records_path,
         dimensions=dimensions,
         expected_records=expected_records,
         np=np,
+        progress=progress,
     )
     normalize = metric == "cosine"
     if normalize:
+        ticker.emit("ground_truth: normalizing record vectors")
         faiss.normalize_L2(record_vectors)
 
+    ticker.emit(f"ground_truth: building faiss index records={len(record_ids)}")
     index = faiss.IndexFlatIP(dimensions)
     index.add(record_vectors)
+    ticker.emit("ground_truth: searching queries with faiss")
 
     query_count = write_faiss_query_results(
         faiss=faiss,
@@ -220,6 +249,7 @@ def write_faiss_ground_truth(
         limit_queries=limit_queries,
         batch_size=batch_size,
         dimensions=dimensions,
+        progress=progress,
     )
     return {
         "records": len(record_ids),
@@ -246,11 +276,13 @@ def write_faiss_query_results(
     limit_queries: int | None,
     batch_size: int,
     dimensions: int,
+    progress: ProgressCallback | None = None,
 ) -> int:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     query_count = 0
     search_k = min(len(record_ids), top_k + 1)
+    ticker = ProgressTicker(progress)
     with output.open("w", encoding="utf-8") as file:
         query_batch: list[VectorItem] = []
         for query in read_vector_items(queries_path):
@@ -276,6 +308,7 @@ def write_faiss_query_results(
                     normalize=normalize,
                 )
                 query_batch = []
+                ticker.maybe(f"ground_truth: faiss queries={query_count}")
         if query_batch and (limit_queries is None or query_count < limit_queries):
             if limit_queries is not None:
                 query_batch = query_batch[: limit_queries - query_count]
@@ -291,6 +324,7 @@ def write_faiss_query_results(
                 metric=metric,
                 normalize=normalize,
             )
+            ticker.maybe(f"ground_truth: faiss queries={query_count}")
     return query_count
 
 
@@ -378,6 +412,7 @@ def read_faiss_records(
     dimensions: int,
     expected_records: int | None,
     np: Any,
+    progress: ProgressCallback | None = None,
 ) -> tuple[list[str], Any]:
     ids: list[str] = []
     if expected_records is not None:
@@ -385,6 +420,7 @@ def read_faiss_records(
     else:
         rows = []
         vectors = None
+    ticker = ProgressTicker(progress)
     with Path(records_path).open("r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, start=1):
             if not line.strip():
@@ -410,6 +446,11 @@ def read_faiss_records(
                 vectors[len(ids) - 1] = item.vector
             else:
                 rows.append(item.vector)
+            ticker.maybe(
+                "ground_truth: loading records "
+                f"records={len(ids)}"
+                + (f"/{expected_records}" if expected_records is not None else "")
+            )
 
     if vectors is not None:
         if len(ids) != expected_records:

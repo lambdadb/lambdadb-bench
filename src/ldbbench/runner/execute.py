@@ -21,6 +21,7 @@ from ldbbench.datasets.ground_truth import (
 )
 from ldbbench.datasets.prepare import QUERIES_FILENAME, RECORDS_FILENAME
 from ldbbench.manifest import initialize_run_artifacts
+from ldbbench.progress import ProgressCallback, ProgressTicker
 from ldbbench.runner.plan import build_run_plan
 
 INGEST_EVENTS_FILENAME = "ingest_events.jsonl"
@@ -60,6 +61,7 @@ def execute_benchmark(
     query_only: bool = False,
     allow_destructive: bool = False,
     allow_large_run: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> BenchmarkRunResult:
     """Execute a small or explicitly opted-in benchmark run sequentially."""
 
@@ -122,16 +124,23 @@ def execute_benchmark(
     query_events_path = out / QUERY_EVENTS_FILENAME
     summary_path = out / SUMMARY_FILENAME
 
+    ticker = ProgressTicker(progress)
+    ticker.emit(
+        f"run: preparing target vendor={target.vendor} mode={target.prepare_mode}"
+    )
     adapter.prepare(
         target,
         dimensions=_dataset_dimensions(scenario, dataset_manifest),
         metric=_dataset_metric(scenario, dataset_manifest),
     )
+    ticker.emit("run: target prepared")
 
     if query_only:
+        ticker.emit("run: skipping load query_only=true")
         ingest_events_path.write_text("", encoding="utf-8")
         ingest_summary = skipped_load_summary(reason="query_only")
     else:
+        ticker.emit("run: starting load stage")
         load_result = run_load_stage(
             adapter=adapter,
             target=target,
@@ -140,9 +149,16 @@ def execute_benchmark(
             max_batch_bytes=_max_batch_bytes(scenario),
             concurrency=_load_concurrency(scenario),
             events_path=ingest_events_path,
+            progress=progress,
         )
         ingest_summary = load_result.summary
+        ticker.emit(
+            "run: load stage finished "
+            f"status={ingest_summary['status']} records={ingest_summary['records']} "
+            f"errors={ingest_summary['errors']}"
+        )
         if ingest_summary["errors"] == 0 and _wait_until_query_visible(scenario):
+            ticker.emit("run: waiting for query visibility")
             ingest_summary["visibility"] = wait_until_query_visible(
                 adapter=adapter,
                 target=target,
@@ -151,14 +167,24 @@ def execute_benchmark(
                 consistency=str(scenario.query.get("consistency", "eventual")),
                 timeout_seconds=_visibility_timeout_seconds(scenario),
                 poll_interval_seconds=_visibility_poll_interval_seconds(scenario),
+                progress=progress,
+            )
+            ticker.emit(
+                "run: query visibility "
+                f"status={ingest_summary['visibility']['status']} "
+                f"visible={ingest_summary['visibility']['visible']}/"
+                f"{ingest_summary['visibility']['samples']}"
             )
 
     skip_reason = _query_skip_reason(load_summary=ingest_summary, load_only=load_only)
     if skip_reason is not None:
+        ticker.emit(f"run: skipping query reason={skip_reason}")
         query_events_path.write_text("", encoding="utf-8")
         query_summary = skipped_query_summary(reason=skip_reason)
     else:
+        ticker.emit("run: loading query vectors")
         queries = list(read_records(queries_path, limit=max_queries))
+        ticker.emit(f"run: starting query stage query_vectors={len(queries)}")
         query_summary = run_query_stage(
             adapter=adapter,
             target=target,
@@ -169,6 +195,12 @@ def execute_benchmark(
             ground_truth=ground_truth,
             events_path=query_events_path,
             stages=None if max_queries is not None else _query_stages(scenario),
+            progress=progress,
+        )
+        ticker.emit(
+            "run: query stage finished "
+            f"mode={query_summary['mode']} queries={query_summary['queries']} "
+            f"errors={query_summary['errors']}"
         )
 
     summary = {
@@ -183,6 +215,7 @@ def execute_benchmark(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    ticker.emit(f"run: wrote summary status={summary['status']}")
 
     return BenchmarkRunResult(
         output_dir=out,
@@ -203,6 +236,7 @@ def run_load_stage(
     concurrency: int,
     events_path: str | Path,
     visibility_sample_size: int = 10,
+    progress: ProgressCallback | None = None,
 ) -> LoadStageResult:
     events_output = Path(events_path)
     events_output.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +248,8 @@ def run_load_stage(
     successful_batches = 0
     attempted_batches = 0
     started = time.perf_counter()
+    ticker = ProgressTicker(progress)
+    ticker.emit(f"load: starting batch_size={batch_size} concurrency={concurrency}")
     with events_output.open("w", encoding="utf-8") as file:
         batch_iter = enumerate(
             _batches(records, batch_size, max_batch_bytes=max_batch_bytes),
@@ -236,6 +272,11 @@ def run_load_stage(
                 successful_batches += 1
                 records_loaded += int(event["records"])
                 latencies.append(float(event["latency_ms"]))
+                ticker.maybe(
+                    "load: progress "
+                    f"records={records_loaded} batches={successful_batches} "
+                    f"errors={load_errors}"
+                )
                 _extend_visibility_samples(
                     visibility_samples,
                     batch,
@@ -282,6 +323,11 @@ def run_load_stage(
                         successful_batches += 1
                         records_loaded += int(event["records"])
                         latencies.append(float(event["latency_ms"]))
+                        ticker.maybe(
+                            "load: progress "
+                            f"records={records_loaded} batches={successful_batches} "
+                            f"errors={load_errors}"
+                        )
                         _extend_visibility_samples(
                             visibility_samples,
                             batch,
@@ -292,6 +338,10 @@ def run_load_stage(
                             break
 
     duration_seconds = time.perf_counter() - started
+    ticker.emit(
+        "load: finished "
+        f"records={records_loaded} batches={successful_batches} errors={load_errors}"
+    )
     return LoadStageResult(
         summary={
             "status": "completed" if load_errors == 0 else "failed",
@@ -379,10 +429,12 @@ def run_query_stage(
     ground_truth: Mapping[str, list[str]],
     events_path: str | Path,
     stages: list[dict[str, Any]] | None = None,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     events_output = Path(events_path)
     events_output.parent.mkdir(parents=True, exist_ok=True)
     query_list = list(queries)
+    ticker = ProgressTicker(progress)
     if not query_list:
         events_output.write_text("", encoding="utf-8")
         return _query_summary(
@@ -406,10 +458,12 @@ def run_query_stage(
             ground_truth=ground_truth,
             events_path=events_output,
             stages=stages,
+            progress=progress,
         )
 
     state = QueryRunState()
     started = time.perf_counter()
+    ticker.emit(f"query: starting one_pass queries={len(query_list)}")
     with events_output.open("w", encoding="utf-8") as file:
         for query_index, query in enumerate(query_list, start=1):
             event = execute_query_once(
@@ -426,7 +480,15 @@ def run_query_stage(
             )
             state.record(event)
             _write_event(file, event)
+            ticker.maybe(
+                "query: one_pass progress "
+                f"attempts={state.queries + state.errors}/{len(query_list)} "
+                f"errors={state.errors}"
+            )
 
+    ticker.emit(
+        f"query: one_pass finished queries={state.queries} errors={state.errors}"
+    )
     return _query_summary(
         mode="one_pass",
         started=started,
@@ -449,6 +511,7 @@ def run_staged_query_stage(
     ground_truth: Mapping[str, list[str]],
     events_path: Path,
     stages: list[dict[str, Any]],
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     query_lock = Lock()
     write_lock = Lock()
@@ -456,6 +519,7 @@ def run_staged_query_stage(
     next_query_index = 1
     started = time.perf_counter()
     stage_summaries: list[dict[str, Any]] = []
+    ticker = ProgressTicker(progress)
 
     with events_path.open("w", encoding="utf-8") as file:
         for stage_index, stage in enumerate(stages, start=1):
@@ -466,6 +530,11 @@ def run_staged_query_stage(
             deadline = time.perf_counter() + duration_seconds
             stage_state = QueryRunState()
             stage_started = time.perf_counter()
+            ticker.emit(
+                "query: starting stage "
+                f"stage={stage_index}/{len(stages)} concurrency={concurrency} "
+                f"duration_seconds={duration_seconds}"
+            )
 
             def next_query(
                 stage_deadline: float = deadline,
@@ -483,6 +552,8 @@ def run_staged_query_stage(
                 worker_index: int,
                 current_stage_index: int = stage_index,
                 current_stage_state: QueryRunState = stage_state,
+                current_stage_started: float = stage_started,
+                current_duration_seconds: float = duration_seconds,
             ) -> None:
                 while True:
                     item = next_query()
@@ -505,6 +576,18 @@ def run_staged_query_stage(
                         state.record(event)
                         current_stage_state.record(event)
                         _write_event(file, event)
+                        elapsed = time.perf_counter() - current_stage_started
+                        attempts = (
+                            current_stage_state.queries + current_stage_state.errors
+                        )
+                        ticker.maybe(
+                            "query: stage progress "
+                            f"stage={current_stage_index} "
+                            f"elapsed_seconds={elapsed:.1f}/"
+                            f"{current_duration_seconds:.1f} "
+                            f"attempts={attempts} "
+                            f"errors={current_stage_state.errors}"
+                        )
 
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = [
@@ -522,6 +605,11 @@ def run_staged_query_stage(
                     elapsed_seconds=time.perf_counter() - stage_started,
                     state=stage_state,
                 )
+            )
+            ticker.emit(
+                "query: stage finished "
+                f"stage={stage_index} queries={stage_state.queries} "
+                f"errors={stage_state.errors}"
             )
 
     return _query_summary(
@@ -688,6 +776,7 @@ def wait_until_query_visible(
     consistency: str,
     timeout_seconds: float,
     poll_interval_seconds: float,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     if not records:
         return {
@@ -708,6 +797,11 @@ def wait_until_query_visible(
     started = time.perf_counter()
     deadline = started + timeout_seconds
     last_error: dict[str, str] | None = None
+    ticker = ProgressTicker(progress)
+    ticker.emit(
+        f"visibility: waiting samples={len(records)} "
+        f"timeout_seconds={timeout_seconds}"
+    )
 
     while pending and time.perf_counter() <= deadline:
         for record_id, record in list(pending.items()):
@@ -730,6 +824,11 @@ def wait_until_query_visible(
             latencies.append(_elapsed_ms(query_started))
             if record_id in {match.id for match in result.matches}:
                 pending.pop(record_id, None)
+            ticker.maybe(
+                "visibility: progress "
+                f"visible={len(records) - len(pending)}/{len(records)} "
+                f"attempts={attempts}"
+            )
 
         if pending:
             remaining = deadline - time.perf_counter()
@@ -739,6 +838,10 @@ def wait_until_query_visible(
 
     duration_seconds = time.perf_counter() - started
     status = "visible" if not pending else "timeout"
+    ticker.emit(
+        "visibility: finished "
+        f"status={status} visible={len(records) - len(pending)}/{len(records)}"
+    )
     summary: dict[str, Any] = {
         "enabled": True,
         "status": status,

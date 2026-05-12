@@ -111,6 +111,7 @@ query:
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    assert "progress: dataset_prepare: planning artifacts" in captured.out
     assert "status: planned" in captured.out
     assert (output_dir / "dataset_manifest.json").exists()
 
@@ -166,6 +167,7 @@ query:
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    assert "progress: ground_truth: starting backend=exact" in captured.out
     assert "status: prepared" in captured.out
     assert (dataset_dir / "ground_truth.jsonl").exists()
 

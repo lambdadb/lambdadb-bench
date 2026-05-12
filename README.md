@@ -31,6 +31,10 @@ Check the CLI:
 uv run ldbbench doctor
 ```
 
+Long-running commands print `progress:` lines for major phases and periodic
+counts. This includes dataset preparation, ground-truth generation, load,
+visibility wait, and query stages.
+
 ### 1. Prepare a smoke dataset
 
 Start with a tiny row-limited dataset. This avoids a costly 1M-row run while

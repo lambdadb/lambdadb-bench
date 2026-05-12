@@ -12,6 +12,7 @@ from typing import Any
 from ldbbench.__about__ import __version__
 from ldbbench.config import ConfigError, ScenarioConfig
 from ldbbench.manifest import sha256_file
+from ldbbench.progress import ProgressCallback, ProgressTicker
 
 RAW_RECORDS_FILENAME = "raw_records.jsonl"
 RECORDS_FILENAME = "records.jsonl"
@@ -39,6 +40,7 @@ def prepare_dataset(
     dry_run: bool = False,
     query_count: int | None = None,
     source_rows: Iterable[Mapping[str, Any]] | None = None,
+    progress: ProgressCallback | None = None,
 ) -> DatasetPrepareResult:
     """Prepare dataset cache artifacts for a scenario.
 
@@ -69,12 +71,23 @@ def prepare_dataset(
     written_rows = 0
     written_queries = 0
     written_source_rows = 0
+    ticker = ProgressTicker(progress)
     if dry_run:
+        ticker.emit("dataset_prepare: planning artifacts")
         status = "planned"
     else:
         rows = source_rows
         if rows is None:
+            ticker.emit(
+                "dataset_prepare: streaming source "
+                f"provider={provider} requested_source_rows={requested_source_rows}"
+            )
             rows = load_huggingface_rows(scenario=scenario, limit=requested_source_rows)
+        ticker.emit(
+            "dataset_prepare: writing artifacts "
+            f"requested_queries={requested_query_rows} "
+            f"requested_records={requested_rows}"
+        )
         prepared = write_prepared_records(
             scenario=scenario,
             rows=rows,
@@ -83,10 +96,16 @@ def prepare_dataset(
             queries_output_path=queries_path,
             record_limit=requested_rows,
             query_count=requested_query_rows,
+            progress=progress,
         )
         written_rows = prepared.records
         written_queries = prepared.queries
         written_source_rows = prepared.source_rows
+        ticker.emit(
+            "dataset_prepare: wrote artifacts "
+            f"source_rows={written_source_rows} queries={written_queries} "
+            f"records={written_rows}"
+        )
         status = "prepared"
 
     manifest = build_dataset_manifest(
@@ -163,6 +182,7 @@ def write_prepared_records(
     queries_output_path: str | Path,
     record_limit: int,
     query_count: int,
+    progress: ProgressCallback | None = None,
 ) -> PreparedCounts:
     raw_output = Path(raw_output_path)
     records_output = Path(records_output_path)
@@ -180,6 +200,7 @@ def write_prepared_records(
     source_rows = 0
     record_rows = 0
     query_rows = 0
+    ticker = ProgressTicker(progress)
     with (
         raw_output.open("w", encoding="utf-8") as raw_file,
         records_output.open("w", encoding="utf-8") as records_file,
@@ -209,6 +230,11 @@ def write_prepared_records(
                 records_file.write(json.dumps(normalized, sort_keys=True) + "\n")
                 record_rows += 1
             source_rows += 1
+            ticker.maybe(
+                "dataset_prepare: writing "
+                f"source_rows={source_rows} queries={query_rows}/{query_count} "
+                f"records={record_rows}/{record_limit}"
+            )
     return PreparedCounts(
         source_rows=source_rows,
         records=record_rows,
