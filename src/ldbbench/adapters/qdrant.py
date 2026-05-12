@@ -175,7 +175,7 @@ class QdrantAdapter:
         settings = _settings_from_target(target)
         response = self._client(settings).query_points(
             collection_name=settings.collection_name,
-            query=list(vector),
+            query=_vector_values(vector),
             using=settings.vector_name,
             query_filter=filter_query,
             limit=top_k,

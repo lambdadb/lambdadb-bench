@@ -66,6 +66,10 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
   those caches to older prepared datasets without re-downloading source data.
   Runs automatically prefer the msgpack cache when present while preserving the
   original JSONL byte estimate for `load.max_batch_bytes`.
+- Staged query runs now decouple request workers from JSONL event writes with a
+  writer thread and batched flushes, avoiding a per-query write lock/flush
+  ceiling at high configured concurrency. The Qdrant query adapter also reuses
+  list vectors directly instead of copying every query vector.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
@@ -256,7 +260,7 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after msgpack dataset cache work:
+Current test count after query runner optimization work:
 
 ```text
 94 passed, 3 skipped

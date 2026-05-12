@@ -9,7 +9,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
+from queue import Queue
+from threading import Lock, Thread
 from typing import Any
 
 import msgpack
@@ -42,6 +43,7 @@ SUMMARY_FILENAME = "summary.json"
 LOAD_CHECKPOINT_FILENAME = "load_checkpoint.json"
 LARGE_RUN_ROW_THRESHOLD = 1_000_000
 LOAD_CHECKPOINT_SCHEMA_VERSION = 1
+QUERY_EVENT_FLUSH_INTERVAL = 1000
 
 
 @dataclass(frozen=True)
@@ -842,12 +844,13 @@ def run_query_stage(
                 ground_truth=ground_truth,
             )
             state.record(event)
-            _write_event(file, event)
+            _write_event(file, event, flush=False, sort_keys=False)
             ticker.maybe(
                 "query: one_pass progress "
                 f"attempts={state.queries + state.errors}/{len(query_list)} "
                 f"errors={state.errors}"
             )
+        file.flush()
 
     ticker.emit(
         f"query: one_pass finished queries={state.queries} errors={state.errors}"
@@ -877,7 +880,6 @@ def run_staged_query_stage(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     query_lock = Lock()
-    write_lock = Lock()
     state = QueryRunState()
     next_query_index = 1
     started = time.perf_counter()
@@ -899,6 +901,10 @@ def run_staged_query_stage(
                 f"duration_seconds={duration_seconds}"
             )
 
+            event_queue: Queue[Mapping[str, Any] | None] = Queue(
+                maxsize=max(concurrency * 16, QUERY_EVENT_FLUSH_INTERVAL),
+            )
+
             def next_query(
                 stage_deadline: float = deadline,
             ) -> tuple[int, VectorRecord] | None:
@@ -914,9 +920,7 @@ def run_staged_query_stage(
             def worker(
                 worker_index: int,
                 current_stage_index: int = stage_index,
-                current_stage_state: QueryRunState = stage_state,
-                current_stage_started: float = stage_started,
-                current_duration_seconds: float = duration_seconds,
+                current_event_queue: Queue[Mapping[str, Any] | None] = event_queue,
             ) -> None:
                 while True:
                     item = next_query()
@@ -935,10 +939,28 @@ def run_staged_query_stage(
                         include_vectors=include_vectors,
                         ground_truth=ground_truth,
                     )
-                    with write_lock:
+                    current_event_queue.put(event)
+
+            def write_events(
+                current_event_queue: Queue[Mapping[str, Any] | None] = event_queue,
+                current_stage_index: int = stage_index,
+                current_stage_state: QueryRunState = stage_state,
+                current_stage_started: float = stage_started,
+                current_duration_seconds: float = duration_seconds,
+            ) -> None:
+                pending_flushes = 0
+                while True:
+                    event = current_event_queue.get()
+                    try:
+                        if event is None:
+                            return
                         state.record(event)
                         current_stage_state.record(event)
-                        _write_event(file, event)
+                        _write_event(file, event, flush=False, sort_keys=False)
+                        pending_flushes += 1
+                        if pending_flushes >= QUERY_EVENT_FLUSH_INTERVAL:
+                            file.flush()
+                            pending_flushes = 0
                         elapsed = time.perf_counter() - current_stage_started
                         attempts = (
                             current_stage_state.queries + current_stage_state.errors
@@ -951,14 +973,24 @@ def run_staged_query_stage(
                             f"attempts={attempts} "
                             f"errors={current_stage_state.errors}"
                         )
+                    finally:
+                        current_event_queue.task_done()
 
+            writer = Thread(target=write_events, name=f"query-events-{stage_index}")
+            writer.start()
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = [
-                    executor.submit(worker, index)
-                    for index in range(1, concurrency + 1)
-                ]
-                for future in futures:
-                    future.result()
+                try:
+                    futures = [
+                        executor.submit(worker, index)
+                        for index in range(1, concurrency + 1)
+                    ]
+                    for future in futures:
+                        future.result()
+                finally:
+                    event_queue.put(None)
+                    event_queue.join()
+                    writer.join()
+                    file.flush()
 
             stage_summaries.append(
                 _query_stage_summary(
@@ -1066,9 +1098,16 @@ def execute_query_once(
     return base_event
 
 
-def _write_event(file: Any, event: Mapping[str, Any]) -> None:
-    file.write(json.dumps(dict(event), sort_keys=True) + "\n")
-    file.flush()
+def _write_event(
+    file: Any,
+    event: Mapping[str, Any],
+    *,
+    flush: bool = True,
+    sort_keys: bool = True,
+) -> None:
+    file.write(json.dumps(dict(event), sort_keys=sort_keys) + "\n")
+    if flush:
+        file.flush()
 
 
 def _query_summary(
