@@ -2,8 +2,8 @@
 
 `lambdadb-bench` is a reproducible benchmark harness for LambdaDB and comparable
 managed vector databases. The first benchmark target is the Cohere Wikipedia
-embedding workload used by `tpuf-benchmark`, with an initial focus on LambdaDB,
-Qdrant Cloud, and Pinecone Serverless.
+embedding workload, with an initial focus on LambdaDB, Qdrant Cloud, and
+Pinecone Serverless.
 
 The goal is not to force every database into the same infrastructure shape. The
 goal is to run the same workload against user-provisioned targets, record the
@@ -473,7 +473,6 @@ but mark the result as not meeting the quality target.
 
 ## References
 
-- `tpuf-benchmark`: https://github.com/turbopuffer/tpuf-benchmark
 - `VectorDBBench`: https://github.com/zilliztech/vectordbbench
 - Qdrant vector database benchmark: https://github.com/qdrant/vector-db-benchmark
 - Cohere Wikipedia embedding dataset:
