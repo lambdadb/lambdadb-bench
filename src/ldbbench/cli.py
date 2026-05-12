@@ -12,6 +12,7 @@ from ldbbench.adapters import get_adapter
 from ldbbench.config import ConfigError, load_scenario, load_target
 from ldbbench.datasets import (
     default_dataset_output_dir,
+    optimize_dataset,
     prepare_dataset,
     prepare_ground_truth,
 )
@@ -102,6 +103,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write only the dataset manifest without downloading rows.",
     )
     prepare.set_defaults(func=run_dataset_prepare)
+    optimize = dataset_subcommands.add_parser(
+        "optimize",
+        help="Build fast binary caches for an existing prepared dataset.",
+    )
+    optimize.add_argument(
+        "--dataset-dir",
+        required=True,
+        help="Prepared dataset cache directory.",
+    )
+    optimize.set_defaults(func=run_dataset_optimize)
     ground_truth = dataset_subcommands.add_parser(
         "ground-truth",
         help="Compute ground truth for prepared dataset artifacts.",
@@ -301,7 +312,23 @@ def run_dataset_prepare(args: argparse.Namespace) -> int:
         print(f"wrote {result.raw_records_path}")
         print(f"wrote {result.records_path}")
         print(f"wrote {result.queries_path}")
+        print(f"wrote {result.records_msgpack_path}")
+        print(f"wrote {result.queries_msgpack_path}")
         args._force_exit_after_return = uses_huggingface
+    return 0
+
+
+def run_dataset_optimize(args: argparse.Namespace) -> int:
+    print(f"dataset_dir: {args.dataset_dir}", flush=True)
+    print("status: optimizing", flush=True)
+    result = optimize_dataset(
+        dataset_dir=args.dataset_dir,
+        progress=print_progress,
+    )
+    print("status: optimized")
+    print(f"wrote {result.records_msgpack_path}")
+    print(f"wrote {result.queries_msgpack_path}")
+    print(f"updated {result.manifest_path}")
     return 0
 
 

@@ -61,6 +61,11 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - Load record reading uses `orjson` and reuses prepared JSONL line byte sizes for
   `load.max_batch_bytes`, avoiding per-record float normalization/norm
   calculation and per-record `json.dumps` during batching.
+- Dataset prepare now writes compact `records.msgpack` / `queries.msgpack`
+  float32 caches, and `ldbbench dataset optimize --dataset-dir ...` can add
+  those caches to older prepared datasets without re-downloading source data.
+  Runs automatically prefer the msgpack cache when present while preserving the
+  original JSONL byte estimate for `load.max_batch_bytes`.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
@@ -251,10 +256,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after load-path optimization work:
+Current test count after msgpack dataset cache work:
 
 ```text
-91 passed, 3 skipped
+94 passed, 3 skipped
 ```
 
 Useful smoke commands:

@@ -25,6 +25,7 @@ from ldbbench.runner.execute import (
     execute_benchmark,
     latency_summary,
     parse_size_bytes,
+    read_records,
     recall_at_k,
 )
 
@@ -294,6 +295,7 @@ def test_execute_benchmark_writes_events_and_summary(tmp_path) -> None:
     assert query_events[0]["recall_at_k"] == 1.0
     assert result.summary["load"]["records"] == 3
     assert result.summary["load"]["records_read"] == 3
+    assert result.summary["load"]["record_source"]["format"] == "msgpack"
     assert result.summary["load"]["batching_duration_seconds"] >= 0
     assert result.summary["load"]["batching_records_per_second"] >= 0
     assert result.summary["load"]["upsert_attempt_duration_seconds"] >= 0
@@ -301,6 +303,16 @@ def test_execute_benchmark_writes_events_and_summary(tmp_path) -> None:
     assert result.summary["query"]["queries"] == 1
     assert result.summary["query"]["recall_at_k"] == 1.0
     assert result.summary_path.exists()
+
+
+def test_read_records_uses_msgpack_estimated_size(tmp_path) -> None:
+    dataset = prepare_fixture_dataset(tmp_path, make_scenario())
+
+    records = list(read_records(dataset.records_msgpack_path))
+
+    assert [record.id for record in records] == ["a", "b", "c"]
+    assert records[0].vector == [1.0, 0.0]
+    assert records[0].estimated_size_bytes == _record_size_bytes(records[0])
 
 
 def test_load_stage_splits_batches_by_byte_limit(tmp_path) -> None:

@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 
+import msgpack
 import pytest
 
 from ldbbench.config import ConfigError, ScenarioConfig
-from ldbbench.datasets import default_dataset_output_dir, prepare_dataset
+from ldbbench.datasets import (
+    default_dataset_output_dir,
+    optimize_dataset,
+    prepare_dataset,
+)
 from ldbbench.manifest import sha256_file
 
 
@@ -89,6 +94,8 @@ def test_prepare_dataset_writes_normalized_records_and_queries(tmp_path) -> None
     assert result.manifest["artifacts"]["raw_records_sha256"]
     assert result.manifest["artifacts"]["records_sha256"]
     assert result.manifest["artifacts"]["queries_sha256"]
+    assert result.manifest["artifacts"]["records_msgpack_sha256"]
+    assert result.manifest["artifacts"]["queries_msgpack_sha256"]
     assert result.manifest["artifacts"]["raw_records_sha256"] == sha256_file(
         result.raw_records_path
     )
@@ -97,6 +104,12 @@ def test_prepare_dataset_writes_normalized_records_and_queries(tmp_path) -> None
     )
     assert result.manifest["artifacts"]["queries_sha256"] == sha256_file(
         result.queries_path
+    )
+    assert result.manifest["artifacts"]["records_msgpack_sha256"] == sha256_file(
+        result.records_msgpack_path
+    )
+    assert result.manifest["artifacts"]["queries_msgpack_sha256"] == sha256_file(
+        result.queries_msgpack_path
     )
     assert raw == rows[:3]
     assert queries[0]["id"] == "q"
@@ -112,6 +125,35 @@ def test_prepare_dataset_writes_normalized_records_and_queries(tmp_path) -> None
             "vector": [0.0, 1.0],
         },
     ]
+    with result.records_msgpack_path.open("rb") as file:
+        msgpack_records = list(msgpack.Unpacker(file, raw=False))
+    assert msgpack_records[0]["id"] == "a"
+    assert msgpack_records[0]["vector"] == [1.0, 0.0]
+    assert msgpack_records[0]["estimated_size_bytes"] > 0
+
+
+def test_optimize_dataset_writes_msgpack_for_existing_jsonl(tmp_path) -> None:
+    result = prepare_dataset(
+        scenario=make_scenario(),
+        output_dir=tmp_path,
+        limit=2,
+        query_count=1,
+        source_rows=[
+            {"_id": "q", "emb": [9.0, 9.0], "text": "query"},
+            {"_id": "a", "emb": [1.0, 0.0], "text": "alpha"},
+            {"_id": "b", "emb": [0.0, 1.0], "text": "beta"},
+        ],
+    )
+    result.records_msgpack_path.unlink()
+    result.queries_msgpack_path.unlink()
+
+    optimized = optimize_dataset(dataset_dir=result.output_dir)
+
+    assert optimized.records_msgpack_path.exists()
+    assert optimized.queries_msgpack_path.exists()
+    assert optimized.manifest["artifacts"]["records_msgpack_sha256"] == sha256_file(
+        optimized.records_msgpack_path
+    )
 
 
 def test_prepare_dataset_falls_back_to_row_id(tmp_path) -> None:

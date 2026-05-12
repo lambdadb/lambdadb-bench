@@ -60,6 +60,8 @@ Dataset preparation writes:
 - `raw_records.jsonl`: source rows as received from the dataset provider.
 - `queries.jsonl`: held-out query vectors.
 - `records.jsonl`: records intended for database loading.
+- `queries.msgpack` and `records.msgpack`: compact float32 caches used
+  automatically by `ldbbench run` when present.
 - `dataset_manifest.json`: dataset source, row counts, artifact paths, and
   checksums.
 
@@ -299,6 +301,14 @@ For the full scenario, prepare the full dataset and opt into the large run:
 uv run ldbbench dataset prepare \
   --scenario scenarios/cohere-wikipedia-1m.yaml \
   --out data/datasets/cohere-wikipedia-1m
+```
+
+If the dataset was prepared before binary caches were available, build them
+without re-downloading Hugging Face data:
+
+```bash
+uv run ldbbench dataset optimize \
+  --dataset-dir data/datasets/cohere-wikipedia-1m
 ```
 
 ```bash

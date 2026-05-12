@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import msgpack
+
 from ldbbench.__about__ import __version__
 from ldbbench.config import ConfigError, ScenarioConfig
 from ldbbench.progress import ProgressCallback, ProgressTicker
@@ -17,9 +19,16 @@ from ldbbench.progress import ProgressCallback, ProgressTicker
 RAW_RECORDS_FILENAME = "raw_records.jsonl"
 RECORDS_FILENAME = "records.jsonl"
 QUERIES_FILENAME = "queries.jsonl"
+RECORDS_MSGPACK_FILENAME = "records.msgpack"
+QUERIES_MSGPACK_FILENAME = "queries.msgpack"
 DATASET_MANIFEST_FILENAME = "dataset_manifest.json"
 SUPPORTED_PROVIDERS = {"huggingface"}
 DEFAULT_QUERY_COUNT = 1000
+
+try:
+    import orjson
+except ImportError:  # pragma: no cover - msgpack optimization still works.
+    orjson = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -29,6 +38,17 @@ class DatasetPrepareResult:
     raw_records_path: Path
     records_path: Path
     queries_path: Path
+    records_msgpack_path: Path
+    queries_msgpack_path: Path
+    manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DatasetOptimizeResult:
+    output_dir: Path
+    manifest_path: Path
+    records_msgpack_path: Path
+    queries_msgpack_path: Path
     manifest: dict[str, Any]
 
 
@@ -64,6 +84,8 @@ def prepare_dataset(
     raw_records_path = out / RAW_RECORDS_FILENAME
     records_path = out / RECORDS_FILENAME
     queries_path = out / QUERIES_FILENAME
+    records_msgpack_path = out / RECORDS_MSGPACK_FILENAME
+    queries_msgpack_path = out / QUERIES_MSGPACK_FILENAME
     manifest_path = out / DATASET_MANIFEST_FILENAME
     requested_query_rows = _requested_query_rows(scenario, query_count)
     requested_source_rows = requested_rows + requested_query_rows
@@ -94,6 +116,8 @@ def prepare_dataset(
             raw_output_path=raw_records_path,
             records_output_path=records_path,
             queries_output_path=queries_path,
+            records_msgpack_output_path=records_msgpack_path,
+            queries_msgpack_output_path=queries_msgpack_path,
             record_limit=requested_rows,
             query_count=requested_query_rows,
             progress=progress,
@@ -125,6 +149,8 @@ def prepare_dataset(
             "raw_records_sha256": prepared.raw_records_sha256,
             "records_sha256": prepared.records_sha256,
             "queries_sha256": prepared.queries_sha256,
+            "records_msgpack_sha256": prepared.records_msgpack_sha256,
+            "queries_msgpack_sha256": prepared.queries_msgpack_sha256,
         },
     )
     manifest_path.write_text(
@@ -138,6 +164,8 @@ def prepare_dataset(
         raw_records_path=raw_records_path,
         records_path=records_path,
         queries_path=queries_path,
+        records_msgpack_path=records_msgpack_path,
+        queries_msgpack_path=queries_msgpack_path,
         manifest=manifest,
     )
 
@@ -150,6 +178,8 @@ class PreparedCounts:
     raw_records_sha256: str
     records_sha256: str
     queries_sha256: str
+    records_msgpack_sha256: str
+    queries_msgpack_sha256: str
 
 
 def load_huggingface_rows(
@@ -190,6 +220,8 @@ def write_prepared_records(
     raw_output_path: str | Path,
     records_output_path: str | Path,
     queries_output_path: str | Path,
+    records_msgpack_output_path: str | Path,
+    queries_msgpack_output_path: str | Path,
     record_limit: int,
     query_count: int,
     progress: ProgressCallback | None = None,
@@ -197,9 +229,13 @@ def write_prepared_records(
     raw_output = Path(raw_output_path)
     records_output = Path(records_output_path)
     queries_output = Path(queries_output_path)
+    records_msgpack_output = Path(records_msgpack_output_path)
+    queries_msgpack_output = Path(queries_msgpack_output_path)
     raw_output.parent.mkdir(parents=True, exist_ok=True)
     records_output.parent.mkdir(parents=True, exist_ok=True)
     queries_output.parent.mkdir(parents=True, exist_ok=True)
+    records_msgpack_output.parent.mkdir(parents=True, exist_ok=True)
+    queries_msgpack_output.parent.mkdir(parents=True, exist_ok=True)
 
     id_field = str(scenario.dataset.get("id_field", "id"))
     vector_field = str(scenario.dataset.get("vector_field", "emb"))
@@ -213,11 +249,16 @@ def write_prepared_records(
     raw_digest = hashlib.sha256()
     records_digest = hashlib.sha256()
     queries_digest = hashlib.sha256()
+    records_msgpack_digest = hashlib.sha256()
+    queries_msgpack_digest = hashlib.sha256()
+    msgpack_packer = msgpack.Packer(use_bin_type=True, use_single_float=True)
     ticker = ProgressTicker(progress)
     with (
         raw_output.open("wb") as raw_file,
         records_output.open("wb") as records_file,
         queries_output.open("wb") as queries_file,
+        records_msgpack_output.open("wb") as records_msgpack_file,
+        queries_msgpack_output.open("wb") as queries_msgpack_file,
     ):
         for row in rows:
             if record_rows >= record_limit and query_rows >= query_count:
@@ -237,10 +278,24 @@ def write_prepared_records(
                     "vector": normalized["vector"],
                     "metadata": normalized["metadata"],
                 }
-                _write_json_line(queries_file, queries_digest, query)
+                json_size = _write_json_line(queries_file, queries_digest, query)
+                _write_msgpack_record(
+                    queries_msgpack_file,
+                    queries_msgpack_digest,
+                    msgpack_packer,
+                    query,
+                    estimated_size_bytes=json_size,
+                )
                 query_rows += 1
             elif record_rows < record_limit:
-                _write_json_line(records_file, records_digest, normalized)
+                json_size = _write_json_line(records_file, records_digest, normalized)
+                _write_msgpack_record(
+                    records_msgpack_file,
+                    records_msgpack_digest,
+                    msgpack_packer,
+                    normalized,
+                    estimated_size_bytes=json_size,
+                )
                 record_rows += 1
             source_rows += 1
             ticker.maybe(
@@ -255,13 +310,169 @@ def write_prepared_records(
         raw_records_sha256=raw_digest.hexdigest(),
         records_sha256=records_digest.hexdigest(),
         queries_sha256=queries_digest.hexdigest(),
+        records_msgpack_sha256=records_msgpack_digest.hexdigest(),
+        queries_msgpack_sha256=queries_msgpack_digest.hexdigest(),
     )
 
 
-def _write_json_line(file: Any, digest: Any, value: Mapping[str, Any]) -> None:
+def optimize_dataset(
+    *,
+    dataset_dir: str | Path,
+    progress: ProgressCallback | None = None,
+) -> DatasetOptimizeResult:
+    out = Path(dataset_dir)
+    manifest_path = out / DATASET_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        raise ConfigError(f"dataset manifest {manifest_path} does not exist")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ConfigError(f"dataset manifest {manifest_path} must be a JSON object")
+
+    records_path = _manifest_artifact_path(
+        out,
+        manifest,
+        "records",
+        RECORDS_FILENAME,
+    )
+    queries_path = _manifest_artifact_path(
+        out,
+        manifest,
+        "queries",
+        QUERIES_FILENAME,
+    )
+    records_msgpack_path = out / RECORDS_MSGPACK_FILENAME
+    queries_msgpack_path = out / QUERIES_MSGPACK_FILENAME
+
+    records_digest, records_count = _write_msgpack_from_jsonl(
+        records_path,
+        records_msgpack_path,
+        progress=progress,
+        label="records",
+    )
+    queries_digest, queries_count = _write_msgpack_from_jsonl(
+        queries_path,
+        queries_msgpack_path,
+        progress=progress,
+        label="queries",
+    )
+
+    artifacts = manifest.setdefault("artifacts", {})
+    if not isinstance(artifacts, dict):
+        raise ConfigError(f"{manifest_path}: artifacts must be a mapping")
+    artifacts.update(
+        {
+            "records_msgpack": str(records_msgpack_path),
+            "records_msgpack_sha256": records_digest,
+            "queries_msgpack": str(queries_msgpack_path),
+            "queries_msgpack_sha256": queries_digest,
+        }
+    )
+    manifest["optimized_at"] = datetime.now(UTC).isoformat()
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    ticker = ProgressTicker(progress)
+    ticker.emit(
+        "dataset_optimize: wrote msgpack "
+        f"records={records_count} queries={queries_count}"
+    )
+    return DatasetOptimizeResult(
+        output_dir=out,
+        manifest_path=manifest_path,
+        records_msgpack_path=records_msgpack_path,
+        queries_msgpack_path=queries_msgpack_path,
+        manifest=manifest,
+    )
+
+
+def _write_json_line(file: Any, digest: Any, value: Mapping[str, Any]) -> int:
     line = (json.dumps(value, sort_keys=True) + "\n").encode("utf-8")
     file.write(line)
     digest.update(line)
+    return _estimated_json_size_bytes(line)
+
+
+def _write_msgpack_record(
+    file: Any,
+    digest: Any,
+    packer: msgpack.Packer,
+    value: Mapping[str, Any],
+    *,
+    estimated_size_bytes: int,
+) -> None:
+    packed = packer.pack(
+        {
+            "id": value["id"],
+            "vector": value["vector"],
+            "metadata": value.get("metadata", {}),
+            "estimated_size_bytes": estimated_size_bytes,
+        }
+    )
+    file.write(packed)
+    digest.update(packed)
+
+
+def _write_msgpack_from_jsonl(
+    input_path: Path,
+    output_path: Path,
+    *,
+    progress: ProgressCallback | None,
+    label: str,
+) -> tuple[str, int]:
+    if not input_path.exists():
+        raise ConfigError(f"dataset artifact {input_path} does not exist")
+    digest = hashlib.sha256()
+    packer = msgpack.Packer(use_bin_type=True, use_single_float=True)
+    ticker = ProgressTicker(progress)
+    count = 0
+    with input_path.open("rb") as input_file, output_path.open("wb") as output_file:
+        for line_number, line in enumerate(input_file, start=1):
+            if not line.strip():
+                continue
+            record = _loads_json(line)
+            if not isinstance(record, dict):
+                raise ConfigError(f"{input_path}:{line_number} row must be an object")
+            _write_msgpack_record(
+                output_file,
+                digest,
+                packer,
+                record,
+                estimated_size_bytes=_estimated_json_size_bytes(line),
+            )
+            count += 1
+            ticker.maybe(f"dataset_optimize: {label} records={count}")
+    return digest.hexdigest(), count
+
+
+def _loads_json(line: bytes) -> Any:
+    if orjson is not None:
+        return orjson.loads(line)
+    return json.loads(line)
+
+
+def _estimated_json_size_bytes(line: bytes) -> int:
+    return len(line.rstrip(b"\r\n")) + 2
+
+
+def _manifest_artifact_path(
+    dataset_dir: Path,
+    manifest: Mapping[str, Any],
+    key: str,
+    default_filename: str,
+) -> Path:
+    artifacts = manifest.get("artifacts", {})
+    artifact = artifacts.get(key) if isinstance(artifacts, Mapping) else None
+    path = (
+        Path(artifact)
+        if isinstance(artifact, str) and artifact
+        else dataset_dir / default_filename
+    )
+    if not path.is_absolute() and not path.exists():
+        candidate = dataset_dir / path.name
+        if candidate.exists():
+            return candidate
+    return path
 
 
 def normalize_record(
@@ -312,6 +523,8 @@ def build_dataset_manifest(
     raw_records_path = output_dir / RAW_RECORDS_FILENAME
     records_path = output_dir / RECORDS_FILENAME
     queries_path = output_dir / QUERIES_FILENAME
+    records_msgpack_path = output_dir / RECORDS_MSGPACK_FILENAME
+    queries_msgpack_path = output_dir / QUERIES_MSGPACK_FILENAME
     manifest: dict[str, Any] = {
         "created_at": datetime.now(UTC).isoformat(),
         "tool": {
@@ -347,8 +560,12 @@ def build_dataset_manifest(
             "raw_records_sha256": None,
             "records": str(records_path),
             "records_sha256": None,
+            "records_msgpack": str(records_msgpack_path),
+            "records_msgpack_sha256": None,
             "queries": str(queries_path),
             "queries_sha256": None,
+            "queries_msgpack": str(queries_msgpack_path),
+            "queries_msgpack_sha256": None,
         },
     }
     if artifact_checksums:

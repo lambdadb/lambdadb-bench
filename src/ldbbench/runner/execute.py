@@ -12,6 +12,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+import msgpack
+
 from ldbbench.adapters.base import VectorDBAdapter, VectorRecord
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
 from ldbbench.datasets.ground_truth import (
@@ -19,7 +21,12 @@ from ldbbench.datasets.ground_truth import (
     artifact_path,
     load_dataset_manifest,
 )
-from ldbbench.datasets.prepare import QUERIES_FILENAME, RECORDS_FILENAME
+from ldbbench.datasets.prepare import (
+    QUERIES_FILENAME,
+    QUERIES_MSGPACK_FILENAME,
+    RECORDS_FILENAME,
+    RECORDS_MSGPACK_FILENAME,
+)
 from ldbbench.manifest import initialize_run_artifacts
 from ldbbench.progress import ProgressCallback, ProgressTicker
 from ldbbench.runner.plan import build_run_plan
@@ -116,17 +123,27 @@ def execute_benchmark(
 
     dataset_path = Path(dataset_dir)
     dataset_manifest = load_dataset_manifest(dataset_path)
-    records_path = artifact_path(
+    records_path, records_sha256 = _preferred_artifact_path(
+        dataset_path,
+        dataset_manifest,
+        preferred_key="records_msgpack",
+        preferred_filename=RECORDS_MSGPACK_FILENAME,
+        fallback_key="records",
+        fallback_filename=RECORDS_FILENAME,
+    )
+    json_records_path = artifact_path(
         dataset_path,
         dataset_manifest,
         "records",
         RECORDS_FILENAME,
     )
-    queries_path = artifact_path(
+    queries_path, _queries_sha256 = _preferred_artifact_path(
         dataset_path,
         dataset_manifest,
-        "queries",
-        QUERIES_FILENAME,
+        preferred_key="queries_msgpack",
+        preferred_filename=QUERIES_MSGPACK_FILENAME,
+        fallback_key="queries",
+        fallback_filename=QUERIES_FILENAME,
     )
     truth_path = _ground_truth_path(dataset_path, ground_truth_path)
     if ground_truth_path is not None and not truth_path.exists():
@@ -159,6 +176,7 @@ def execute_benchmark(
             adapter=adapter,
             target=target,
             records=read_records(records_path, limit=max_records),
+            record_source_path=records_path,
             batch_size=_batch_size(scenario),
             max_batch_bytes=_max_batch_bytes(scenario),
             concurrency=_load_concurrency(scenario),
@@ -166,6 +184,8 @@ def execute_benchmark(
             checkpoint_path=load_checkpoint_path,
             checkpoint_context=_load_checkpoint_context(
                 records_path=records_path,
+                records_sha256=records_sha256,
+                json_records_path=json_records_path,
                 dataset_manifest=dataset_manifest,
                 scenario=scenario,
                 target=target,
@@ -257,6 +277,7 @@ def run_load_stage(
     adapter: VectorDBAdapter,
     target: TargetConfig,
     records: Iterable[VectorRecord],
+    record_source_path: str | Path | None = None,
     batch_size: int,
     max_batch_bytes: int | None,
     concurrency: int,
@@ -586,6 +607,7 @@ def run_load_stage(
             "attempts_per_second": _rate(attempted_batches, duration_seconds),
             "latency_ms": latency_summary(latencies),
             "attempt_latency_ms": latency_summary(attempt_latencies),
+            "record_source": _record_source_summary(record_source_path),
         },
         visibility_samples=visibility_samples,
     )
@@ -1267,6 +1289,9 @@ def read_records(
     limit: int | None = None,
 ) -> Iterable[VectorRecord]:
     source_path = Path(path)
+    if source_path.suffix == ".msgpack":
+        yield from _read_msgpack_records(source_path, limit=limit)
+        return
     with source_path.open("rb") as file:
         for index, line in enumerate(file, start=1):
             if limit is not None and index > limit:
@@ -1278,6 +1303,19 @@ def read_records(
                 path=source_path,
                 line_number=index,
             )
+
+
+def _read_msgpack_records(
+    path: Path,
+    *,
+    limit: int | None = None,
+) -> Iterable[VectorRecord]:
+    with path.open("rb") as file:
+        unpacker = msgpack.Unpacker(file, raw=False)
+        for index, raw in enumerate(unpacker, start=1):
+            if limit is not None and index > limit:
+                break
+            yield _parse_msgpack_record(raw, path=path, record_number=index)
 
 
 def load_ground_truth(path: str | Path) -> dict[str, list[str]]:
@@ -1320,6 +1358,34 @@ def _parse_record_line(line: bytes, *, path: Path, line_number: int) -> VectorRe
     )
 
 
+def _parse_msgpack_record(
+    raw: Any,
+    *,
+    path: Path,
+    record_number: int,
+) -> VectorRecord:
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}:{record_number} record row must be a mapping")
+    record_id = raw.get("id")
+    vector = raw.get("vector")
+    metadata = raw.get("metadata", {})
+    estimated_size_bytes = raw.get("estimated_size_bytes")
+    if not isinstance(record_id, str) or not record_id:
+        raise ConfigError(f"{path}:{record_number} missing non-empty id")
+    if not isinstance(vector, list) or not vector:
+        raise ConfigError(f"{path}:{record_number} missing vector list")
+    if not isinstance(metadata, dict):
+        raise ConfigError(f"{path}:{record_number} metadata must be a mapping")
+    if estimated_size_bytes is not None and not isinstance(estimated_size_bytes, int):
+        raise ConfigError(f"{path}:{record_number} estimated_size_bytes must be an int")
+    return VectorRecord(
+        id=record_id,
+        vector=vector,
+        metadata=metadata,
+        estimated_size_bytes=estimated_size_bytes,
+    )
+
+
 def _loads_json(line: bytes) -> Any:
     if orjson is not None:
         return orjson.loads(line)
@@ -1329,6 +1395,8 @@ def _loads_json(line: bytes) -> Any:
 def _load_checkpoint_context(
     *,
     records_path: Path,
+    records_sha256: str | None = None,
+    json_records_path: Path | None = None,
     dataset_manifest: Mapping[str, Any],
     scenario: ScenarioConfig,
     target: TargetConfig,
@@ -1338,13 +1406,17 @@ def _load_checkpoint_context(
 ) -> dict[str, Any]:
     artifacts = dataset_manifest.get("artifacts", {})
     artifact_checksums = artifacts if isinstance(artifacts, Mapping) else {}
+    checksum = records_sha256
+    if checksum is None:
+        checksum = artifact_checksums.get("records_sha256")
     return {
         "scenario_name": scenario.name,
         "target_vendor": target.vendor,
         "target_name": target.name,
         "target_collection_name": target.collection_name,
         "records_path": str(records_path),
-        "records_sha256": artifact_checksums.get("records_sha256"),
+        "records_sha256": checksum,
+        "json_records_path": str(json_records_path) if json_records_path else None,
         "batch_size": batch_size,
         "max_batch_bytes": max_batch_bytes,
         "max_records": max_records,
@@ -1428,6 +1500,16 @@ def _record_size_bytes(record: VectorRecord) -> int:
         "vector": list(record.vector),
     }
     return len(json.dumps(payload, sort_keys=True).encode("utf-8")) + 2
+
+
+def _record_source_summary(path: str | Path | None) -> dict[str, str | None]:
+    if path is None:
+        return {"path": None, "format": None}
+    source_path = Path(path)
+    return {
+        "path": str(source_path),
+        "format": "msgpack" if source_path.suffix == ".msgpack" else "jsonl",
+    }
 
 
 def _batch_size(scenario: ScenarioConfig) -> int:
@@ -1607,6 +1689,38 @@ def _ground_truth_path(dataset_dir: Path, ground_truth_path: str | Path | None) 
     if ground_truth_path is not None:
         return Path(ground_truth_path)
     return dataset_dir / GROUND_TRUTH_FILENAME
+
+
+def _preferred_artifact_path(
+    dataset_dir: Path,
+    dataset_manifest: Mapping[str, Any],
+    *,
+    preferred_key: str,
+    preferred_filename: str,
+    fallback_key: str,
+    fallback_filename: str,
+) -> tuple[Path, str | None]:
+    artifacts = dataset_manifest.get("artifacts", {})
+    if isinstance(artifacts, Mapping):
+        preferred = artifacts.get(preferred_key)
+        if isinstance(preferred, str) and preferred and Path(preferred).exists():
+            checksum = artifacts.get(f"{preferred_key}_sha256")
+            return Path(preferred), checksum if isinstance(checksum, str) else None
+        preferred_default = dataset_dir / preferred_filename
+        if preferred_default.exists():
+            checksum = artifacts.get(f"{preferred_key}_sha256")
+            return preferred_default, checksum if isinstance(checksum, str) else None
+    fallback = artifact_path(
+        dataset_dir,
+        dataset_manifest,
+        fallback_key,
+        fallback_filename,
+    )
+    checksum = artifacts.get(f"{fallback_key}_sha256") if isinstance(
+        artifacts,
+        Mapping,
+    ) else None
+    return fallback, checksum if isinstance(checksum, str) else None
 
 
 def _validate_limits(*, max_records: int | None, max_queries: int | None) -> None:
