@@ -419,6 +419,10 @@ def run_benchmark(args: argparse.Namespace) -> int:
             print(f"load_concurrency: {result.summary['load']['concurrency']}")
             print(f"load_processes: {result.summary['load']['processes']}")
             print(
+                "load_worker_threads_per_process: "
+                f"{result.summary['load']['worker_threads_per_process']}"
+            )
+            print(
                 "load_records_per_second: "
                 f"{result.summary['load']['records_per_second']}"
             )

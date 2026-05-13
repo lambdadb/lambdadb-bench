@@ -321,9 +321,11 @@ def run_load_stage(
     started = time.perf_counter()
     ticker = ProgressTicker(progress)
     process_count = _effective_process_count(processes, concurrency)
+    worker_threads = _split_concurrency(concurrency, process_count)
     ticker.emit(
         f"load: starting batch_size={batch_size} concurrency={concurrency} "
-        f"processes={process_count} resume={resume_load}"
+        f"processes={process_count} worker_threads_per_process={worker_threads} "
+        f"resume={resume_load}"
     )
     if resumed_from_batch_index:
         ticker.emit(f"load: resuming after batch={resumed_from_batch_index}")
@@ -354,7 +356,6 @@ def run_load_stage(
         )
 
         if process_count > 1:
-            worker_threads = _split_concurrency(concurrency, process_count)
             task_queue: Any = mp.Queue()
             result_queue: Any = mp.Queue()
             workers = [
@@ -740,6 +741,7 @@ def run_load_stage(
             "error_rate": _error_rate(load_errors, attempted_batches),
             "concurrency": concurrency,
             "processes": process_count,
+            "worker_threads_per_process": worker_threads,
             "checkpoint": {
                 "path": str(checkpoint_output) if checkpoint_output else None,
                 "resume_enabled": resume_load,
@@ -789,9 +791,8 @@ def _load_process_worker(
     result_queue: Any,
     concurrency: int,
 ) -> None:
-    adapter = _worker_adapter(vendor)
-
     def worker() -> None:
+        adapter = _worker_adapter(vendor)
         while True:
             item = task_queue.get()
             if item is None:
@@ -1087,10 +1088,12 @@ def run_staged_query_stage(
             deadline = time.perf_counter() + duration_seconds
             stage_state = QueryRunState()
             stage_started = time.perf_counter()
+            worker_threads = _split_concurrency(concurrency, process_count)
             ticker.emit(
                 "query: starting stage "
                 f"stage={stage_index}/{len(stages)} concurrency={concurrency} "
                 f"processes={process_count} "
+                f"worker_threads_per_process={worker_threads} "
                 f"duration_seconds={duration_seconds}"
             )
             if process_count > 1:
@@ -1119,6 +1122,7 @@ def run_staged_query_stage(
                         stage_index=stage_index,
                         concurrency=concurrency,
                         processes=process_count,
+                        worker_threads_per_process=worker_threads,
                         configured_duration_seconds=duration_seconds,
                         elapsed_seconds=time.perf_counter() - stage_started,
                         state=stage_state,
@@ -1227,6 +1231,7 @@ def run_staged_query_stage(
                     stage_index=stage_index,
                     concurrency=concurrency,
                     processes=process_count,
+                    worker_threads_per_process=worker_threads,
                     configured_duration_seconds=duration_seconds,
                     elapsed_seconds=time.perf_counter() - stage_started,
                     state=stage_state,
@@ -1373,9 +1378,8 @@ def _query_process_worker(
     include_vectors: bool,
     ground_truth: Mapping[str, list[str]],
 ) -> None:
-    adapter = _worker_adapter(vendor)
-
     def worker(local_index: int) -> None:
+        adapter = _worker_adapter(vendor)
         worker_index = worker_offset + local_index
         while True:
             item = task_queue.get()
@@ -1692,6 +1696,7 @@ def _query_stage_summary(
     stage_index: int,
     concurrency: int,
     processes: int,
+    worker_threads_per_process: list[int],
     configured_duration_seconds: float,
     elapsed_seconds: float,
     state: QueryRunState,
@@ -1701,6 +1706,7 @@ def _query_stage_summary(
         "stage_index": stage_index,
         "concurrency": concurrency,
         "processes": processes,
+        "worker_threads_per_process": worker_threads_per_process,
         "configured_duration_seconds": configured_duration_seconds,
         "duration_seconds": elapsed_seconds,
         "queries": state.queries,
