@@ -32,7 +32,9 @@ f011802 Add dataset prepare skeleton
 
 Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 
-- LambdaDB recreate waits for asynchronous collection deletion.
+- LambdaDB recreate waits for asynchronous collection deletion, and
+  create/existing prepare waits for collection `ACTIVE` status before load or
+  query starts.
 - Load failures write partial `summary.json` and skip query execution cleanly.
 - Load batches can be capped by approximate payload size.
 - Load can run with concurrent upsert workers via `load.concurrency`.
@@ -226,6 +228,9 @@ Implementation choices:
   visible before creating the replacement collection. Configure with
   `delete_wait_timeout_seconds` and `delete_wait_poll_seconds` in the target if
   needed.
+- LambdaDB create/existing prepare modes wait for collection status `ACTIVE`
+  before returning. Configure with `create_wait_timeout_seconds` and
+  `create_wait_poll_seconds` in the target if needed.
 
 ### Phase 2-6 Stage 1
 
@@ -263,10 +268,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after report generator work:
+Current test count after LambdaDB ACTIVE wait work:
 
 ```text
-98 passed, 3 skipped
+102 passed, 3 skipped
 ```
 
 Useful smoke commands:

@@ -23,6 +23,9 @@ from ldbbench.config import ConfigError, TargetConfig
 DEFAULT_VECTOR_FIELD = "vector"
 DEFAULT_DELETE_WAIT_TIMEOUT_SECONDS = 60.0
 DEFAULT_DELETE_WAIT_POLL_SECONDS = 1.0
+DEFAULT_CREATE_WAIT_TIMEOUT_SECONDS = 300.0
+DEFAULT_CREATE_WAIT_POLL_SECONDS = 1.0
+ACTIVE_COLLECTION_STATUS = "ACTIVE"
 SUPPORTED_METRIC_MAP = {
     "cosine": "cosine",
     "dot": "dot_product",
@@ -50,6 +53,8 @@ class LambdaDBTargetSettings:
     timeout_ms: int | None
     delete_wait_timeout_seconds: float
     delete_wait_poll_seconds: float
+    create_wait_timeout_seconds: float
+    create_wait_poll_seconds: float
 
 
 class LambdaDBAdapter:
@@ -103,12 +108,17 @@ class LambdaDBAdapter:
             response = client.collections.get(
                 collection_name=settings.collection_name,
             )
+            ready_response = self._wait_until_active(
+                client,
+                settings,
+                initial_response=response,
+            )
             return PrepareResult(
                 ok=True,
                 message="LambdaDB collection exists",
                 details={
                     "collection_name": settings.collection_name,
-                    "response": response,
+                    "response": ready_response,
                 },
             )
 
@@ -120,6 +130,7 @@ class LambdaDBAdapter:
             collection_name=settings.collection_name,
             index_configs=index_configs,
         )
+        ready_response = self._wait_until_active(client, settings)
         return PrepareResult(
             ok=True,
             message="LambdaDB collection created",
@@ -127,6 +138,7 @@ class LambdaDBAdapter:
                 "collection_name": settings.collection_name,
                 "index_configs": index_configs,
                 "response": response,
+                "ready_response": ready_response,
             },
         )
 
@@ -270,6 +282,47 @@ class LambdaDBAdapter:
             f"{settings.collection_name!r} deletion"
         )
 
+    @staticmethod
+    def _wait_until_active(
+        client: Any,
+        settings: LambdaDBTargetSettings,
+        *,
+        initial_response: Any | None = None,
+    ) -> Any:
+        deadline = time.monotonic() + settings.create_wait_timeout_seconds
+        response = initial_response
+        last_status = _collection_status(response)
+        last_error: Exception | None = None
+
+        while time.monotonic() <= deadline:
+            if response is None:
+                try:
+                    response = client.collections.get(
+                        collection_name=settings.collection_name,
+                    )
+                    last_error = None
+                except Exception as exc:
+                    last_error = exc
+                    if not _is_not_found_error(exc):
+                        raise
+            last_status = _collection_status(response)
+            if _is_active_collection_status(last_status):
+                return response
+            time.sleep(settings.create_wait_poll_seconds)
+            response = None
+
+        if last_error is not None:
+            raise ConfigError(
+                "timed out waiting for LambdaDB collection "
+                f"{settings.collection_name!r} to become ACTIVE; "
+                f"last status check failed: {last_error}"
+            )
+        raise ConfigError(
+            "timed out waiting for LambdaDB collection "
+            f"{settings.collection_name!r} to become ACTIVE; "
+            f"last status was {_display_status(last_status)}"
+        )
+
 
 def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
     if target.vendor != "lambdadb":
@@ -299,6 +352,16 @@ def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
         "delete_wait_poll_seconds",
         DEFAULT_DELETE_WAIT_POLL_SECONDS,
     )
+    create_wait_timeout_seconds = _optional_positive_float(
+        target.raw,
+        "create_wait_timeout_seconds",
+        DEFAULT_CREATE_WAIT_TIMEOUT_SECONDS,
+    )
+    create_wait_poll_seconds = _optional_positive_float(
+        target.raw,
+        "create_wait_poll_seconds",
+        DEFAULT_CREATE_WAIT_POLL_SECONDS,
+    )
 
     return LambdaDBTargetSettings(
         base_url=target.endpoint,
@@ -310,6 +373,8 @@ def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
         timeout_ms=timeout_ms,
         delete_wait_timeout_seconds=delete_wait_timeout_seconds,
         delete_wait_poll_seconds=delete_wait_poll_seconds,
+        create_wait_timeout_seconds=create_wait_timeout_seconds,
+        create_wait_poll_seconds=create_wait_poll_seconds,
     )
 
 
@@ -329,6 +394,51 @@ def _is_not_found_error(exc: Exception) -> bool:
         return True
     status_code = getattr(exc, "status_code", None)
     return status_code == 404
+
+
+def _collection_status(response: Any) -> str | None:
+    for key in ("collection_status", "collectionStatus", "status", "state"):
+        value = _field_value(response, key)
+        if value is not None:
+            return _status_text(value)
+    return None
+
+
+def _field_value(value: Any, key: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        if key in value:
+            return value[key]
+        for nested_key in ("collection", "data"):
+            nested = value.get(nested_key)
+            nested_value = _field_value(nested, key)
+            if nested_value is not None:
+                return nested_value
+        return None
+    direct_value = getattr(value, key, None)
+    if direct_value is not None:
+        return direct_value
+    for nested_key in ("collection", "data"):
+        nested_value = _field_value(getattr(value, nested_key, None), key)
+        if nested_value is not None:
+            return nested_value
+    return None
+
+
+def _is_active_collection_status(status: str | None) -> bool:
+    if status is None:
+        return True
+    return status.upper() == ACTIVE_COLLECTION_STATUS
+
+
+def _status_text(value: Any) -> str:
+    enum_value = getattr(value, "value", None)
+    return str(enum_value if enum_value is not None else value)
+
+
+def _display_status(status: str | None) -> str:
+    return "unknown" if status is None else repr(status)
 
 
 def _api_key(

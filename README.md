@@ -350,6 +350,10 @@ LambdaDB targets with:
   to `60`.
 - `delete_wait_poll_seconds`: recreate-mode deletion polling interval. Defaults
   to `1`.
+- `create_wait_timeout_seconds`: create/existing-mode ACTIVE status wait
+  timeout before load or query starts. Defaults to `300`.
+- `create_wait_poll_seconds`: create/existing-mode ACTIVE status polling
+  interval. Defaults to `1`.
 
 Useful load settings:
 

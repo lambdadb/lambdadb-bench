@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from ldbbench.adapters.lambdadb import LambdaDBAdapter
 from ldbbench.config import ConfigError, TargetConfig
+
+
+class FakeStatus:
+    def __init__(self, value: str) -> None:
+        self.value = value
 
 
 class FakeDocs:
@@ -24,16 +30,26 @@ class FakeDocs:
 
 
 class FakeCollections:
-    def __init__(self, *, missing_after_gets: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        missing_after_gets: int | None = None,
+        statuses: list[str | None] | None = None,
+        sdk_response_objects: bool = False,
+    ) -> None:
         self.docs = FakeDocs()
         self.creates: list[dict[str, Any]] = []
         self.gets: list[dict[str, Any]] = []
         self.deletes: list[dict[str, Any]] = []
         self.queries: list[dict[str, Any]] = []
         self.missing_after_gets = missing_after_gets
+        self.statuses = list(statuses or [])
+        self.last_status: str | None = None
+        self.sdk_response_objects = sdk_response_objects
 
     def create(self, **kwargs: Any) -> dict[str, Any]:
         self.creates.append(kwargs)
+        self.missing_after_gets = None
         return {"created": kwargs["collection_name"]}
 
     def get(self, **kwargs: Any) -> dict[str, Any]:
@@ -45,7 +61,33 @@ class FakeCollections:
             exc = RuntimeError("not found")
             exc.status_code = 404
             raise exc
-        return {"name": kwargs["collection_name"]}
+        response = {"name": kwargs["collection_name"]}
+        if self.statuses:
+            status = self.statuses.pop(0)
+            self.last_status = status
+            if status is not None:
+                response = self._collection_response(kwargs["collection_name"], status)
+        elif self.last_status is not None:
+            response = self._collection_response(
+                kwargs["collection_name"],
+                self.last_status,
+            )
+        return response
+
+    def _collection_response(self, collection_name: str, status: Any) -> Any:
+        if self.sdk_response_objects:
+            return SimpleNamespace(
+                collection=SimpleNamespace(
+                    collection_name=collection_name,
+                    collection_status=status,
+                )
+            )
+        return {
+            "collection": {
+                "collection_name": collection_name,
+                "collection_status": status,
+            }
+        }
 
     def delete(self, **kwargs: Any) -> dict[str, Any]:
         self.deletes.append(kwargs)
@@ -62,8 +104,18 @@ class FakeCollections:
 
 
 class FakeClient:
-    def __init__(self, *, missing_after_gets: int | None = None) -> None:
-        self.collections = FakeCollections(missing_after_gets=missing_after_gets)
+    def __init__(
+        self,
+        *,
+        missing_after_gets: int | None = None,
+        statuses: list[str | None] | None = None,
+        sdk_response_objects: bool = False,
+    ) -> None:
+        self.collections = FakeCollections(
+            missing_after_gets=missing_after_gets,
+            statuses=statuses,
+            sdk_response_objects=sdk_response_objects,
+        )
 
 
 def make_target(**overrides: Any) -> TargetConfig:
@@ -133,6 +185,62 @@ def test_prepare_create_builds_vector_index_config() -> None:
             },
         }
     ]
+    assert client.collections.gets == [{"collection_name": "smoke"}]
+
+
+def test_prepare_create_waits_until_collection_is_active() -> None:
+    client = FakeClient(statuses=["CREATING", "ACTIVE"])
+    adapter = make_adapter(client)
+    target = make_target(
+        prepare={"mode": "create"},
+        create_wait_timeout_seconds=1,
+        create_wait_poll_seconds=0.001,
+    )
+
+    result = adapter.prepare(target, dimensions=1024, metric="cosine")
+
+    assert result.ok
+    assert client.collections.gets == [
+        {"collection_name": "smoke"},
+        {"collection_name": "smoke"},
+    ]
+    assert result.details["ready_response"]["collection"]["collection_status"] == (
+        "ACTIVE"
+    )
+
+
+def test_prepare_create_reads_sdk_nested_status_enum_value() -> None:
+    client = FakeClient(
+        statuses=[FakeStatus("CREATING"), FakeStatus("ACTIVE")],
+        sdk_response_objects=True,
+    )
+    adapter = make_adapter(client)
+    target = make_target(
+        prepare={"mode": "create"},
+        create_wait_timeout_seconds=1,
+        create_wait_poll_seconds=0.001,
+    )
+
+    result = adapter.prepare(target, dimensions=1024, metric="cosine")
+
+    assert result.ok
+    assert len(client.collections.gets) == 2
+    assert result.details["ready_response"].collection.collection_status.value == (
+        "ACTIVE"
+    )
+
+
+def test_prepare_create_times_out_waiting_for_active_collection() -> None:
+    client = FakeClient(statuses=["CREATING", "CREATING", "CREATING"])
+    adapter = make_adapter(client)
+    target = make_target(
+        prepare={"mode": "create"},
+        create_wait_timeout_seconds=0.002,
+        create_wait_poll_seconds=0.001,
+    )
+
+    with pytest.raises(ConfigError, match="ACTIVE"):
+        adapter.prepare(target, dimensions=1024, metric="cosine")
 
 
 def test_prepare_existing_checks_collection() -> None:
@@ -143,6 +251,23 @@ def test_prepare_existing_checks_collection() -> None:
 
     assert result.ok
     assert client.collections.gets == [{"collection_name": "smoke"}]
+
+
+def test_prepare_existing_waits_if_collection_is_creating() -> None:
+    client = FakeClient(statuses=["CREATING", "ACTIVE"])
+    adapter = make_adapter(client)
+    target = make_target(
+        create_wait_timeout_seconds=1,
+        create_wait_poll_seconds=0.001,
+    )
+
+    result = adapter.prepare(target)
+
+    assert result.ok
+    assert client.collections.gets == [
+        {"collection_name": "smoke"},
+        {"collection_name": "smoke"},
+    ]
 
 
 def test_adapter_reuses_client_for_same_target() -> None:
@@ -166,14 +291,24 @@ def test_adapter_reuses_client_for_same_target() -> None:
     assert len(clients) == 1
 
 
-def test_prepare_recreate_deletes_before_create() -> None:
-    client = FakeClient(missing_after_gets=2)
+def test_prepare_recreate_waits_for_delete_then_active_collection() -> None:
+    client = FakeClient(
+        missing_after_gets=2,
+        statuses=[
+            FakeStatus("DELETING"),
+            FakeStatus("CREATING"),
+            FakeStatus("ACTIVE"),
+        ],
+        sdk_response_objects=True,
+    )
     adapter = make_adapter(client)
     target = make_target(
         prepare={"mode": "recreate"},
         index_configs={"dense": {"type": "vector", "dimensions": 3}},
         delete_wait_timeout_seconds=1,
         delete_wait_poll_seconds=0.001,
+        create_wait_timeout_seconds=1,
+        create_wait_poll_seconds=0.001,
     )
 
     result = adapter.prepare(target)
@@ -183,6 +318,8 @@ def test_prepare_recreate_deletes_before_create() -> None:
     assert client.collections.gets == [
         {"collection_name": "smoke"},
         {"collection_name": "smoke"},
+        {"collection_name": "smoke"},
+        {"collection_name": "smoke"},
     ]
     assert client.collections.creates == [
         {
@@ -190,6 +327,9 @@ def test_prepare_recreate_deletes_before_create() -> None:
             "index_configs": {"dense": {"type": "vector", "dimensions": 3}},
         }
     ]
+    assert result.details["ready_response"].collection.collection_status.value == (
+        "ACTIVE"
+    )
 
 
 def test_prepare_recreate_times_out_waiting_for_delete() -> None:
