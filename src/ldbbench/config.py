@@ -53,6 +53,8 @@ class ScenarioConfig:
                 "scenario.load.write_mode must be one of "
                 f"{sorted(VALID_WRITE_MODES)}"
             )
+        _validate_optional_positive_int(load, "concurrency")
+        _validate_optional_positive_int(load, "processes")
 
         consistency = query.get("consistency", "eventual")
         if consistency not in VALID_QUERY_CONSISTENCY:
@@ -60,6 +62,7 @@ class ScenarioConfig:
                 "scenario.query.consistency must be one of "
                 f"{sorted(VALID_QUERY_CONSISTENCY)}"
             )
+        _validate_optional_positive_int(query, "processes")
 
         stages = query.get("stages", [])
         if stages is not None:
@@ -286,4 +289,10 @@ def _optional_mapping(data: Mapping[str, Any], key: str) -> dict[str, Any]:
 def _validate_positive_int(data: Mapping[str, Any], key: str) -> None:
     value = data.get(key)
     if not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{key} must be a positive integer")
+
+
+def _validate_optional_positive_int(data: Mapping[str, Any], key: str) -> None:
+    value = data.get(key)
+    if value is not None and (not isinstance(value, int) or value <= 0):
         raise ConfigError(f"{key} must be a positive integer")

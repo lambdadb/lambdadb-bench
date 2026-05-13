@@ -44,9 +44,11 @@ def test_generate_report_writes_markdown_and_csv(tmp_path) -> None:
     load_rows = list(csv.DictReader(result.load_csv_path.open(encoding="utf-8")))
     assert [row["target"] for row in load_rows] == ["qdrant-cloud", "lambdadb-cloud"]
     assert load_rows[0]["records_per_second"] == "952.680"
+    assert load_rows[0]["processes"] == "4"
 
     query_rows = list(csv.DictReader(result.query_csv_path.open(encoding="utf-8")))
     assert [row["concurrency"] for row in query_rows] == ["16", "16"]
+    assert [row["processes"] for row in query_rows] == ["4", "4"]
     assert query_rows[1]["queries_per_second"] == "700.000"
 
 
@@ -108,6 +110,7 @@ def write_result(
             },
             "batches": 4196,
             "concurrency": 8,
+            "processes": 4,
             "duration_seconds": 1049.7,
             "error_rate": 0.0,
             "errors": 0,
@@ -128,6 +131,7 @@ def write_result(
             "stages": [
                 {
                     "concurrency": 16,
+                    "processes": 4,
                     "duration_seconds": 60.0,
                     "error_rate": 0.0,
                     "errors": 0,

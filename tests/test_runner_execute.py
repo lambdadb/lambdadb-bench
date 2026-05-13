@@ -22,6 +22,7 @@ from ldbbench.datasets.prepare import prepare_dataset
 from ldbbench.runner.execute import (
     _batches,
     _record_size_bytes,
+    _split_concurrency,
     execute_benchmark,
     latency_summary,
     parse_size_bytes,
@@ -383,6 +384,7 @@ def test_execute_benchmark_loads_batches_concurrently(tmp_path) -> None:
     ]
 
     assert result.summary["load"]["concurrency"] == 2
+    assert result.summary["load"]["processes"] == 1
     assert result.summary["load"]["records"] == 4
     assert result.summary["load"]["records_read"] == 4
     assert result.summary["load"]["batches"] == 2
@@ -443,9 +445,15 @@ def test_execute_benchmark_runs_duration_query_stages(tmp_path) -> None:
     assert result.summary["query"]["queries"] > 2
     assert result.summary["query"]["errors"] == 0
     assert result.summary["query"]["stages"][0]["concurrency"] == 2
+    assert result.summary["query"]["stages"][0]["processes"] == 1
     assert result.summary["query"]["stages"][0]["queries"] == len(query_events)
     assert {event["query_stage_index"] for event in query_events} == {1}
     assert {event["worker_index"] for event in query_events} == {1, 2}
+
+
+def test_process_concurrency_split_preserves_total_concurrency() -> None:
+    assert _split_concurrency(64, 4) == [16, 16, 16, 16]
+    assert _split_concurrency(10, 3) == [4, 3, 3]
 
 
 def test_execute_benchmark_records_query_errors(tmp_path) -> None:

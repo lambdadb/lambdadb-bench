@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from threading import Lock, Thread
 from typing import Any
 
@@ -182,6 +183,7 @@ def execute_benchmark(
             batch_size=_batch_size(scenario),
             max_batch_bytes=_max_batch_bytes(scenario),
             concurrency=_load_concurrency(scenario),
+            processes=_load_processes(scenario),
             events_path=ingest_events_path,
             checkpoint_path=load_checkpoint_path,
             checkpoint_context=_load_checkpoint_context(
@@ -242,6 +244,7 @@ def execute_benchmark(
             ground_truth=ground_truth,
             events_path=query_events_path,
             stages=None if max_queries is not None else _query_stages(scenario),
+            processes=_query_processes(scenario),
             progress=progress,
         )
         ticker.emit(
@@ -283,6 +286,7 @@ def run_load_stage(
     batch_size: int,
     max_batch_bytes: int | None,
     concurrency: int,
+    processes: int = 1,
     events_path: str | Path,
     checkpoint_path: str | Path | None = None,
     checkpoint_context: Mapping[str, Any] | None = None,
@@ -316,9 +320,10 @@ def run_load_stage(
     highest_contiguous_successful_batch_index = resumed_from_batch_index
     started = time.perf_counter()
     ticker = ProgressTicker(progress)
+    process_count = _effective_process_count(processes, concurrency)
     ticker.emit(
         f"load: starting batch_size={batch_size} concurrency={concurrency} "
-        f"resume={resume_load}"
+        f"processes={process_count} resume={resume_load}"
     )
     if resumed_from_batch_index:
         ticker.emit(f"load: resuming after batch={resumed_from_batch_index}")
@@ -348,7 +353,151 @@ def run_load_stage(
             start=1,
         )
 
-        if concurrency == 1:
+        if process_count > 1:
+            worker_threads = _split_concurrency(concurrency, process_count)
+            task_queue: Any = mp.Queue()
+            result_queue: Any = mp.Queue()
+            workers = [
+                mp.Process(
+                    target=_load_process_worker,
+                    args=(
+                        target.vendor,
+                        target,
+                        task_queue,
+                        result_queue,
+                        thread_count,
+                    ),
+                    name=f"ldbbench-load-{index}",
+                )
+                for index, thread_count in enumerate(worker_threads, start=1)
+            ]
+            for worker_process in workers:
+                worker_process.start()
+
+            accepting = True
+            exhausted = False
+            in_flight = 0
+
+            def submit_next_process_batch() -> bool:
+                nonlocal attempted_batches
+                nonlocal batching_duration_seconds, records_read
+                nonlocal skipped_batches, skipped_records
+                nonlocal exhausted, in_flight
+                if not accepting or exhausted:
+                    return False
+                while True:
+                    item = _next_load_batch(batch_iter)
+                    if item is None:
+                        exhausted = True
+                        return False
+                    batch_index, batch, batching_duration = item
+                    batching_duration_seconds += batching_duration
+                    records_read += len(batch)
+                    if batch_index <= resumed_from_batch_index:
+                        skipped_batches += 1
+                        skipped_records += len(batch)
+                        continue
+                    attempted_batches += 1
+                    _extend_visibility_samples(
+                        visibility_samples,
+                        batch,
+                        visibility_sample_size=visibility_sample_size,
+                    )
+                    task_queue.put((batch_index, batch))
+                    in_flight += 1
+                    return True
+
+            try:
+                while in_flight < concurrency and submit_next_process_batch():
+                    pass
+
+                while in_flight:
+                    try:
+                        event = result_queue.get(timeout=0.1)
+                    except Empty:
+                        for worker_process in workers:
+                            if worker_process.exitcode not in (None, 0):
+                                raise RuntimeError(
+                                    "load worker process exited with "
+                                    f"code {worker_process.exitcode}"
+                                ) from None
+                        continue
+                    in_flight -= 1
+                    _write_event(file, event)
+                    event_latency = float(event["latency_ms"])
+                    attempt_latencies.append(event_latency)
+                    upsert_attempt_duration_seconds += event_latency / 1000
+                    if event["status"] != "ok":
+                        load_errors += 1
+                        accepting = False
+                        _write_load_checkpoint(
+                            checkpoint_output,
+                            context=checkpoint_context_dict,
+                            status="failed",
+                            resumed_from_batch_index=resumed_from_batch_index,
+                            highest_contiguous_successful_batch_index=(
+                                highest_contiguous_successful_batch_index
+                            ),
+                            successful_batch_indexes=successful_batch_indexes,
+                            attempted_batches=attempted_batches,
+                            successful_batches=successful_batches,
+                            skipped_batches=skipped_batches,
+                            skipped_records=skipped_records,
+                            records_loaded=records_loaded,
+                            records_read=records_read,
+                            batching_duration_seconds=batching_duration_seconds,
+                            upsert_attempt_duration_seconds=(
+                                upsert_attempt_duration_seconds
+                            ),
+                            errors=load_errors,
+                        )
+                        continue
+                    successful_batches += 1
+                    successful_batch_indexes.add(int(event["batch_index"]))
+                    highest_contiguous_successful_batch_index = (
+                        _advance_contiguous_watermark(
+                            highest_contiguous_successful_batch_index,
+                            successful_batch_indexes,
+                        )
+                    )
+                    records_loaded += int(event["records"])
+                    latencies.append(float(event["latency_ms"]))
+                    _write_load_checkpoint(
+                        checkpoint_output,
+                        context=checkpoint_context_dict,
+                        status="in_progress",
+                        resumed_from_batch_index=resumed_from_batch_index,
+                        highest_contiguous_successful_batch_index=(
+                            highest_contiguous_successful_batch_index
+                        ),
+                        successful_batch_indexes=successful_batch_indexes,
+                        attempted_batches=attempted_batches,
+                        successful_batches=successful_batches,
+                        skipped_batches=skipped_batches,
+                        skipped_records=skipped_records,
+                        records_loaded=records_loaded,
+                        records_read=records_read,
+                        batching_duration_seconds=batching_duration_seconds,
+                        upsert_attempt_duration_seconds=upsert_attempt_duration_seconds,
+                        errors=load_errors,
+                    )
+                    ticker.maybe(
+                        "load: progress "
+                        f"records={records_loaded} batches={successful_batches} "
+                        f"errors={load_errors}"
+                    )
+                    while (
+                        load_errors == 0
+                        and in_flight < concurrency
+                        and submit_next_process_batch()
+                    ):
+                        pass
+            finally:
+                for _ in range(sum(worker_threads)):
+                    task_queue.put(None)
+                for worker_process in workers:
+                    worker_process.join()
+        elif concurrency == 1:
             while True:
                 item = _next_load_batch(batch_iter)
                 if item is None:
@@ -590,6 +739,7 @@ def run_load_stage(
             "errors": load_errors,
             "error_rate": _error_rate(load_errors, attempted_batches),
             "concurrency": concurrency,
+            "processes": process_count,
             "checkpoint": {
                 "path": str(checkpoint_output) if checkpoint_output else None,
                 "resume_enabled": resume_load,
@@ -630,6 +780,42 @@ def _execute_load_batch_with_records(
         ),
         batch,
     )
+
+
+def _load_process_worker(
+    vendor: str,
+    target: TargetConfig,
+    task_queue: Any,
+    result_queue: Any,
+    concurrency: int,
+) -> None:
+    adapter = _worker_adapter(vendor)
+
+    def worker() -> None:
+        while True:
+            item = task_queue.get()
+            if item is None:
+                return
+            batch_index, batch = item
+            result_queue.put(
+                execute_load_batch(
+                    adapter=adapter,
+                    target=target,
+                    batch=batch,
+                    batch_index=batch_index,
+                )
+            )
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(worker) for _ in range(concurrency)]
+        for future in futures:
+            future.result()
+
+
+def _worker_adapter(vendor: str) -> VectorDBAdapter:
+    from ldbbench.adapters import get_adapter
+
+    return get_adapter(vendor)
 
 
 def _next_load_batch(
@@ -794,6 +980,7 @@ def run_query_stage(
     ground_truth: Mapping[str, list[str]],
     events_path: str | Path,
     stages: list[dict[str, Any]] | None = None,
+    processes: int = 1,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     events_output = Path(events_path)
@@ -809,6 +996,7 @@ def run_query_stage(
             recalls=[],
             query_count=0,
             error_count=0,
+            processes=1,
             stage_summaries=[],
         )
 
@@ -823,6 +1011,7 @@ def run_query_stage(
             ground_truth=ground_truth,
             events_path=events_output,
             stages=stages,
+            processes=processes,
             progress=progress,
         )
 
@@ -862,6 +1051,7 @@ def run_query_stage(
         recalls=state.recalls,
         query_count=state.queries,
         error_count=state.errors,
+        processes=1,
         stage_summaries=[],
     )
 
@@ -877,6 +1067,7 @@ def run_staged_query_stage(
     ground_truth: Mapping[str, list[str]],
     events_path: Path,
     stages: list[dict[str, Any]],
+    processes: int = 1,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     query_lock = Lock()
@@ -889,6 +1080,7 @@ def run_staged_query_stage(
     with events_path.open("w", encoding="utf-8") as file:
         for stage_index, stage in enumerate(stages, start=1):
             concurrency = _stage_concurrency(stage, stage_index=stage_index)
+            process_count = _effective_process_count(processes, concurrency)
             duration_seconds = parse_duration_seconds(
                 _stage_duration(stage, stage_index=stage_index)
             )
@@ -898,8 +1090,46 @@ def run_staged_query_stage(
             ticker.emit(
                 "query: starting stage "
                 f"stage={stage_index}/{len(stages)} concurrency={concurrency} "
+                f"processes={process_count} "
                 f"duration_seconds={duration_seconds}"
             )
+            if process_count > 1:
+                next_query_index = _run_staged_query_processes(
+                    vendor=target.vendor,
+                    target=target,
+                    queries=queries,
+                    top_k=top_k,
+                    consistency=consistency,
+                    include_vectors=include_vectors,
+                    ground_truth=ground_truth,
+                    file=file,
+                    stage_index=stage_index,
+                    concurrency=concurrency,
+                    process_count=process_count,
+                    deadline=deadline,
+                    state=state,
+                    stage_state=stage_state,
+                    next_query_index=next_query_index,
+                    ticker=ticker,
+                    stage_started=stage_started,
+                    duration_seconds=duration_seconds,
+                )
+                stage_summaries.append(
+                    _query_stage_summary(
+                        stage_index=stage_index,
+                        concurrency=concurrency,
+                        processes=process_count,
+                        configured_duration_seconds=duration_seconds,
+                        elapsed_seconds=time.perf_counter() - stage_started,
+                        state=stage_state,
+                    )
+                )
+                ticker.emit(
+                    "query: stage finished "
+                    f"stage={stage_index} queries={stage_state.queries} "
+                    f"errors={stage_state.errors}"
+                )
+                continue
 
             event_queue: Queue[Mapping[str, Any] | None] = Queue(
                 maxsize=max(concurrency * 16, QUERY_EVENT_FLUSH_INTERVAL),
@@ -996,6 +1226,7 @@ def run_staged_query_stage(
                 _query_stage_summary(
                     stage_index=stage_index,
                     concurrency=concurrency,
+                    processes=process_count,
                     configured_duration_seconds=duration_seconds,
                     elapsed_seconds=time.perf_counter() - stage_started,
                     state=stage_state,
@@ -1014,8 +1245,165 @@ def run_staged_query_stage(
         recalls=state.recalls,
         query_count=state.queries,
         error_count=state.errors,
+        processes=_effective_process_count(processes, max(1, max(
+            _stage_concurrency(stage, stage_index=index)
+            for index, stage in enumerate(stages, start=1)
+        ))),
         stage_summaries=stage_summaries,
     )
+
+
+def _run_staged_query_processes(
+    *,
+    vendor: str,
+    target: TargetConfig,
+    queries: list[VectorRecord],
+    top_k: int,
+    consistency: str,
+    include_vectors: bool,
+    ground_truth: Mapping[str, list[str]],
+    file: Any,
+    stage_index: int,
+    concurrency: int,
+    process_count: int,
+    deadline: float,
+    state: QueryRunState,
+    stage_state: QueryRunState,
+    next_query_index: int,
+    ticker: ProgressTicker,
+    stage_started: float,
+    duration_seconds: float,
+) -> int:
+    worker_threads = _split_concurrency(concurrency, process_count)
+    task_queue: Any = mp.Queue()
+    result_queue: Any = mp.Queue()
+    workers = [
+        mp.Process(
+            target=_query_process_worker,
+            args=(
+                vendor,
+                target,
+                task_queue,
+                result_queue,
+                thread_count,
+                worker_offset,
+                stage_index,
+                top_k,
+                consistency,
+                include_vectors,
+                dict(ground_truth),
+            ),
+            name=f"ldbbench-query-{stage_index}-{index}",
+        )
+        for index, (thread_count, worker_offset) in enumerate(
+            _worker_offsets(worker_threads),
+            start=1,
+        )
+    ]
+    for worker_process in workers:
+        worker_process.start()
+
+    in_flight = 0
+    pending_flushes = 0
+
+    def submit_query() -> bool:
+        nonlocal in_flight, next_query_index
+        if time.perf_counter() >= deadline:
+            return False
+        query_index = next_query_index
+        query = queries[(query_index - 1) % len(queries)]
+        next_query_index += 1
+        task_queue.put((query_index, query))
+        in_flight += 1
+        return True
+
+    try:
+        while in_flight < concurrency and submit_query():
+            pass
+
+        while in_flight:
+            try:
+                event = result_queue.get(timeout=0.1)
+            except Empty:
+                for worker_process in workers:
+                    if worker_process.exitcode not in (None, 0):
+                        raise RuntimeError(
+                            "query worker process exited with "
+                            f"code {worker_process.exitcode}"
+                        ) from None
+                continue
+            in_flight -= 1
+            state.record(event)
+            stage_state.record(event)
+            _write_event(file, event, flush=False, sort_keys=False)
+            pending_flushes += 1
+            if pending_flushes >= QUERY_EVENT_FLUSH_INTERVAL:
+                file.flush()
+                pending_flushes = 0
+            elapsed = time.perf_counter() - stage_started
+            attempts = stage_state.queries + stage_state.errors
+            ticker.maybe(
+                "query: stage progress "
+                f"stage={stage_index} "
+                f"elapsed_seconds={elapsed:.1f}/{duration_seconds:.1f} "
+                f"attempts={attempts} "
+                f"errors={stage_state.errors}"
+            )
+            while in_flight < concurrency and submit_query():
+                pass
+    finally:
+        for _ in range(sum(worker_threads)):
+            task_queue.put(None)
+        for worker_process in workers:
+            worker_process.join()
+        file.flush()
+    return next_query_index
+
+
+def _query_process_worker(
+    vendor: str,
+    target: TargetConfig,
+    task_queue: Any,
+    result_queue: Any,
+    concurrency: int,
+    worker_offset: int,
+    stage_index: int,
+    top_k: int,
+    consistency: str,
+    include_vectors: bool,
+    ground_truth: Mapping[str, list[str]],
+) -> None:
+    adapter = _worker_adapter(vendor)
+
+    def worker(local_index: int) -> None:
+        worker_index = worker_offset + local_index
+        while True:
+            item = task_queue.get()
+            if item is None:
+                return
+            query_index, query = item
+            result_queue.put(
+                execute_query_once(
+                    adapter=adapter,
+                    target=target,
+                    query=query,
+                    query_index=query_index,
+                    query_stage_index=stage_index,
+                    worker_index=worker_index,
+                    top_k=top_k,
+                    consistency=consistency,
+                    include_vectors=include_vectors,
+                    ground_truth=ground_truth,
+                )
+            )
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [
+            executor.submit(worker, index)
+            for index in range(1, concurrency + 1)
+        ]
+        for future in futures:
+            future.result()
 
 
 @dataclass
@@ -1118,6 +1506,7 @@ def _query_summary(
     recalls: list[float],
     query_count: int,
     error_count: int,
+    processes: int,
     stage_summaries: list[dict[str, Any]],
 ) -> dict[str, Any]:
     duration_seconds = time.perf_counter() - started
@@ -1134,6 +1523,7 @@ def _query_summary(
         "latency_ms": latency_summary(latencies),
         "recall_at_k": _mean(recalls) if recalls else None,
         "recall_samples": len(recalls),
+        "processes": processes,
     }
     if stage_summaries:
         summary["stages"] = stage_summaries
@@ -1148,6 +1538,7 @@ def skipped_query_summary(*, reason: str) -> dict[str, Any]:
         recalls=[],
         query_count=0,
         error_count=0,
+        processes=1,
         stage_summaries=[],
     )
     summary["skip_reason"] = reason
@@ -1300,6 +1691,7 @@ def _query_stage_summary(
     *,
     stage_index: int,
     concurrency: int,
+    processes: int,
     configured_duration_seconds: float,
     elapsed_seconds: float,
     state: QueryRunState,
@@ -1308,6 +1700,7 @@ def _query_stage_summary(
     return {
         "stage_index": stage_index,
         "concurrency": concurrency,
+        "processes": processes,
         "configured_duration_seconds": configured_duration_seconds,
         "duration_seconds": elapsed_seconds,
         "queries": state.queries,
@@ -1563,6 +1956,41 @@ def _load_concurrency(scenario: ScenarioConfig) -> int:
     if not isinstance(concurrency, int) or concurrency <= 0:
         raise ConfigError("scenario.load.concurrency must be a positive integer")
     return concurrency
+
+
+def _load_processes(scenario: ScenarioConfig) -> int:
+    processes = scenario.load.get("processes", 1)
+    if not isinstance(processes, int) or processes <= 0:
+        raise ConfigError("scenario.load.processes must be a positive integer")
+    return processes
+
+
+def _query_processes(scenario: ScenarioConfig) -> int:
+    processes = scenario.query.get("processes", 1)
+    if not isinstance(processes, int) or processes <= 0:
+        raise ConfigError("scenario.query.processes must be a positive integer")
+    return processes
+
+
+def _effective_process_count(processes: int, concurrency: int) -> int:
+    return max(1, min(processes, concurrency))
+
+
+def _split_concurrency(concurrency: int, process_count: int) -> list[int]:
+    base, remainder = divmod(concurrency, process_count)
+    return [
+        base + (1 if index < remainder else 0)
+        for index in range(process_count)
+    ]
+
+
+def _worker_offsets(thread_counts: list[int]) -> list[tuple[int, int]]:
+    offsets: list[tuple[int, int]] = []
+    next_offset = 0
+    for thread_count in thread_counts:
+        offsets.append((thread_count, next_offset))
+        next_offset += thread_count
+    return offsets
 
 
 def _max_batch_bytes(scenario: ScenarioConfig) -> int | None:

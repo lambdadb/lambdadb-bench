@@ -20,8 +20,11 @@ dataset:
   dimensions: 1024
 load:
   write_mode: upsert
+  concurrency: 64
+  processes: 4
 query:
   consistency: eventual
+  processes: 2
   stages:
     - concurrency: 8
       duration: 5m
@@ -33,6 +36,8 @@ query:
 
     assert scenario.name == "smoke"
     assert scenario.load["write_mode"] == "upsert"
+    assert scenario.load["processes"] == 4
+    assert scenario.query["processes"] == 2
 
 
 def test_load_target_expands_env_and_redacts_secrets(tmp_path, monkeypatch) -> None:
@@ -143,4 +148,25 @@ query:
     )
 
     with pytest.raises(ConfigError, match="query.consistency"):
+        load_scenario(scenario_path)
+
+
+def test_invalid_process_counts_fail(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+  processes: 0
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="processes"):
         load_scenario(scenario_path)

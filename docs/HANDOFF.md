@@ -38,6 +38,9 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - Load failures write partial `summary.json` and skip query execution cleanly.
 - Load batches can be capped by approximate payload size.
 - Load can run with concurrent upsert workers via `load.concurrency`.
+- Load can split that total concurrency across multiple worker processes with
+  `load.processes` to use more CPU cores while preserving checkpoint/event
+  semantics.
 - Load writes `load_checkpoint.json` and can resume interrupted large ingests
   with `--resume-load` from the highest contiguous successful batch watermark.
 - The runner can wait for loaded records to become query-visible before query
@@ -74,6 +77,8 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
   writer thread and batched flushes, avoiding a per-query write lock/flush
   ceiling at high configured concurrency. The Qdrant query adapter also reuses
   list vectors directly instead of copying every query vector.
+- Staged query runs can split each stage's total concurrency across multiple
+  worker processes with `query.processes`.
 - `ldbbench report` combines one or more result directories into a Markdown
   report plus sibling load/query-stage CSV files for spreadsheet-friendly
   comparison.

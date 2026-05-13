@@ -364,6 +364,9 @@ Useful load settings:
 
 - `batch_size`: maximum records per upsert request.
 - `concurrency`: number of concurrent upsert workers. Defaults to `1`.
+- `processes`: optional process count for CPU parallelism. Defaults to `1`.
+  `concurrency` remains the total in-flight upsert worker count; when
+  `processes > 1`, the runner splits that total across worker processes.
 - `max_batch_bytes`: optional approximate request payload cap. The runner
   splits batches by both `batch_size` and this byte limit to avoid oversized
   requests.
@@ -371,6 +374,10 @@ Useful load settings:
   visible through vector query before the query stage starts.
 - `query_visibility_timeout`: optional duration string, defaults to `60s`.
 - `query_visibility_poll_interval`: optional duration string, defaults to `1s`.
+
+For staged queries, `query.processes` works the same way: each
+`query.stages[].concurrency` value remains the total in-flight query count, and
+the runner splits that total across worker processes when `query.processes > 1`.
 
 Optional integration coverage is gated behind:
 

@@ -417,6 +417,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             print(f"load: skipped ({result.summary['load']['skip_reason']})")
         else:
             print(f"load_concurrency: {result.summary['load']['concurrency']}")
+            print(f"load_processes: {result.summary['load']['processes']}")
             print(
                 "load_records_per_second: "
                 f"{result.summary['load']['records_per_second']}"
@@ -435,6 +436,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         if "visibility" in result.summary["load"]:
             print(f"visibility: {result.summary['load']['visibility']['status']}")
         print(f"queries: {result.summary['query']['queries']}")
+        print(f"query_processes: {result.summary['query']['processes']}")
         if result.summary["query"]["errors"]:
             print(f"errors: {result.summary['query']['errors']}")
             print(f"error_rate: {result.summary['query']['error_rate']}")

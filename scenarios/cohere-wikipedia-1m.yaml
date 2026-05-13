@@ -16,9 +16,10 @@ dataset:
 load:
   write_mode: upsert
   batch_size: 500
-  concurrency: 4
+  concurrency: 16
+  processes: 4
   max_batch_bytes: 5MB
-  wait_until_query_visible: true
+  wait_until_query_visible: false
 
 query:
   top_k: 10
@@ -26,6 +27,7 @@ query:
   query_source: heldout_dataset_vectors
   consistency: eventual
   include_vectors: false
+  # processes: 4
   warmup:
     enabled: true
     query_count: 100
