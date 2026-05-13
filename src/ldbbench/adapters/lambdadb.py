@@ -6,7 +6,7 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from threading import Lock
+from threading import Lock, get_ident
 from typing import Any
 
 from ldbbench.adapters.base import (
@@ -212,6 +212,7 @@ class LambdaDBAdapter:
     def _client(self, settings: LambdaDBTargetSettings) -> Any:
         api_key = _api_key(settings, self._environ)
         cache_key = (
+            get_ident(),
             settings.base_url,
             settings.project_name,
             api_key,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any
 
@@ -289,6 +291,36 @@ def test_adapter_reuses_client_for_same_target() -> None:
     adapter.fetch(target, ids=["a"], consistency="eventual")
 
     assert len(clients) == 1
+
+
+def test_adapter_uses_separate_clients_per_worker_thread() -> None:
+    clients: list[FakeClient] = []
+
+    def factory(**_kwargs: Any) -> FakeClient:
+        client = FakeClient()
+        clients.append(client)
+        return client
+
+    adapter = LambdaDBAdapter(
+        client_factory=factory,
+        environ={"LAMBDADB_API_KEY": "secret"},
+    )
+    target = make_target()
+    barrier = Barrier(2)
+
+    def upsert() -> None:
+        barrier.wait(timeout=1)
+        adapter.upsert_batch(
+            target,
+            [{"id": "a", "vector": [0.1], "metadata": {}}],
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(upsert) for _ in range(2)]
+        for future in futures:
+            future.result()
+
+    assert len(clients) == 2
 
 
 def test_prepare_recreate_waits_for_delete_then_active_collection() -> None:

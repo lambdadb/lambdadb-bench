@@ -55,8 +55,10 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
 - Dataset prepare computes artifact SHA256 digests while writing JSONL files,
   so full 1M prepares no longer pause silently after `wrote artifacts` to
   re-read large files for checksums.
-- LambdaDB, Qdrant, and Pinecone adapters cache SDK clients/index handles per
-  target settings instead of recreating them for every batch/query.
+- Qdrant and Pinecone adapters cache SDK clients/index handles per target
+  settings instead of recreating them for every batch/query.
+- LambdaDB caches SDK clients per target settings and worker thread to avoid
+  sharing the underlying HTTP transport at high load/query concurrency.
 - Load summaries now separate runner-side batching time from adapter upsert
   attempt time with `records_read`, `batching_duration_seconds`,
   `batching_records_per_second`, and `upsert_attempt_duration_seconds`.

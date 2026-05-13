@@ -355,6 +355,11 @@ LambdaDB targets with:
 - `create_wait_poll_seconds`: create/existing-mode ACTIVE status polling
   interval. Defaults to `1`.
 
+The LambdaDB adapter keeps SDK clients thread-local during load/query execution
+so concurrent workers do not share the same underlying HTTP transport. High
+concurrency can therefore open more sockets; raise the process file descriptor
+limit on benchmark hosts when testing large `load.concurrency` values.
+
 Useful load settings:
 
 - `batch_size`: maximum records per upsert request.
