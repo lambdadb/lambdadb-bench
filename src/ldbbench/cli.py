@@ -17,6 +17,7 @@ from ldbbench.datasets import (
     prepare_ground_truth,
 )
 from ldbbench.manifest import initialize_run_artifacts
+from ldbbench.report import generate_report
 from ldbbench.runner import build_run_plan, execute_benchmark
 
 RESOURCE_TRACKER_WARNING_FILTER = (
@@ -231,6 +232,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow 1M+ real runs. Intended for explicit cost/time opt-in.",
     )
     run.set_defaults(func=run_benchmark)
+
+    report = subcommands.add_parser(
+        "report",
+        help="Combine benchmark result directories into Markdown and CSV reports.",
+    )
+    report.add_argument(
+        "result_dirs",
+        nargs="+",
+        help="Result directories containing summary.json and run_manifest.json.",
+    )
+    report.add_argument("--out", required=True, help="Output Markdown report path.")
+    report.set_defaults(func=run_report)
 
     return parser
 
@@ -453,6 +466,15 @@ def run_benchmark(args: argparse.Namespace) -> int:
         print(f"warning: {item}")
     print(f"wrote {paths.run_manifest}")
     return 0 if plan.can_run else 2
+
+
+def run_report(args: argparse.Namespace) -> int:
+    result = generate_report(args.result_dirs, output_path=args.out)
+    print(f"runs: {result.run_count}")
+    print(f"wrote {result.markdown_path}")
+    print(f"wrote {result.load_csv_path}")
+    print(f"wrote {result.query_csv_path}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

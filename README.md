@@ -269,6 +269,17 @@ Real runs write:
   summaries, load batching/upsert timing, error rates, and recall when
   `ground_truth.jsonl` is present.
 
+Combine one or more run directories into Markdown and CSV report artifacts:
+
+```bash
+uv run ldbbench report \
+  results/example-qdrant-smoke results/example-lambdadb-smoke \
+  --out reports/cohere-wikipedia-smoke.md
+```
+
+The report command writes the Markdown file plus sibling `*-load.csv` and
+`*-query-stages.csv` files for spreadsheet-friendly comparisons.
+
 Runs at 1M rows or larger require `--allow-large-run` unless `--max-records`
 keeps the run below that threshold.
 

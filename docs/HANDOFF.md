@@ -1,6 +1,6 @@
 # LambdaDB Bench Handoff
 
-Last updated: 2026-05-12
+Last updated: 2026-05-13
 
 This repository includes Phase 2-6 runner follow-up work and the Phase 3
 Pinecone Serverless adapter. Real LambdaDB/Qdrant Phase 2 endpoint validation
@@ -70,6 +70,9 @@ Current code includes Phase 2-6 stage 2 plus follow-up hardening:
   writer thread and batched flushes, avoiding a per-query write lock/flush
   ceiling at high configured concurrency. The Qdrant query adapter also reuses
   list vectors directly instead of copying every query vector.
+- `ldbbench report` combines one or more result directories into a Markdown
+  report plus sibling load/query-stage CSV files for spreadsheet-friendly
+  comparison.
 
 Any remaining local files should be benchmark artifacts or local configs ignored
 by `.gitignore`.
@@ -260,10 +263,10 @@ uv run python -m pytest
 git diff --check
 ```
 
-Current test count after query runner optimization work:
+Current test count after report generator work:
 
 ```text
-94 passed, 3 skipped
+98 passed, 3 skipped
 ```
 
 Useful smoke commands:
@@ -288,7 +291,7 @@ QDRANT_ENDPOINT=https://example.qdrant.io \
 ## Next Work
 
 Run gated Pinecone endpoint validation when credentials are available, then move
-to the report generator or another Later Work item unless priorities change.
+to another Later Work item unless priorities change.
 
 ## Qdrant SDK Notes
 
@@ -606,7 +609,6 @@ stable. Prepare 1k/10k datasets before any full 1M workload, and use
 - filtered search scenario.
 - search-under-ingest scenario.
 - idle-to-burst serverless scenario.
-- report generator.
 
 ## Notes For Next Session
 

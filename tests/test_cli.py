@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from ldbbench.cli import main
@@ -267,6 +269,72 @@ prepare:
     assert "run_manifest.json" in captured.out
     assert (output_dir / "run_manifest.json").exists()
     assert (output_dir / "target.redacted.yaml").exists()
+
+
+def test_report_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    result_dir = tmp_path / "result"
+    result_dir.mkdir()
+    (result_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "load": {
+                    "batches": 1,
+                    "duration_seconds": 1.0,
+                    "errors": 0,
+                    "records": 10,
+                    "records_per_second": 10.0,
+                    "status": "completed",
+                },
+                "query": {
+                    "errors": 0,
+                    "mode": "staged",
+                    "queries": 20,
+                    "queries_per_second": 20.0,
+                    "recall_at_k": 1.0,
+                    "recall_samples": 20,
+                    "stages": [
+                        {
+                            "concurrency": 1,
+                            "duration_seconds": 1.0,
+                            "errors": 0,
+                            "queries": 20,
+                            "queries_per_second": 20.0,
+                            "stage_index": 1,
+                        }
+                    ],
+                },
+                "status": "completed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (result_dir / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "scenario": {
+                    "dataset": {"dimensions": 2, "rows": 10, "source": "demo"},
+                    "name": "smoke",
+                    "query": {"consistency": "eventual", "top_k": 10},
+                },
+                "target": {
+                    "name": "qdrant",
+                    "report_label": "qdrant-ci",
+                    "vendor": "qdrant",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "reports" / "smoke.md"
+
+    exit_code = main(["report", str(result_dir), "--out", str(report_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "runs: 1" in captured.out
+    assert report_path.exists()
+    assert (report_path.parent / "smoke-load.csv").exists()
+    assert (report_path.parent / "smoke-query-stages.csv").exists()
 
 
 def test_target_check_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
