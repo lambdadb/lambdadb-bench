@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -61,6 +61,18 @@ class BenchmarkRunResult:
 class LoadStageResult:
     summary: dict[str, Any]
     visibility_samples: list[VectorRecord]
+
+
+@dataclass(frozen=True)
+class PartitionFilterSpec:
+    field: str
+    metadata_field: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "field": self.field,
+            "metadata_field": self.metadata_field,
+        }
 
 
 def execute_benchmark(
@@ -242,6 +254,7 @@ def execute_benchmark(
             consistency=str(scenario.query.get("consistency", "eventual")),
             include_vectors=bool(scenario.query.get("include_vectors", False)),
             ground_truth=ground_truth,
+            partition_filter_spec=_partition_filter_spec(scenario),
             events_path=query_events_path,
             stages=None if max_queries is not None else _query_stages(scenario),
             processes=_query_processes(scenario),
@@ -980,6 +993,7 @@ def run_query_stage(
     include_vectors: bool,
     ground_truth: Mapping[str, list[str]],
     events_path: str | Path,
+    partition_filter_spec: PartitionFilterSpec | None = None,
     stages: list[dict[str, Any]] | None = None,
     processes: int = 1,
     progress: ProgressCallback | None = None,
@@ -988,6 +1002,7 @@ def run_query_stage(
     events_output.parent.mkdir(parents=True, exist_ok=True)
     query_list = list(queries)
     ticker = ProgressTicker(progress)
+    _validate_partition_filter_query_records(query_list, partition_filter_spec)
     if not query_list:
         events_output.write_text("", encoding="utf-8")
         return _query_summary(
@@ -999,6 +1014,7 @@ def run_query_stage(
             error_count=0,
             processes=1,
             stage_summaries=[],
+            partition_filter_spec=partition_filter_spec,
         )
 
     if stages:
@@ -1010,6 +1026,7 @@ def run_query_stage(
             consistency=consistency,
             include_vectors=include_vectors,
             ground_truth=ground_truth,
+            partition_filter_spec=partition_filter_spec,
             events_path=events_output,
             stages=stages,
             processes=processes,
@@ -1032,6 +1049,7 @@ def run_query_stage(
                 consistency=consistency,
                 include_vectors=include_vectors,
                 ground_truth=ground_truth,
+                partition_filter_spec=partition_filter_spec,
             )
             state.record(event)
             _write_event(file, event, flush=False, sort_keys=False)
@@ -1054,6 +1072,7 @@ def run_query_stage(
         error_count=state.errors,
         processes=1,
         stage_summaries=[],
+        partition_filter_spec=partition_filter_spec,
     )
 
 
@@ -1066,6 +1085,7 @@ def run_staged_query_stage(
     consistency: str,
     include_vectors: bool,
     ground_truth: Mapping[str, list[str]],
+    partition_filter_spec: PartitionFilterSpec | None,
     events_path: Path,
     stages: list[dict[str, Any]],
     processes: int = 1,
@@ -1105,6 +1125,7 @@ def run_staged_query_stage(
                     consistency=consistency,
                     include_vectors=include_vectors,
                     ground_truth=ground_truth,
+                    partition_filter_spec=partition_filter_spec,
                     file=file,
                     stage_index=stage_index,
                     concurrency=concurrency,
@@ -1126,6 +1147,7 @@ def run_staged_query_stage(
                         configured_duration_seconds=duration_seconds,
                         elapsed_seconds=time.perf_counter() - stage_started,
                         state=stage_state,
+                        partition_filter_spec=partition_filter_spec,
                     )
                 )
                 ticker.emit(
@@ -1172,6 +1194,7 @@ def run_staged_query_stage(
                         consistency=consistency,
                         include_vectors=include_vectors,
                         ground_truth=ground_truth,
+                        partition_filter_spec=partition_filter_spec,
                     )
                     current_event_queue.put(event)
 
@@ -1235,6 +1258,7 @@ def run_staged_query_stage(
                     configured_duration_seconds=duration_seconds,
                     elapsed_seconds=time.perf_counter() - stage_started,
                     state=stage_state,
+                    partition_filter_spec=partition_filter_spec,
                 )
             )
             ticker.emit(
@@ -1255,6 +1279,7 @@ def run_staged_query_stage(
             for index, stage in enumerate(stages, start=1)
         ))),
         stage_summaries=stage_summaries,
+        partition_filter_spec=partition_filter_spec,
     )
 
 
@@ -1267,6 +1292,7 @@ def _run_staged_query_processes(
     consistency: str,
     include_vectors: bool,
     ground_truth: Mapping[str, list[str]],
+    partition_filter_spec: PartitionFilterSpec | None,
     file: Any,
     stage_index: int,
     concurrency: int,
@@ -1297,6 +1323,7 @@ def _run_staged_query_processes(
                 consistency,
                 include_vectors,
                 dict(ground_truth),
+                partition_filter_spec,
             ),
             name=f"ldbbench-query-{stage_index}-{index}",
         )
@@ -1377,6 +1404,7 @@ def _query_process_worker(
     consistency: str,
     include_vectors: bool,
     ground_truth: Mapping[str, list[str]],
+    partition_filter_spec: PartitionFilterSpec | None,
 ) -> None:
     def worker(local_index: int) -> None:
         adapter = _worker_adapter(vendor)
@@ -1398,6 +1426,7 @@ def _query_process_worker(
                     consistency=consistency,
                     include_vectors=include_vectors,
                     ground_truth=ground_truth,
+                    partition_filter_spec=partition_filter_spec,
                 )
             )
 
@@ -1430,6 +1459,34 @@ class QueryRunState:
             self.errors += 1
 
 
+def _query_partition_filter(
+    query: VectorRecord,
+    partition_filter_spec: PartitionFilterSpec | None,
+) -> dict[str, Any] | None:
+    if partition_filter_spec is None:
+        return None
+    value = query.metadata.get(partition_filter_spec.metadata_field)
+    if not isinstance(value, str) or not value:
+        raise ConfigError(
+            "query partition_filter metadata field "
+            f"{partition_filter_spec.metadata_field!r} must be a non-empty string"
+        )
+    return {
+        "field": partition_filter_spec.field,
+        "in_": [value],
+    }
+
+
+def _validate_partition_filter_query_records(
+    queries: Sequence[VectorRecord],
+    partition_filter_spec: PartitionFilterSpec | None,
+) -> None:
+    if partition_filter_spec is None:
+        return
+    for query in queries:
+        _query_partition_filter(query, partition_filter_spec)
+
+
 def execute_query_once(
     *,
     adapter: VectorDBAdapter,
@@ -1442,6 +1499,7 @@ def execute_query_once(
     consistency: str,
     include_vectors: bool,
     ground_truth: Mapping[str, list[str]],
+    partition_filter_spec: PartitionFilterSpec | None = None,
 ) -> dict[str, Any]:
     query_started = time.perf_counter()
     base_event: dict[str, Any] = {
@@ -1453,6 +1511,9 @@ def execute_query_once(
         base_event["query_stage_index"] = query_stage_index
     if worker_index is not None:
         base_event["worker_index"] = worker_index
+    partition_filter = _query_partition_filter(query, partition_filter_spec)
+    if partition_filter is not None:
+        base_event["partition_filter"] = partition_filter
 
     try:
         result = adapter.query(
@@ -1461,6 +1522,7 @@ def execute_query_once(
             top_k=top_k,
             consistency=consistency,
             include_vectors=include_vectors,
+            partition_filter=partition_filter,
         )
     except Exception as exc:  # noqa: BLE001
         base_event.update(
@@ -1474,11 +1536,16 @@ def execute_query_once(
         return base_event
 
     match_ids = [match.id for match in result.matches]
-    recall = recall_at_k(
-        actual=match_ids,
-        expected=ground_truth.get(query.id),
-        k=top_k,
-    )
+    recall = None
+    recall_skip_reason = None
+    if partition_filter_spec is not None:
+        recall_skip_reason = "partition_filtered"
+    else:
+        recall = recall_at_k(
+            actual=match_ids,
+            expected=ground_truth.get(query.id),
+            k=top_k,
+        )
     base_event.update(
         {
             "matches": match_ids,
@@ -1487,6 +1554,8 @@ def execute_query_once(
             "status": "ok",
         }
     )
+    if recall_skip_reason is not None:
+        base_event["recall_skip_reason"] = recall_skip_reason
     return base_event
 
 
@@ -1512,6 +1581,7 @@ def _query_summary(
     error_count: int,
     processes: int,
     stage_summaries: list[dict[str, Any]],
+    partition_filter_spec: PartitionFilterSpec | None = None,
 ) -> dict[str, Any]:
     duration_seconds = time.perf_counter() - started
     attempts = query_count + error_count
@@ -1529,6 +1599,10 @@ def _query_summary(
         "recall_samples": len(recalls),
         "processes": processes,
     }
+    if partition_filter_spec is not None:
+        summary["partition_filter"] = partition_filter_spec.as_dict()
+        summary["partition_filter_applied"] = True
+        summary["recall_skip_reason"] = "partition_filtered"
     if stage_summaries:
         summary["stages"] = stage_summaries
     return summary
@@ -1544,6 +1618,7 @@ def skipped_query_summary(*, reason: str) -> dict[str, Any]:
         error_count=0,
         processes=1,
         stage_summaries=[],
+        partition_filter_spec=None,
     )
     summary["skip_reason"] = reason
     return summary
@@ -1700,9 +1775,10 @@ def _query_stage_summary(
     configured_duration_seconds: float,
     elapsed_seconds: float,
     state: QueryRunState,
+    partition_filter_spec: PartitionFilterSpec | None,
 ) -> dict[str, Any]:
     attempts = state.queries + state.errors
-    return {
+    summary: dict[str, Any] = {
         "stage_index": stage_index,
         "concurrency": concurrency,
         "processes": processes,
@@ -1719,6 +1795,11 @@ def _query_stage_summary(
         "recall_at_k": _mean(state.recalls) if state.recalls else None,
         "recall_samples": len(state.recalls),
     }
+    if partition_filter_spec is not None:
+        summary["partition_filter"] = partition_filter_spec.as_dict()
+        summary["partition_filter_applied"] = True
+        summary["recall_skip_reason"] = "partition_filtered"
+    return summary
 
 
 def read_records(
@@ -2084,6 +2165,23 @@ def _query_stages(scenario: ScenarioConfig) -> list[dict[str, Any]] | None:
         dict(_as_stage_mapping(stage, stage_index=index))
         for index, stage in enumerate(stages, start=1)
     ]
+
+
+def _partition_filter_spec(scenario: ScenarioConfig) -> PartitionFilterSpec | None:
+    value = scenario.query.get("partition_filter")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ConfigError("scenario.query.partition_filter must be a mapping")
+    field = value.get("field")
+    metadata_field = value.get("metadata_field")
+    if not isinstance(field, str) or not field:
+        raise ConfigError("scenario.query.partition_filter.field must be a string")
+    if not isinstance(metadata_field, str) or not metadata_field:
+        raise ConfigError(
+            "scenario.query.partition_filter.metadata_field must be a string"
+        )
+    return PartitionFilterSpec(field=field, metadata_field=metadata_field)
 
 
 def _as_stage_mapping(stage: Any, *, stage_index: int) -> Mapping[str, Any]:

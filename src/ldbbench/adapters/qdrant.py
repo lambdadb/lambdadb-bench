@@ -24,6 +24,7 @@ QDRANT_CAPABILITIES = AdapterCapabilities(
     supported_write_modes=frozenset({"upsert"}),
     supported_query_consistency=frozenset({"eventual"}),
     supports_read_after_write_strong=False,
+    supports_query_partition_filter=False,
     vendor_consistency_options={
         "read_consistency": ["all", "majority", "quorum"],
         "write_ordering": ["weak", "medium", "strong"],
@@ -168,9 +169,12 @@ class QdrantAdapter:
         consistency: str,
         include_vectors: bool = False,
         filter_query: Mapping[str, Any] | None = None,
+        partition_filter: Mapping[str, Any] | None = None,
     ) -> QueryResult:
         if consistency != "eventual":
             raise ConfigError("Qdrant adapter supports only eventual consistency")
+        if partition_filter is not None:
+            raise ConfigError("Qdrant adapter does not support partition filters")
 
         settings = _settings_from_target(target)
         response = self._client(settings).query_points(

@@ -54,6 +54,8 @@ def test_generate_report_writes_markdown_and_csv(tmp_path) -> None:
         "[4, 4, 4, 4]",
         "[4, 4, 4, 4]",
     ]
+    assert [row["partition_filter_applied"] for row in query_rows] == ["N/A", "N/A"]
+    assert [row["recall_skip_reason"] for row in query_rows] == ["N/A", "N/A"]
     assert query_rows[1]["queries_per_second"] == "700.000"
 
 

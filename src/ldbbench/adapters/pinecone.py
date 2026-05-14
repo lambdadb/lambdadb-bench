@@ -34,6 +34,7 @@ PINECONE_CAPABILITIES = AdapterCapabilities(
     supported_write_modes=frozenset({"upsert"}),
     supported_query_consistency=frozenset({"eventual"}),
     supports_read_after_write_strong=False,
+    supports_query_partition_filter=False,
     vendor_consistency_options={"data_freshness_model": "eventual"},
 )
 
@@ -173,9 +174,12 @@ class PineconeAdapter:
         consistency: str,
         include_vectors: bool = False,
         filter_query: Mapping[str, Any] | None = None,
+        partition_filter: Mapping[str, Any] | None = None,
     ) -> QueryResult:
         if consistency != "eventual":
             raise ConfigError("Pinecone adapter supports only eventual consistency")
+        if partition_filter is not None:
+            raise ConfigError("Pinecone adapter does not support partition filters")
 
         settings = _settings_from_target(target)
         kwargs: dict[str, Any] = {

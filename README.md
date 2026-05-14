@@ -346,6 +346,8 @@ LambdaDB targets with:
   `vector`.
 - `index_configs`: LambdaDB collection index config used by create/recreate
   preparation modes.
+- `partition_config`: optional LambdaDB hash partition config for create/recreate
+  preparation modes. See `configs/lambdadb-partitioned.example.yaml`.
 - `delete_wait_timeout_seconds`: recreate-mode deletion wait timeout. Defaults
   to `60`.
 - `delete_wait_poll_seconds`: recreate-mode deletion polling interval. Defaults
@@ -378,6 +380,12 @@ Useful load settings:
 For staged queries, `query.processes` works the same way: each
 `query.stages[].concurrency` value remains the total in-flight query count, and
 the runner splits that total across worker processes when `query.processes > 1`.
+
+Partition-pruned query workloads can set `query.partition_filter` with a target
+field and query metadata source field. These runs intentionally skip global
+recall reporting because the query searches a restricted partition subset. See
+`docs/PARTITIONING_WORKLOAD.md` and
+`scenarios/cohere-wikipedia-1m-partitioned.yaml`.
 
 Optional integration coverage is gated behind:
 

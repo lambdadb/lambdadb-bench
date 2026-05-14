@@ -38,7 +38,11 @@ LAMBDADB_CAPABILITIES = AdapterCapabilities(
     supported_write_modes=frozenset({"upsert", "bulk_upsert"}),
     supported_query_consistency=frozenset({"eventual", "strong"}),
     supports_read_after_write_strong=True,
-    vendor_consistency_options={"consistent_read": True},
+    supports_query_partition_filter=True,
+    vendor_consistency_options={
+        "consistent_read": True,
+        "partition_filter": True,
+    },
 )
 
 
@@ -50,6 +54,7 @@ class LambdaDBTargetSettings:
     collection_name: str
     vector_field: str
     index_configs: dict[str, Any]
+    partition_config: dict[str, Any] | None
     timeout_ms: int | None
     delete_wait_timeout_seconds: float
     delete_wait_poll_seconds: float
@@ -83,6 +88,7 @@ class LambdaDBAdapter:
             "target": target.name,
             "collection_name": settings.collection_name,
             "vector_field": settings.vector_field,
+            "partition_config": settings.partition_config,
             "api_key_env": settings.api_key_env,
             "api_key_present": bool(
                 settings.api_key_env and self._environ.get(settings.api_key_env)
@@ -126,10 +132,13 @@ class LambdaDBAdapter:
             self._delete_if_present(client, settings)
 
         index_configs = _index_configs(settings, dimensions=dimensions, metric=metric)
-        response = client.collections.create(
-            collection_name=settings.collection_name,
-            index_configs=index_configs,
-        )
+        create_kwargs: dict[str, Any] = {
+            "collection_name": settings.collection_name,
+            "index_configs": index_configs,
+        }
+        if settings.partition_config is not None:
+            create_kwargs["partition_config"] = settings.partition_config
+        response = client.collections.create(**create_kwargs)
         ready_response = self._wait_until_active(client, settings)
         return PrepareResult(
             ok=True,
@@ -149,7 +158,11 @@ class LambdaDBAdapter:
     ) -> UpsertResult:
         settings = _settings_from_target(target)
         docs = [
-            _record_to_doc(record, vector_field=settings.vector_field)
+            _record_to_doc(
+                record,
+                vector_field=settings.vector_field,
+                partition_field=_partition_field(settings.partition_config),
+            )
             for record in records
         ]
         if not docs:
@@ -170,6 +183,7 @@ class LambdaDBAdapter:
         consistency: str,
         include_vectors: bool = False,
         filter_query: Mapping[str, Any] | None = None,
+        partition_filter: Mapping[str, Any] | None = None,
     ) -> QueryResult:
         settings = _settings_from_target(target)
         knn: dict[str, Any] = {
@@ -180,13 +194,16 @@ class LambdaDBAdapter:
         if filter_query is not None:
             knn["filter"] = dict(filter_query)
 
-        response = self._client(settings).collections.query(
-            collection_name=settings.collection_name,
-            query={"knn": knn},
-            size=top_k,
-            consistent_read=_consistent_read(consistency),
-            include_vectors=include_vectors,
-        )
+        query_kwargs: dict[str, Any] = {
+            "collection_name": settings.collection_name,
+            "query": {"knn": knn},
+            "size": top_k,
+            "consistent_read": _consistent_read(consistency),
+            "include_vectors": include_vectors,
+        }
+        if partition_filter is not None:
+            query_kwargs["partition_filter"] = dict(partition_filter)
+        response = self._client(settings).collections.query(**query_kwargs)
         return QueryResult(
             matches=_query_matches(response),
             raw_response=response,
@@ -371,6 +388,7 @@ def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
         collection_name=target.collection_name,
         vector_field=target.vector_field or DEFAULT_VECTOR_FIELD,
         index_configs=target.index_configs,
+        partition_config=_partition_config(target.partition_config),
         timeout_ms=timeout_ms,
         delete_wait_timeout_seconds=delete_wait_timeout_seconds,
         delete_wait_poll_seconds=delete_wait_poll_seconds,
@@ -388,6 +406,28 @@ def _optional_positive_float(
     if not isinstance(value, int | float) or value <= 0:
         raise ConfigError(f"target.{key} must be a positive number")
     return float(value)
+
+
+def _partition_config(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ConfigError("target.partition_config must be a mapping")
+    partition_config = dict(value)
+    field_name = partition_config.get("field_name")
+    data_type = partition_config.get("data_type")
+    num_partitions = partition_config.get("num_partitions")
+    if not isinstance(field_name, str) or not field_name:
+        raise ConfigError("target.partition_config.field_name must be a string")
+    if data_type != "keyword":
+        raise ConfigError("target.partition_config.data_type must be 'keyword'")
+    if num_partitions is not None and (
+        not isinstance(num_partitions, int) or num_partitions <= 0
+    ):
+        raise ConfigError(
+            "target.partition_config.num_partitions must be a positive integer"
+        )
+    return partition_config
 
 
 def _is_not_found_error(exc: Exception) -> bool:
@@ -486,13 +526,17 @@ def _record_to_doc(
     record: Mapping[str, Any] | VectorRecord,
     *,
     vector_field: str,
+    partition_field: str | None = None,
 ) -> dict[str, Any]:
     if isinstance(record, VectorRecord):
-        return {
+        metadata = dict(record.metadata)
+        doc = {
             "id": record.id,
             vector_field: _vector_values(record.vector),
-            "metadata": dict(record.metadata),
+            "metadata": metadata,
         }
+        _copy_partition_field(doc, metadata, partition_field=partition_field)
+        return doc
 
     record_id = record.get("id")
     vector = record.get("vector")
@@ -503,11 +547,34 @@ def _record_to_doc(
         raise ConfigError("record vector must be a list")
     if not isinstance(metadata, Mapping):
         raise ConfigError("record metadata must be a mapping")
-    return {
+    metadata_dict = dict(metadata)
+    doc = {
         "id": record_id,
         vector_field: _vector_values(vector),
-        "metadata": dict(metadata),
+        "metadata": metadata_dict,
     }
+    _copy_partition_field(doc, metadata_dict, partition_field=partition_field)
+    return doc
+
+
+def _partition_field(partition_config: Mapping[str, Any] | None) -> str | None:
+    if partition_config is None:
+        return None
+    field_name = partition_config.get("field_name")
+    return field_name if isinstance(field_name, str) and field_name else None
+
+
+def _copy_partition_field(
+    doc: dict[str, Any],
+    metadata: Mapping[str, Any],
+    *,
+    partition_field: str | None,
+) -> None:
+    if partition_field is None or partition_field in doc:
+        return
+    value = metadata.get(partition_field)
+    if value is not None:
+        doc[partition_field] = value
 
 
 def _vector_values(vector: Sequence[float]) -> Sequence[float]:

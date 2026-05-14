@@ -108,6 +108,7 @@ def build_run_manifest(
             "query": {
                 "consistency": scenario.query.get("consistency", "eventual"),
                 "top_k": scenario.query.get("top_k"),
+                "partition_filter": scenario.query.get("partition_filter"),
             },
             "load": {
                 "write_mode": scenario.load.get("write_mode"),
@@ -122,6 +123,7 @@ def build_run_manifest(
             "endpoint": endpoint_redacted,
             "region": target.region,
             "prepare_mode": target.prepare_mode,
+            "partition_config": target.partition_config,
             "deployment_mode": metadata.get("deployment_mode"),
             "user_declared_config": metadata.get("user_declared_config"),
             "pricing_notes": metadata.get("pricing_notes"),

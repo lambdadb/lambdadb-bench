@@ -54,6 +54,7 @@ def build_run_plan(
 ) -> RunPlan:
     write_mode = str(scenario.load.get("write_mode"))
     query_consistency = str(scenario.query.get("consistency", "eventual"))
+    partition_filter_requested = scenario.query.get("partition_filter") is not None
     unsupported: list[str] = []
     not_applicable: list[str] = []
     warnings: list[str] = []
@@ -82,6 +83,12 @@ def build_run_plan(
 
     if target.prepare_mode == "recreate" and not allow_destructive:
         unsupported.append("prepare mode 'recreate' requires --allow-destructive")
+
+    if partition_filter_requested and not capabilities.supports_query_partition_filter:
+        not_applicable.append(
+            f"query partition_filter is N/A for {target.vendor}: "
+            "no equivalent physical partition pruning support is declared"
+        )
 
     if not target.endpoint:
         warnings.append(

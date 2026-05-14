@@ -1,0 +1,30 @@
+vendor: lambdadb
+name: lambdadb-user-project-partitioned
+endpoint: ${LAMBDADB_ENDPOINT}
+project_name: ${LAMBDADB_PROJECT_NAME}
+api_key_env: LAMBDADB_API_KEY
+collection_name: cohere_wikipedia_1m_partitioned
+vector_field: vector
+region: us-east-1
+
+prepare:
+  mode: existing
+
+index_configs:
+  vector:
+    type: vector
+    dimensions: 1024
+    similarity: cosine
+  url:
+    type: keyword
+
+partition_config:
+  field_name: url
+  data_type: keyword
+  num_partitions: 16
+
+metadata:
+  deployment_mode: serverless
+  user_declared_config: "LambdaDB serverless project with hash partitioning on url"
+  pricing_notes: "User-provided LambdaDB pricing assumptions"
+  report_label: lambdadb-serverless-partitioned

@@ -63,6 +63,7 @@ class ScenarioConfig:
                 f"{sorted(VALID_QUERY_CONSISTENCY)}"
             )
         _validate_optional_positive_int(query, "processes")
+        _validate_partition_filter(query)
 
         stages = query.get("stages", [])
         if stages is not None:
@@ -100,6 +101,7 @@ class TargetConfig:
     project_name: str | None
     vector_field: str | None
     index_configs: dict[str, Any]
+    partition_config: dict[str, Any] | None
     region: str | None
     prepare_mode: str
     metadata: dict[str, Any]
@@ -116,6 +118,7 @@ class TargetConfig:
         project_name = _optional_str(raw, "project_name")
         vector_field = _optional_str(raw, "vector_field")
         index_configs = _optional_mapping(raw, "index_configs")
+        partition_config = _optional_mapping_or_none(raw, "partition_config")
         region = _optional_str(raw, "region")
         prepare = _optional_mapping(raw, "prepare")
         prepare_mode = prepare.get("mode", "existing")
@@ -134,6 +137,7 @@ class TargetConfig:
             project_name=project_name,
             vector_field=vector_field,
             index_configs=index_configs,
+            partition_config=partition_config,
             region=region,
             prepare_mode=prepare_mode,
             metadata=_optional_mapping(raw, "metadata"),
@@ -284,6 +288,34 @@ def _optional_mapping(data: Mapping[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{key} must be a mapping")
     return dict(value)
+
+
+def _optional_mapping_or_none(
+    data: Mapping[str, Any],
+    key: str,
+) -> dict[str, Any] | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must be a mapping")
+    return dict(value)
+
+
+def _validate_partition_filter(query: Mapping[str, Any]) -> None:
+    value = query.get("partition_filter")
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ConfigError("scenario.query.partition_filter must be a mapping")
+    field = value.get("field")
+    metadata_field = value.get("metadata_field")
+    if not isinstance(field, str) or not field:
+        raise ConfigError("scenario.query.partition_filter.field must be a string")
+    if not isinstance(metadata_field, str) or not metadata_field:
+        raise ConfigError(
+            "scenario.query.partition_filter.metadata_field must be a string"
+        )
 
 
 def _validate_positive_int(data: Mapping[str, Any], key: str) -> None:

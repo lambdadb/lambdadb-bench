@@ -9,13 +9,20 @@ def make_scenario(
     *,
     write_mode: str = "upsert",
     consistency: str = "eventual",
+    partition_filter: bool = False,
 ) -> ScenarioConfig:
+    query = {"consistency": consistency}
+    if partition_filter:
+        query["partition_filter"] = {
+            "field": "url",
+            "metadata_field": "url",
+        }
     return ScenarioConfig.from_mapping(
         {
             "name": "smoke",
             "dataset": {"rows": 1, "dimensions": 1024},
             "load": {"write_mode": write_mode},
-            "query": {"consistency": consistency},
+            "query": query,
         }
     )
 
@@ -58,6 +65,29 @@ def test_lambdadb_strong_consistency_is_supported() -> None:
     assert not plan.not_applicable
 
 
+def test_qdrant_partition_filter_is_partial_na() -> None:
+    plan = build_run_plan(
+        scenario=make_scenario(partition_filter=True),
+        target=make_target(vendor="qdrant"),
+        capabilities=QDRANT_DRYRUN.capabilities,
+    )
+
+    assert plan.status == "partial"
+    assert plan.can_run
+    assert "partition_filter" in plan.not_applicable[0]
+
+
+def test_lambdadb_partition_filter_is_supported() -> None:
+    plan = build_run_plan(
+        scenario=make_scenario(partition_filter=True),
+        target=make_target(vendor="lambdadb"),
+        capabilities=LAMBDADB_DRYRUN.capabilities,
+    )
+
+    assert plan.status == "supported"
+    assert not plan.not_applicable
+
+
 def test_recreate_requires_destructive_flag() -> None:
     plan = build_run_plan(
         scenario=make_scenario(),
@@ -89,4 +119,3 @@ def test_unsupported_write_mode_blocks_run() -> None:
 
     assert plan.status == "unsupported"
     assert "bulk_upsert" in plan.unsupported[0]
-

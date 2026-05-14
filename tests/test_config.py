@@ -25,6 +25,9 @@ load:
 query:
   consistency: eventual
   processes: 2
+  partition_filter:
+    field: url
+    metadata_field: url
   stages:
     - concurrency: 8
       duration: 5m
@@ -38,6 +41,10 @@ query:
     assert scenario.load["write_mode"] == "upsert"
     assert scenario.load["processes"] == 4
     assert scenario.query["processes"] == 2
+    assert scenario.query["partition_filter"] == {
+        "field": "url",
+        "metadata_field": "url",
+    }
 
 
 def test_load_target_expands_env_and_redacts_secrets(tmp_path, monkeypatch) -> None:
@@ -86,6 +93,10 @@ index_configs:
     type: vector
     dimensions: 3
     similarity: cosine
+partition_config:
+  field_name: url
+  data_type: keyword
+  num_partitions: 16
 """,
         encoding="utf-8",
     )
@@ -98,6 +109,11 @@ index_configs:
     assert target.collection_name == "smoke"
     assert target.vector_field == "dense"
     assert target.index_configs["dense"]["dimensions"] == 3
+    assert target.partition_config == {
+        "field_name": "url",
+        "data_type": "keyword",
+        "num_partitions": 16,
+    }
 
 
 def test_conflicting_collection_names_fail(tmp_path) -> None:
@@ -148,6 +164,28 @@ query:
     )
 
     with pytest.raises(ConfigError, match="query.consistency"):
+        load_scenario(scenario_path)
+
+
+def test_invalid_partition_filter_fails(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  partition_filter:
+    field: url
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="partition_filter.metadata_field"):
         load_scenario(scenario_path)
 
 

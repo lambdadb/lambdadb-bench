@@ -190,6 +190,52 @@ def test_prepare_create_builds_vector_index_config() -> None:
     assert client.collections.gets == [{"collection_name": "smoke"}]
 
 
+def test_prepare_create_passes_partition_config() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(
+        prepare={"mode": "create"},
+        partition_config={
+            "field_name": "url",
+            "data_type": "keyword",
+            "num_partitions": 16,
+        },
+    )
+
+    result = adapter.prepare(target, dimensions=1024, metric="cosine")
+
+    assert result.ok
+    assert client.collections.creates == [
+        {
+            "collection_name": "smoke",
+            "index_configs": {
+                "dense": {
+                    "type": "vector",
+                    "dimensions": 1024,
+                    "similarity": "cosine",
+                }
+            },
+            "partition_config": {
+                "field_name": "url",
+                "data_type": "keyword",
+                "num_partitions": 16,
+            },
+        }
+    ]
+
+
+def test_prepare_create_rejects_invalid_partition_config() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(
+        prepare={"mode": "create"},
+        partition_config={"field_name": "url", "data_type": "text"},
+    )
+
+    with pytest.raises(ConfigError, match="partition_config"):
+        adapter.prepare(target, dimensions=1024, metric="cosine")
+
+
 def test_prepare_create_waits_until_collection_is_active() -> None:
     client = FakeClient(statuses=["CREATING", "ACTIVE"])
     adapter = make_adapter(client)
@@ -404,6 +450,46 @@ def test_upsert_batch_maps_normalized_records_to_documents() -> None:
     ]
 
 
+def test_upsert_batch_copies_partition_field_from_metadata() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(
+        partition_config={
+            "field_name": "url",
+            "data_type": "keyword",
+            "num_partitions": 16,
+        },
+    )
+
+    adapter.upsert_batch(
+        target,
+        [
+            {
+                "id": "a",
+                "vector": [0.1, 0.2],
+                "metadata": {"text": "alpha", "url": "https://example.test/a"},
+            },
+        ],
+    )
+
+    assert client.collections.docs.upserts == [
+        {
+            "collection_name": "smoke",
+            "docs": [
+                {
+                    "id": "a",
+                    "dense": [0.1, 0.2],
+                    "metadata": {
+                        "text": "alpha",
+                        "url": "https://example.test/a",
+                    },
+                    "url": "https://example.test/a",
+                }
+            ],
+        }
+    ]
+
+
 def test_query_maps_strong_consistency_to_consistent_read() -> None:
     client = FakeClient()
     adapter = make_adapter(client)
@@ -432,6 +518,39 @@ def test_query_maps_strong_consistency_to_consistent_read() -> None:
             "size": 2,
             "consistent_read": True,
             "include_vectors": False,
+        }
+    ]
+
+
+def test_query_passes_partition_filter() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    adapter.query(
+        make_target(),
+        vector=[0.1, 0.2],
+        top_k=2,
+        consistency="eventual",
+        partition_filter={"field": "url", "in_": ["https://example.test/doc"]},
+    )
+
+    assert client.collections.queries == [
+        {
+            "collection_name": "smoke",
+            "query": {
+                "knn": {
+                    "field": "dense",
+                    "queryVector": [0.1, 0.2],
+                    "k": 2,
+                }
+            },
+            "size": 2,
+            "consistent_read": False,
+            "include_vectors": False,
+            "partition_filter": {
+                "field": "url",
+                "in_": ["https://example.test/doc"],
+            },
         }
     ]
 

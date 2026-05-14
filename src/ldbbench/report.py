@@ -40,6 +40,8 @@ QUERY_CSV_HEADERS = [
     "concurrency",
     "processes",
     "worker_threads_per_process",
+    "partition_filter_applied",
+    "recall_skip_reason",
     "queries",
     "queries_per_second",
     "duration_seconds",
@@ -268,6 +270,7 @@ def _target_rows(runs: list[RunReport]) -> list[dict[str, str]]:
                 "region": _fmt(target.get("region")),
                 "endpoint": _fmt(target.get("endpoint")),
                 "prepare_mode": _fmt(target.get("prepare_mode")),
+                "partition_config": _fmt(target.get("partition_config")),
                 "deployment_mode": _fmt(target.get("deployment_mode")),
                 "config_notes": _fmt(target.get("user_declared_config")),
             }
@@ -331,6 +334,8 @@ def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
         "worker_threads_per_process": _fmt(
             stage.get("worker_threads_per_process"),
         ),
+        "partition_filter_applied": _fmt(stage.get("partition_filter_applied")),
+        "recall_skip_reason": _fmt(stage.get("recall_skip_reason")),
         "queries": _fmt(stage.get("queries")),
         "queries_per_second": _fmt_float(stage.get("queries_per_second")),
         "duration_seconds": _fmt_float(stage.get("duration_seconds")),
@@ -358,6 +363,7 @@ def _quality_rows(runs: list[RunReport]) -> list[dict[str, str]]:
                 "target": _target_label(run),
                 "recall_at_k": _fmt_float(recall),
                 "recall_samples": _fmt(query.get("recall_samples")),
+                "recall_skip_reason": _fmt(query.get("recall_skip_reason")),
                 "min_recall": _fmt_float(gate),
                 "quality_gate": passed,
                 "query_mode": _fmt(query.get("mode")),
@@ -382,6 +388,11 @@ def _warning_lines(runs: list[RunReport]) -> list[str]:
         if query.get("mode") == "skipped":
             warnings.append(
                 f"{target}: query stage skipped ({_fmt(query.get('skip_reason'))})."
+            )
+        if query.get("recall_skip_reason") == "partition_filtered":
+            warnings.append(
+                f"{target}: recall is N/A because partition-filtered search "
+                "uses a restricted candidate set."
             )
         for stage_name, stage in (("load", load), ("query", query)):
             errors = stage.get("errors")

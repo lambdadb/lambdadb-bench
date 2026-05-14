@@ -36,6 +36,7 @@ class FakeAdapter:
     capabilities = AdapterCapabilities(
         supported_write_modes=frozenset({"upsert"}),
         supported_query_consistency=frozenset({"eventual"}),
+        supports_query_partition_filter=True,
     )
 
     def __init__(
@@ -49,6 +50,7 @@ class FakeAdapter:
         self.prepared: dict[str, Any] | None = None
         self.upserted: list[list[VectorRecord]] = []
         self.queries: list[list[float]] = []
+        self.partition_filters: list[dict[str, Any] | None] = []
         self.fail_load_batch = fail_load_batch
         self.fail_every = fail_every
         self.load_delay_seconds = load_delay_seconds
@@ -98,6 +100,7 @@ class FakeAdapter:
         consistency: str,
         include_vectors: bool = False,
         filter_query: dict[str, Any] | None = None,
+        partition_filter: dict[str, Any] | None = None,
     ) -> QueryResult:
         if self.query_delay_seconds:
             time.sleep(self.query_delay_seconds)
@@ -105,6 +108,7 @@ class FakeAdapter:
             self.query_calls += 1
             call_number = self.query_calls
             self.queries.append(vector)
+            self.partition_filters.append(partition_filter)
         if self.fail_every and call_number % self.fail_every == 0:
             raise RuntimeError("planned query failure")
         scored = [
@@ -150,6 +154,7 @@ def make_scenario(
     batch_size: int = 2,
     load_concurrency: int | None = None,
     wait_until_query_visible: bool = False,
+    partition_filter: bool = False,
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": 2,
@@ -158,6 +163,11 @@ def make_scenario(
     }
     if stages is not None:
         query["stages"] = stages
+    if partition_filter:
+        query["partition_filter"] = {
+            "field": "url",
+            "metadata_field": "url",
+        }
     mapping: dict[str, Any] = {
         "name": "runner-smoke",
         "dataset": {
@@ -304,6 +314,70 @@ def test_execute_benchmark_writes_events_and_summary(tmp_path) -> None:
     assert result.summary["query"]["queries"] == 1
     assert result.summary["query"]["recall_at_k"] == 1.0
     assert result.summary_path.exists()
+
+
+def test_execute_benchmark_applies_partition_filter_and_skips_recall(tmp_path) -> None:
+    scenario = make_scenario(partition_filter=True)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_dataset(
+        scenario=scenario,
+        output_dir=tmp_path / "dataset",
+        limit=3,
+        query_count=1,
+        source_rows=[
+            {"_id": "query", "emb": [1.0, 0.0], "text": "query", "url": "q-url"},
+            {"_id": "a", "emb": [1.0, 0.0], "text": "alpha", "url": "a-url"},
+            {"_id": "b", "emb": [0.0, 1.0], "text": "beta", "url": "b-url"},
+            {"_id": "c", "emb": [0.8, 0.2], "text": "gamma", "url": "c-url"},
+        ],
+    )
+    prepare_ground_truth(dataset_dir=dataset.output_dir, top_k=2)
+    adapter = FakeAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert adapter.partition_filters == [{"field": "url", "in_": ["q-url"]}]
+    assert query_events[0]["partition_filter"] == {"field": "url", "in_": ["q-url"]}
+    assert query_events[0]["recall_at_k"] is None
+    assert query_events[0]["recall_skip_reason"] == "partition_filtered"
+    assert result.summary["query"]["recall_at_k"] is None
+    assert result.summary["query"]["recall_samples"] == 0
+    assert result.summary["query"]["partition_filter_applied"] is True
+    assert result.summary["query"]["recall_skip_reason"] == "partition_filtered"
+
+
+def test_execute_benchmark_fails_partition_filter_when_query_metadata_missing(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(partition_filter=True)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+
+    with pytest.raises(ConfigError, match="metadata field 'url'"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+        )
 
 
 def test_read_records_uses_msgpack_estimated_size(tmp_path) -> None:
