@@ -55,6 +55,8 @@ class ScenarioConfig:
             )
         _validate_optional_positive_int(load, "concurrency")
         _validate_optional_positive_int(load, "processes")
+        _validate_optional_bool(load, "sharded_records")
+        _validate_optional_positive_int(load, "shard_count")
 
         consistency = query.get("consistency", "eventual")
         if consistency not in VALID_QUERY_CONSISTENCY:
@@ -328,3 +330,9 @@ def _validate_optional_positive_int(data: Mapping[str, Any], key: str) -> None:
     value = data.get(key)
     if value is not None and (not isinstance(value, int) or value <= 0):
         raise ConfigError(f"{key} must be a positive integer")
+
+
+def _validate_optional_bool(data: Mapping[str, Any], key: str) -> None:
+    value = data.get(key)
+    if value is not None and not isinstance(value, bool):
+        raise ConfigError(f"{key} must be a boolean")

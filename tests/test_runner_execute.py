@@ -18,7 +18,7 @@ from ldbbench.adapters.base import (
 )
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
 from ldbbench.datasets.ground_truth import prepare_ground_truth
-from ldbbench.datasets.prepare import prepare_dataset
+from ldbbench.datasets.prepare import optimize_dataset, prepare_dataset
 from ldbbench.runner.execute import (
     _batches,
     _record_size_bytes,
@@ -160,6 +160,9 @@ def make_scenario(
     wait_until_query_visible: bool = False,
     partition_filter: bool = False,
     write_mode: str = "upsert",
+    sharded_records: bool = False,
+    shard_count: int | None = None,
+    max_batch_bytes: str | None = "1MB",
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": 2,
@@ -188,15 +191,20 @@ def make_scenario(
         "load": {
             "write_mode": write_mode,
             "batch_size": batch_size,
-            "max_batch_bytes": "1MB",
             "wait_until_query_visible": wait_until_query_visible,
             "query_visibility_timeout": "50ms",
             "query_visibility_poll_interval": "1ms",
         },
         "query": query,
     }
+    if max_batch_bytes is not None:
+        mapping["load"]["max_batch_bytes"] = max_batch_bytes
     if load_concurrency is not None:
         mapping["load"]["concurrency"] = load_concurrency
+    if sharded_records:
+        mapping["load"]["sharded_records"] = True
+    if shard_count is not None:
+        mapping["load"]["shard_count"] = shard_count
     return ScenarioConfig.from_mapping(mapping)
 
 
@@ -353,6 +361,75 @@ def test_execute_benchmark_forwards_bulk_write_mode(tmp_path) -> None:
         "bulk_upsert",
     ]
     assert result.summary["load"]["write_mode"] == "bulk_upsert"
+
+
+def test_execute_benchmark_loads_sharded_records(tmp_path) -> None:
+    scenario = make_scenario(
+        batch_size=1,
+        sharded_records=True,
+        shard_count=2,
+        max_batch_bytes=None,
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    optimize_dataset(dataset_dir=dataset.output_dir, shards=2)
+    adapter = FakeAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+
+    ingest_events = [
+        json.loads(line)
+        for line in result.ingest_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert [batch[0].id for batch in adapter.upserted] == ["a", "b", "c"]
+    assert [event["batch_index"] for event in ingest_events] == [1, 2, 3]
+    assert result.summary["load"]["sharded_records"] is True
+    assert result.summary["load"]["shard_count"] == 2
+    assert result.summary["load"]["effective_shard_count"] == 2
+    assert result.summary["load"]["manifest_shard_count"] == 2
+    assert result.summary["load"]["worker_shards"] == [2]
+    assert result.summary["load"]["records"] == 3
+    assert result.summary["load"]["records_read"] == 3
+    assert result.summary["load"]["record_source"]["sharded"] is True
+    assert result.summary["load"]["record_source"]["effective_shards"] == 2
+    assert result.summary["load"]["record_source"]["manifest_shards"] == 2
+
+
+def test_execute_benchmark_rejects_sharded_load_with_max_batch_bytes(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(
+        sharded_records=True,
+        shard_count=2,
+        max_batch_bytes="1MB",
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    optimize_dataset(dataset_dir=dataset.output_dir, shards=2)
+
+    with pytest.raises(ConfigError, match="max_batch_bytes"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+            load_only=True,
+        )
 
 
 def test_execute_benchmark_applies_partition_filter_and_skips_recall(tmp_path) -> None:

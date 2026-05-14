@@ -22,6 +22,8 @@ load:
   write_mode: upsert
   concurrency: 64
   processes: 4
+  sharded_records: true
+  shard_count: 16
 query:
   consistency: eventual
   processes: 2
@@ -40,6 +42,8 @@ query:
     assert scenario.name == "smoke"
     assert scenario.load["write_mode"] == "upsert"
     assert scenario.load["processes"] == 4
+    assert scenario.load["sharded_records"] is True
+    assert scenario.load["shard_count"] == 16
     assert scenario.query["processes"] == 2
     assert scenario.query["partition_filter"] == {
         "field": "url",
@@ -207,4 +211,25 @@ query:
     )
 
     with pytest.raises(ConfigError, match="processes"):
+        load_scenario(scenario_path)
+
+
+def test_invalid_sharded_records_flag_fails(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+  sharded_records: enabled
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="sharded_records"):
         load_scenario(scenario_path)

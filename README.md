@@ -322,6 +322,14 @@ uv run ldbbench dataset optimize \
   --dataset-dir data/datasets/cohere-wikipedia-1m
 ```
 
+To enable sharded load, split records into msgpack shards:
+
+```bash
+uv run ldbbench dataset optimize \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --shards 16
+```
+
 ```bash
 uv run ldbbench run \
   --scenario scenarios/cohere-wikipedia-1m.yaml \
@@ -373,9 +381,14 @@ Useful load settings:
 - `processes`: optional process count for CPU parallelism. Defaults to `1`.
   `concurrency` remains the total in-flight upsert worker count; when
   `processes > 1`, the runner splits that total across worker processes.
+- `sharded_records`: when true, load workers read prepared record shards
+  directly instead of receiving parsed batches from the parent process. Prepare
+  shards first with `ldbbench dataset optimize --shards N`.
+- `shard_count`: optional assertion for the expected number of record shards.
 - `max_batch_bytes`: optional approximate request payload cap. The runner
   splits batches by both `batch_size` and this byte limit to avoid oversized
-  requests.
+  requests. The first sharded load path does not support `max_batch_bytes`;
+  remove this setting when `sharded_records: true`.
 - `wait_until_query_visible`: when true, wait for a loaded-record sample to be
   visible through vector query before the query stage starts.
 - `query_visibility_timeout`: optional duration string, defaults to `60s`.

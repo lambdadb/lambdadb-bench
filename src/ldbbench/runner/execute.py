@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import multiprocessing as mp
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any
 
 import msgpack
@@ -72,6 +73,30 @@ class PartitionFilterSpec:
         return {
             "field": self.field,
             "metadata_field": self.metadata_field,
+        }
+
+
+@dataclass(frozen=True)
+class RecordShard:
+    path: Path
+    sha256: str | None
+    records: int
+    first_record_index: int
+    last_record_index: int
+    batch_base: int = 0
+    effective_records: int | None = None
+    manifest_shard_count: int | None = None
+
+    def as_checkpoint_dict(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "records": self.records,
+            "first_record_index": self.first_record_index,
+            "last_record_index": self.last_record_index,
+            "batch_base": self.batch_base,
+            "effective_records": self.effective_records,
+            "manifest_shard_count": self.manifest_shard_count,
         }
 
 
@@ -164,6 +189,16 @@ def execute_benchmark(
     if ground_truth_path is not None and not truth_path.exists():
         raise ConfigError(f"ground truth file {truth_path} does not exist")
     ground_truth = load_ground_truth(truth_path) if truth_path.exists() else {}
+    record_shards = None
+    if not query_only:
+        record_shards = _record_shards_for_load(
+            scenario=scenario,
+            dataset_dir=dataset_path,
+            dataset_manifest=dataset_manifest,
+            batch_size=_batch_size(scenario),
+            max_batch_bytes=_max_batch_bytes(scenario),
+            max_records=max_records,
+        )
 
     ingest_events_path = out / INGEST_EVENTS_FILENAME
     query_events_path = out / QUERY_EVENTS_FILENAME
@@ -192,6 +227,7 @@ def execute_benchmark(
             target=target,
             records=read_records(records_path, limit=max_records),
             record_source_path=records_path,
+            record_shards=record_shards,
             write_mode=str(scenario.load.get("write_mode")),
             batch_size=_batch_size(scenario),
             max_batch_bytes=_max_batch_bytes(scenario),
@@ -207,6 +243,7 @@ def execute_benchmark(
                 scenario=scenario,
                 target=target,
                 write_mode=str(scenario.load.get("write_mode")),
+                record_shards=record_shards,
                 batch_size=_batch_size(scenario),
                 max_batch_bytes=_max_batch_bytes(scenario),
                 max_records=max_records,
@@ -298,6 +335,7 @@ def run_load_stage(
     target: TargetConfig,
     records: Iterable[VectorRecord],
     record_source_path: str | Path | None = None,
+    record_shards: Sequence[RecordShard] | None = None,
     write_mode: str,
     batch_size: int,
     max_batch_bytes: int | None,
@@ -319,6 +357,23 @@ def run_load_stage(
         context=checkpoint_context_dict,
         resume_load=resume_load,
     )
+    if record_shards is not None:
+        return _run_sharded_load_stage(
+            adapter=adapter,
+            target=target,
+            record_shards=record_shards,
+            write_mode=write_mode,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            processes=processes,
+            events_output=events_output,
+            checkpoint_output=checkpoint_output,
+            checkpoint_context=checkpoint_context_dict,
+            resume_load=resume_load,
+            resumed_from_batch_index=resumed_from_batch_index,
+            visibility_sample_size=visibility_sample_size,
+            progress=progress,
+        )
 
     records_loaded = 0
     records_read = 0
@@ -786,6 +841,588 @@ def run_load_stage(
         },
         visibility_samples=visibility_samples,
     )
+
+
+def _run_sharded_load_stage(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    record_shards: Sequence[RecordShard],
+    write_mode: str,
+    batch_size: int,
+    concurrency: int,
+    processes: int,
+    events_output: Path,
+    checkpoint_output: Path | None,
+    checkpoint_context: Mapping[str, Any],
+    resume_load: bool,
+    resumed_from_batch_index: int,
+    visibility_sample_size: int,
+    progress: ProgressCallback | None,
+) -> LoadStageResult:
+    manifest_shard_count = _manifest_shard_count(record_shards)
+    records_loaded = 0
+    records_read = 0
+    skipped_records = 0
+    load_errors = 0
+    latencies: list[float] = []
+    attempt_latencies: list[float] = []
+    upsert_attempt_duration_seconds = 0.0
+    batching_duration_seconds = 0.0
+    visibility_samples: list[VectorRecord] = []
+    successful_batches = 0
+    skipped_batches = 0
+    attempted_batches = 0
+    successful_batch_indexes: set[int] = set()
+    highest_contiguous_successful_batch_index = resumed_from_batch_index
+    started = time.perf_counter()
+    ticker = ProgressTicker(progress)
+    process_count = min(
+        _effective_process_count(processes, concurrency),
+        len(record_shards),
+    )
+    process_count = max(1, process_count)
+    worker_threads = _split_concurrency(concurrency, process_count)
+    worker_shards = _split_shards(record_shards, process_count)
+    ticker.emit(
+        f"load: starting write_mode={write_mode} batch_size={batch_size} "
+        f"concurrency={concurrency} processes={process_count} "
+        f"worker_threads_per_process={worker_threads} sharded_records=true "
+        f"effective_shards={len(record_shards)} "
+        f"manifest_shards={manifest_shard_count} resume={resume_load}"
+    )
+    if resumed_from_batch_index:
+        ticker.emit(f"load: resuming after batch={resumed_from_batch_index}")
+    _write_load_checkpoint(
+        checkpoint_output,
+        context=checkpoint_context,
+        status="in_progress",
+        resumed_from_batch_index=resumed_from_batch_index,
+        highest_contiguous_successful_batch_index=(
+            highest_contiguous_successful_batch_index
+        ),
+        successful_batch_indexes=successful_batch_indexes,
+        attempted_batches=attempted_batches,
+        successful_batches=successful_batches,
+        skipped_batches=skipped_batches,
+        skipped_records=skipped_records,
+        records_loaded=records_loaded,
+        records_read=records_read,
+        batching_duration_seconds=batching_duration_seconds,
+        upsert_attempt_duration_seconds=upsert_attempt_duration_seconds,
+        errors=load_errors,
+    )
+
+    events_mode = "a" if resume_load else "w"
+    with events_output.open(events_mode, encoding="utf-8") as file:
+        if process_count == 1:
+            state = {
+                "records_loaded": 0,
+                "records_read": 0,
+                "skipped_records": 0,
+                "load_errors": 0,
+                "successful_batches": 0,
+                "skipped_batches": 0,
+                "attempted_batches": 0,
+                "highest_contiguous_successful_batch_index": (
+                    highest_contiguous_successful_batch_index
+                ),
+                "upsert_attempt_duration_seconds": 0.0,
+                "batching_duration_seconds": 0.0,
+            }
+            done_message = _run_sharded_load_worker_local(
+                adapter=adapter,
+                target=target,
+                write_mode=write_mode,
+                record_shards=list(record_shards),
+                batch_size=batch_size,
+                concurrency=worker_threads[0],
+                resumed_from_batch_index=resumed_from_batch_index,
+                result_callback=lambda event: _handle_sharded_load_event(
+                    event,
+                    file=file,
+                    checkpoint_output=checkpoint_output,
+                    checkpoint_context=checkpoint_context,
+                    resumed_from_batch_index=resumed_from_batch_index,
+                    state=state,
+                    successful_batch_indexes=successful_batch_indexes,
+                    latencies=latencies,
+                    attempt_latencies=attempt_latencies,
+                    visibility_samples=visibility_samples,
+                    visibility_sample_size=visibility_sample_size,
+                    ticker=ticker,
+                ),
+            )
+            state["records_read"] += int(done_message["records_read"])
+            state["skipped_records"] += int(done_message["skipped_records"])
+            state["skipped_batches"] += int(done_message["skipped_batches"])
+            records_loaded = int(state["records_loaded"])
+            records_read = int(state["records_read"])
+            skipped_records = int(state["skipped_records"])
+            load_errors = int(state["load_errors"])
+            successful_batches = int(state["successful_batches"])
+            skipped_batches = int(state["skipped_batches"])
+            attempted_batches = int(state["attempted_batches"])
+            highest_contiguous_successful_batch_index = int(
+                state["highest_contiguous_successful_batch_index"]
+            )
+            upsert_attempt_duration_seconds = float(
+                state["upsert_attempt_duration_seconds"]
+            )
+            batching_duration_seconds = float(state["batching_duration_seconds"])
+        else:
+            state = {
+                "records_loaded": 0,
+                "records_read": 0,
+                "skipped_records": 0,
+                "load_errors": 0,
+                "successful_batches": 0,
+                "skipped_batches": 0,
+                "attempted_batches": 0,
+                "highest_contiguous_successful_batch_index": (
+                    highest_contiguous_successful_batch_index
+                ),
+                "upsert_attempt_duration_seconds": 0.0,
+                "batching_duration_seconds": 0.0,
+            }
+            stop_event = mp.Event()
+            result_queue: Any = mp.Queue()
+            workers = [
+                mp.Process(
+                    target=_sharded_load_process_worker,
+                    args=(
+                        target.vendor,
+                        target,
+                        write_mode,
+                        list(shards),
+                        batch_size,
+                        resumed_from_batch_index,
+                        result_queue,
+                        thread_count,
+                        stop_event,
+                        visibility_sample_size,
+                    ),
+                    name=f"ldbbench-sharded-load-{index}",
+                )
+                for index, (shards, thread_count) in enumerate(
+                    zip(worker_shards, worker_threads, strict=True),
+                    start=1,
+                )
+                if shards
+            ]
+            for worker_process in workers:
+                worker_process.start()
+            done_workers = 0
+            try:
+                while done_workers < len(workers):
+                    try:
+                        message = result_queue.get(timeout=0.1)
+                    except Empty:
+                        for worker_process in workers:
+                            if worker_process.exitcode not in (None, 0):
+                                raise RuntimeError(
+                                    "sharded load worker process exited with "
+                                    f"code {worker_process.exitcode}"
+                                ) from None
+                        continue
+                    if message.get("_type") == "worker_done":
+                        done_workers += 1
+                        state["records_read"] += int(message["records_read"])
+                        state["skipped_records"] += int(message["skipped_records"])
+                        state["skipped_batches"] += int(message["skipped_batches"])
+                        continue
+                    _handle_sharded_load_event(
+                        message,
+                        file=file,
+                        checkpoint_output=checkpoint_output,
+                        checkpoint_context=checkpoint_context,
+                        resumed_from_batch_index=resumed_from_batch_index,
+                        state=state,
+                        successful_batch_indexes=successful_batch_indexes,
+                        latencies=latencies,
+                        attempt_latencies=attempt_latencies,
+                        visibility_samples=visibility_samples,
+                        visibility_sample_size=visibility_sample_size,
+                        ticker=ticker,
+                    )
+                    if state["load_errors"]:
+                        stop_event.set()
+            finally:
+                stop_event.set()
+                for worker_process in workers:
+                    worker_process.join()
+            records_loaded = int(state["records_loaded"])
+            records_read = int(state["records_read"])
+            skipped_records = int(state["skipped_records"])
+            load_errors = int(state["load_errors"])
+            successful_batches = int(state["successful_batches"])
+            skipped_batches = int(state["skipped_batches"])
+            attempted_batches = int(state["attempted_batches"])
+            highest_contiguous_successful_batch_index = int(
+                state["highest_contiguous_successful_batch_index"]
+            )
+            upsert_attempt_duration_seconds = float(
+                state["upsert_attempt_duration_seconds"]
+            )
+            batching_duration_seconds = float(state["batching_duration_seconds"])
+
+    duration_seconds = time.perf_counter() - started
+    final_status = "completed" if load_errors == 0 else "failed"
+    _write_load_checkpoint(
+        checkpoint_output,
+        context=checkpoint_context,
+        status=final_status,
+        resumed_from_batch_index=resumed_from_batch_index,
+        highest_contiguous_successful_batch_index=(
+            highest_contiguous_successful_batch_index
+        ),
+        successful_batch_indexes=successful_batch_indexes,
+        attempted_batches=attempted_batches,
+        successful_batches=successful_batches,
+        skipped_batches=skipped_batches,
+        skipped_records=skipped_records,
+        records_loaded=records_loaded,
+        records_read=records_read,
+        batching_duration_seconds=batching_duration_seconds,
+        upsert_attempt_duration_seconds=upsert_attempt_duration_seconds,
+        errors=load_errors,
+    )
+    ticker.emit(
+        "load: finished "
+        f"records={records_loaded} batches={successful_batches} errors={load_errors}"
+    )
+    return LoadStageResult(
+        summary={
+            "status": final_status,
+            "records": records_loaded,
+            "records_read": records_read,
+            "write_mode": write_mode,
+            "skipped_records": skipped_records,
+            "batches": successful_batches,
+            "skipped_batches": skipped_batches,
+            "attempts": attempted_batches,
+            "errors": load_errors,
+            "error_rate": _error_rate(load_errors, attempted_batches),
+            "concurrency": concurrency,
+            "processes": process_count,
+            "worker_threads_per_process": worker_threads,
+            "sharded_records": True,
+            "shard_count": len(record_shards),
+            "effective_shard_count": len(record_shards),
+            "manifest_shard_count": manifest_shard_count,
+            "worker_shards": [len(shards) for shards in worker_shards],
+            "checkpoint": {
+                "path": str(checkpoint_output) if checkpoint_output else None,
+                "resume_enabled": resume_load,
+                "resumed_from_batch_index": resumed_from_batch_index,
+                "highest_contiguous_successful_batch_index": (
+                    highest_contiguous_successful_batch_index
+                ),
+            },
+            "duration_seconds": duration_seconds,
+            "batching_duration_seconds": batching_duration_seconds,
+            "upsert_attempt_duration_seconds": upsert_attempt_duration_seconds,
+            "records_per_second": _rate(records_loaded, duration_seconds),
+            "batching_records_per_second": _rate(
+                records_read,
+                batching_duration_seconds,
+            ),
+            "attempts_per_second": _rate(attempted_batches, duration_seconds),
+            "latency_ms": latency_summary(latencies),
+            "attempt_latency_ms": latency_summary(attempt_latencies),
+            "record_source": {
+                "format": "msgpack",
+                "path": None,
+                "sharded": True,
+                "shards": len(record_shards),
+                "effective_shards": len(record_shards),
+                "manifest_shards": manifest_shard_count,
+            },
+        },
+        visibility_samples=visibility_samples,
+    )
+
+
+def _handle_sharded_load_event(
+    event: dict[str, Any],
+    *,
+    file: Any,
+    checkpoint_output: Path | None,
+    checkpoint_context: Mapping[str, Any],
+    resumed_from_batch_index: int,
+    state: dict[str, Any],
+    successful_batch_indexes: set[int],
+    latencies: list[float],
+    attempt_latencies: list[float],
+    visibility_samples: list[VectorRecord],
+    visibility_sample_size: int,
+    ticker: ProgressTicker,
+) -> None:
+    samples = event.pop("_visibility_samples", [])
+    batching_duration_ms = float(event.pop("_batching_duration_ms", 0.0))
+    _write_event(file, event)
+    event_latency = float(event["latency_ms"])
+    attempt_latencies.append(event_latency)
+    state["attempted_batches"] += 1
+    state["upsert_attempt_duration_seconds"] += event_latency / 1000
+    state["batching_duration_seconds"] += batching_duration_ms / 1000
+    if event["status"] != "ok":
+        state["load_errors"] += 1
+        _write_load_checkpoint(
+            checkpoint_output,
+            context=checkpoint_context,
+            status="failed",
+            resumed_from_batch_index=resumed_from_batch_index,
+            highest_contiguous_successful_batch_index=int(
+                state["highest_contiguous_successful_batch_index"]
+            ),
+            successful_batch_indexes=successful_batch_indexes,
+            attempted_batches=int(state["attempted_batches"]),
+            successful_batches=int(state["successful_batches"]),
+            skipped_batches=int(state["skipped_batches"]),
+            skipped_records=int(state["skipped_records"]),
+            records_loaded=int(state["records_loaded"]),
+            records_read=int(state["records_read"]),
+            batching_duration_seconds=float(state["batching_duration_seconds"]),
+            upsert_attempt_duration_seconds=float(
+                state["upsert_attempt_duration_seconds"]
+            ),
+            errors=int(state["load_errors"]),
+        )
+        return
+    state["successful_batches"] += 1
+    successful_batch_indexes.add(int(event["batch_index"]))
+    state["highest_contiguous_successful_batch_index"] = (
+        _advance_contiguous_watermark(
+            int(state["highest_contiguous_successful_batch_index"]),
+            successful_batch_indexes,
+        )
+    )
+    state["records_loaded"] += int(event["records"])
+    latencies.append(event_latency)
+    if samples:
+        _extend_visibility_samples(
+            visibility_samples,
+            samples,
+            visibility_sample_size=visibility_sample_size,
+        )
+    _write_load_checkpoint(
+        checkpoint_output,
+        context=checkpoint_context,
+        status="in_progress",
+        resumed_from_batch_index=resumed_from_batch_index,
+        highest_contiguous_successful_batch_index=int(
+            state["highest_contiguous_successful_batch_index"]
+        ),
+        successful_batch_indexes=successful_batch_indexes,
+        attempted_batches=int(state["attempted_batches"]),
+        successful_batches=int(state["successful_batches"]),
+        skipped_batches=int(state["skipped_batches"]),
+        skipped_records=int(state["skipped_records"]),
+        records_loaded=int(state["records_loaded"]),
+        records_read=int(state["records_read"]),
+        batching_duration_seconds=float(state["batching_duration_seconds"]),
+        upsert_attempt_duration_seconds=float(state["upsert_attempt_duration_seconds"]),
+        errors=int(state["load_errors"]),
+    )
+    ticker.maybe(
+        "load: progress "
+        f"records={state['records_loaded']} "
+        f"batches={state['successful_batches']} errors={state['load_errors']}"
+    )
+
+
+def _run_sharded_load_worker_local(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    write_mode: str,
+    record_shards: list[RecordShard],
+    batch_size: int,
+    concurrency: int,
+    resumed_from_batch_index: int,
+    result_callback: Any,
+) -> dict[str, Any]:
+    task_queue: Queue[Any] = Queue(maxsize=max(1, concurrency * 2))
+    stop_event = Event()
+    result_lock = Lock()
+    stats = {
+        "records_read": 0,
+        "skipped_records": 0,
+        "skipped_batches": 0,
+    }
+
+    def reader() -> None:
+        try:
+            for shard in record_shards:
+                if stop_event.is_set():
+                    break
+                for batch_index, batch, batching_duration in _iter_shard_batches(
+                    shard,
+                    batch_size=batch_size,
+                ):
+                    stats["records_read"] += len(batch)
+                    if batch_index <= resumed_from_batch_index:
+                        stats["skipped_batches"] += 1
+                        stats["skipped_records"] += len(batch)
+                        continue
+                    task_queue.put((batch_index, batch, batching_duration))
+                    if stop_event.is_set():
+                        break
+        finally:
+            for _ in range(concurrency):
+                task_queue.put(None)
+
+    def writer() -> None:
+        while True:
+            item = task_queue.get()
+            if item is None:
+                return
+            batch_index, batch, batching_duration = item
+            if stop_event.is_set():
+                continue
+            event = execute_load_batch(
+                adapter=adapter,
+                target=target,
+                batch=batch,
+                batch_index=batch_index,
+                write_mode=write_mode,
+            )
+            event["_batching_duration_ms"] = batching_duration * 1000
+            if event["status"] == "ok":
+                event["_visibility_samples"] = batch
+            with result_lock:
+                result_callback(event)
+            if event["status"] != "ok":
+                stop_event.set()
+
+    reader_thread = Thread(target=reader, name="ldbbench-sharded-reader-local")
+    reader_thread.start()
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(writer) for _ in range(concurrency)]
+        for future in futures:
+            future.result()
+    reader_thread.join()
+    return {
+        "_type": "worker_done",
+        **stats,
+    }
+
+
+def _sharded_load_process_worker(
+    vendor: str,
+    target: TargetConfig,
+    write_mode: str,
+    record_shards: list[RecordShard],
+    batch_size: int,
+    resumed_from_batch_index: int,
+    result_queue: Any,
+    concurrency: int,
+    stop_event: Any,
+    visibility_sample_size: int,
+) -> None:
+    task_queue: Queue[Any] = Queue(maxsize=max(1, concurrency * 2))
+    stats = {
+        "records_read": 0,
+        "skipped_records": 0,
+        "skipped_batches": 0,
+    }
+
+    def reader() -> None:
+        try:
+            for shard in record_shards:
+                if stop_event.is_set():
+                    break
+                for batch_index, batch, batching_duration in _iter_shard_batches(
+                    shard,
+                    batch_size=batch_size,
+                ):
+                    stats["records_read"] += len(batch)
+                    if batch_index <= resumed_from_batch_index:
+                        stats["skipped_batches"] += 1
+                        stats["skipped_records"] += len(batch)
+                        continue
+                    task_queue.put((batch_index, batch, batching_duration))
+                    if stop_event.is_set():
+                        break
+        finally:
+            for _ in range(concurrency):
+                task_queue.put(None)
+
+    def writer() -> None:
+        adapter = _worker_adapter(vendor)
+        samples_sent = 0
+        while True:
+            item = task_queue.get()
+            if item is None:
+                return
+            batch_index, batch, batching_duration = item
+            if stop_event.is_set():
+                continue
+            event = execute_load_batch(
+                adapter=adapter,
+                target=target,
+                batch=batch,
+                batch_index=batch_index,
+                write_mode=write_mode,
+            )
+            event["_batching_duration_ms"] = batching_duration * 1000
+            if event["status"] == "ok" and samples_sent < visibility_sample_size:
+                remaining = visibility_sample_size - samples_sent
+                event["_visibility_samples"] = batch[:remaining]
+                samples_sent += len(event["_visibility_samples"])
+            result_queue.put(event)
+            if event["status"] != "ok":
+                stop_event.set()
+
+    reader_thread = Thread(target=reader, name="ldbbench-sharded-reader")
+    reader_thread.start()
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(writer) for _ in range(concurrency)]
+        for future in futures:
+            future.result()
+    reader_thread.join()
+    result_queue.put({"_type": "worker_done", **stats})
+
+
+def _iter_shard_batches(
+    shard: RecordShard,
+    *,
+    batch_size: int,
+) -> Iterator[tuple[int, list[VectorRecord], float]]:
+    records = read_records(shard.path, limit=shard.effective_records)
+    for local_batch_index, (batch, batching_duration) in enumerate(
+        _timed_batches(records, batch_size),
+        start=1,
+    ):
+        batch_index = shard.batch_base + local_batch_index
+        yield batch_index, batch, batching_duration
+
+
+def _timed_batches(
+    records: Iterable[VectorRecord],
+    batch_size: int,
+) -> Iterator[tuple[list[VectorRecord], float]]:
+    batch: list[VectorRecord] = []
+    started = time.perf_counter()
+    for record in records:
+        batch.append(record)
+        if len(batch) >= batch_size:
+            yield batch, time.perf_counter() - started
+            batch = []
+            started = time.perf_counter()
+    if batch:
+        yield batch, time.perf_counter() - started
+
+
+def _split_shards(
+    shards: Sequence[RecordShard],
+    process_count: int,
+) -> list[list[RecordShard]]:
+    assignments = [[] for _ in range(process_count)]
+    for index, shard in enumerate(shards):
+        assignments[index % process_count].append(shard)
+    return assignments
 
 
 def _execute_load_batch_with_records(
@@ -1935,6 +2572,7 @@ def _load_checkpoint_context(
     scenario: ScenarioConfig,
     target: TargetConfig,
     write_mode: str,
+    record_shards: Sequence[RecordShard] | None,
     batch_size: int,
     max_batch_bytes: int | None,
     max_records: int | None,
@@ -1944,11 +2582,12 @@ def _load_checkpoint_context(
     checksum = records_sha256
     if checksum is None:
         checksum = artifact_checksums.get("records_sha256")
-    return {
+    context = {
         "scenario_name": scenario.name,
         "target_vendor": target.vendor,
         "target_name": target.name,
         "target_collection_name": target.collection_name,
+        "record_source": "sharded_msgpack" if record_shards is not None else "single",
         "records_path": str(records_path),
         "records_sha256": checksum,
         "json_records_path": str(json_records_path) if json_records_path else None,
@@ -1957,6 +2596,11 @@ def _load_checkpoint_context(
         "max_batch_bytes": max_batch_bytes,
         "max_records": max_records,
     }
+    if record_shards is not None:
+        context["records_shards"] = [
+            shard.as_checkpoint_dict() for shard in record_shards
+        ]
+    return context
 
 
 def recall_at_k(
@@ -2046,6 +2690,118 @@ def _record_source_summary(path: str | Path | None) -> dict[str, str | None]:
         "path": str(source_path),
         "format": "msgpack" if source_path.suffix == ".msgpack" else "jsonl",
     }
+
+
+def _record_shards_for_load(
+    *,
+    scenario: ScenarioConfig,
+    dataset_dir: Path,
+    dataset_manifest: Mapping[str, Any],
+    batch_size: int,
+    max_batch_bytes: int | None,
+    max_records: int | None,
+) -> list[RecordShard] | None:
+    if not bool(scenario.load.get("sharded_records", False)):
+        return None
+    if max_batch_bytes is not None:
+        raise ConfigError(
+            "scenario.load.sharded_records does not support max_batch_bytes yet"
+        )
+    artifacts = dataset_manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise ConfigError("dataset manifest artifacts must be a mapping")
+    raw_shards = artifacts.get("records_shards")
+    if not isinstance(raw_shards, list) or not raw_shards:
+        raise ConfigError(
+            "scenario.load.sharded_records requires records_shards in the "
+            "dataset manifest; run `ldbbench dataset optimize --shards N` first"
+        )
+    configured_shard_count = scenario.load.get("shard_count")
+    if configured_shard_count is not None and configured_shard_count != len(raw_shards):
+        raise ConfigError(
+            "scenario.load.shard_count does not match dataset records_shards "
+            f"({configured_shard_count} != {len(raw_shards)})"
+        )
+    shards: list[RecordShard] = []
+    next_batch_base = 0
+    for index, raw_shard in enumerate(raw_shards):
+        if not isinstance(raw_shard, Mapping):
+            raise ConfigError(f"records_shards[{index}] must be a mapping")
+        shard = _record_shard_from_manifest(
+            dataset_dir=dataset_dir,
+            raw_shard=raw_shard,
+            index=index,
+            max_records=max_records,
+            batch_base=next_batch_base,
+            manifest_shard_count=len(raw_shards),
+        )
+        if shard.effective_records is None or shard.effective_records <= 0:
+            continue
+        shards.append(shard)
+        next_batch_base += math.ceil(shard.effective_records / batch_size)
+    if not shards:
+        raise ConfigError("sharded load has no record shards to load")
+    return shards
+
+
+def _record_shard_from_manifest(
+    *,
+    dataset_dir: Path,
+    raw_shard: Mapping[str, Any],
+    index: int,
+    max_records: int | None,
+    batch_base: int,
+    manifest_shard_count: int,
+) -> RecordShard:
+    path_value = raw_shard.get("path")
+    if not isinstance(path_value, str) or not path_value:
+        raise ConfigError(f"records_shards[{index}].path must be a string")
+    path = Path(path_value)
+    if not path.is_absolute() and not path.exists():
+        candidate = dataset_dir / path.name
+        if candidate.exists():
+            path = candidate
+    if not path.exists():
+        raise ConfigError(f"records_shards[{index}] file {path} does not exist")
+    records = raw_shard.get("records")
+    first_record_index = raw_shard.get("first_record_index")
+    last_record_index = raw_shard.get("last_record_index")
+    if not isinstance(records, int) or records < 0:
+        raise ConfigError(f"records_shards[{index}].records must be an integer")
+    if not isinstance(first_record_index, int) or first_record_index <= 0:
+        raise ConfigError(
+            f"records_shards[{index}].first_record_index must be a positive integer"
+        )
+    if not isinstance(last_record_index, int) or last_record_index < first_record_index:
+        raise ConfigError(
+            f"records_shards[{index}].last_record_index must be a valid integer"
+        )
+    effective_records = records
+    if max_records is not None:
+        if first_record_index > max_records:
+            effective_records = 0
+        else:
+            effective_records = min(records, max_records - first_record_index + 1)
+    if effective_records > records:
+        raise ConfigError(f"records_shards[{index}] effective records are invalid")
+    sha256 = raw_shard.get("sha256")
+    return RecordShard(
+        path=path,
+        sha256=sha256 if isinstance(sha256, str) else None,
+        records=records,
+        first_record_index=first_record_index,
+        last_record_index=last_record_index,
+        batch_base=batch_base,
+        effective_records=effective_records,
+        manifest_shard_count=manifest_shard_count,
+    )
+
+
+def _manifest_shard_count(record_shards: Sequence[RecordShard]) -> int:
+    for shard in record_shards:
+        if shard.manifest_shard_count is not None:
+            return shard.manifest_shard_count
+    return len(record_shards)
 
 
 def _batch_size(scenario: ScenarioConfig) -> int:

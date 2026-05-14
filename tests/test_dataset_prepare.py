@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import msgpack
 import pytest
@@ -154,6 +155,32 @@ def test_optimize_dataset_writes_msgpack_for_existing_jsonl(tmp_path) -> None:
     assert optimized.manifest["artifacts"]["records_msgpack_sha256"] == sha256_file(
         optimized.records_msgpack_path
     )
+
+
+def test_optimize_dataset_writes_record_shards(tmp_path) -> None:
+    result = prepare_dataset(
+        scenario=make_scenario(),
+        output_dir=tmp_path,
+        limit=3,
+        query_count=1,
+        source_rows=[
+            {"_id": "q", "emb": [9.0, 9.0], "text": "query"},
+            {"_id": "a", "emb": [1.0, 0.0], "text": "alpha"},
+            {"_id": "b", "emb": [0.0, 1.0], "text": "beta"},
+            {"_id": "c", "emb": [0.8, 0.2], "text": "gamma"},
+        ],
+    )
+
+    optimized = optimize_dataset(dataset_dir=result.output_dir, shards=2)
+
+    shards = optimized.manifest["artifacts"]["records_shards"]
+    assert len(shards) == 2
+    assert [item["records"] for item in shards] == [2, 1]
+    assert [item["first_record_index"] for item in shards] == [1, 3]
+    assert [item["last_record_index"] for item in shards] == [2, 3]
+    for item in shards:
+        assert Path(item["path"]).exists()
+        assert item["sha256"] == sha256_file(item["path"])
 
 
 def test_prepare_dataset_falls_back_to_row_id(tmp_path) -> None:

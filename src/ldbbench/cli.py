@@ -113,6 +113,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Prepared dataset cache directory.",
     )
+    optimize.add_argument(
+        "--shards",
+        type=int,
+        help="Optionally split records into this many msgpack shards.",
+    )
     optimize.set_defaults(func=run_dataset_optimize)
     ground_truth = dataset_subcommands.add_parser(
         "ground-truth",
@@ -336,11 +341,14 @@ def run_dataset_optimize(args: argparse.Namespace) -> int:
     print("status: optimizing", flush=True)
     result = optimize_dataset(
         dataset_dir=args.dataset_dir,
+        shards=args.shards,
         progress=print_progress,
     )
     print("status: optimized")
     print(f"wrote {result.records_msgpack_path}")
     print(f"wrote {result.queries_msgpack_path}")
+    if result.record_shard_paths:
+        print(f"wrote_record_shards: {len(result.record_shard_paths)}")
     print(f"updated {result.manifest_path}")
     return 0
 

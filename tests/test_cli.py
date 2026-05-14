@@ -214,13 +214,17 @@ query:
     dataset.records_msgpack_path.unlink()
     dataset.queries_msgpack_path.unlink()
 
-    exit_code = main(["dataset", "optimize", "--dataset-dir", str(dataset_dir)])
+    exit_code = main(
+        ["dataset", "optimize", "--dataset-dir", str(dataset_dir), "--shards", "2"]
+    )
 
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "status: optimized" in captured.out
+    assert "wrote_record_shards: 2" in captured.out
     assert (dataset_dir / "records.msgpack").exists()
     assert (dataset_dir / "queries.msgpack").exists()
+    assert (dataset_dir / "records-00000.msgpack").exists()
 
 
 def test_manifest_init_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:

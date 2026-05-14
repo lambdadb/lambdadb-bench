@@ -21,6 +21,7 @@ RECORDS_FILENAME = "records.jsonl"
 QUERIES_FILENAME = "queries.jsonl"
 RECORDS_MSGPACK_FILENAME = "records.msgpack"
 QUERIES_MSGPACK_FILENAME = "queries.msgpack"
+RECORD_SHARD_FILENAME_TEMPLATE = "records-{index:05d}.msgpack"
 DATASET_MANIFEST_FILENAME = "dataset_manifest.json"
 SUPPORTED_PROVIDERS = {"huggingface"}
 DEFAULT_QUERY_COUNT = 1000
@@ -49,6 +50,7 @@ class DatasetOptimizeResult:
     manifest_path: Path
     records_msgpack_path: Path
     queries_msgpack_path: Path
+    record_shard_paths: list[Path]
     manifest: dict[str, Any]
 
 
@@ -318,8 +320,11 @@ def write_prepared_records(
 def optimize_dataset(
     *,
     dataset_dir: str | Path,
+    shards: int | None = None,
     progress: ProgressCallback | None = None,
 ) -> DatasetOptimizeResult:
+    if shards is not None and shards <= 0:
+        raise ConfigError("dataset optimize shard count must be a positive integer")
     out = Path(dataset_dir)
     manifest_path = out / DATASET_MANIFEST_FILENAME
     if not manifest_path.exists():
@@ -355,6 +360,15 @@ def optimize_dataset(
         progress=progress,
         label="queries",
     )
+    record_shards: list[dict[str, Any]] = []
+    if shards is not None:
+        record_shards = _write_record_msgpack_shards_from_jsonl(
+            records_path,
+            output_dir=out,
+            shard_count=shards,
+            total_records=_manifest_written_rows(manifest),
+            progress=progress,
+        )
 
     artifacts = manifest.setdefault("artifacts", {})
     if not isinstance(artifacts, dict):
@@ -367,6 +381,8 @@ def optimize_dataset(
             "queries_msgpack_sha256": queries_digest,
         }
     )
+    if shards is not None:
+        artifacts["records_shards"] = record_shards
     manifest["optimized_at"] = datetime.now(UTC).isoformat()
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -377,11 +393,17 @@ def optimize_dataset(
         "dataset_optimize: wrote msgpack "
         f"records={records_count} queries={queries_count}"
     )
+    if shards is not None:
+        ticker.emit(
+            "dataset_optimize: wrote record shards "
+            f"shards={len(record_shards)} records={records_count}"
+        )
     return DatasetOptimizeResult(
         output_dir=out,
         manifest_path=manifest_path,
         records_msgpack_path=records_msgpack_path,
         queries_msgpack_path=queries_msgpack_path,
+        record_shard_paths=[Path(str(item["path"])) for item in record_shards],
         manifest=manifest,
     )
 
@@ -443,6 +465,91 @@ def _write_msgpack_from_jsonl(
             count += 1
             ticker.maybe(f"dataset_optimize: {label} records={count}")
     return digest.hexdigest(), count
+
+
+def _write_record_msgpack_shards_from_jsonl(
+    input_path: Path,
+    *,
+    output_dir: Path,
+    shard_count: int,
+    total_records: int,
+    progress: ProgressCallback | None,
+) -> list[dict[str, Any]]:
+    if not input_path.exists():
+        raise ConfigError(f"dataset artifact {input_path} does not exist")
+    records_per_shard = max(1, (total_records + shard_count - 1) // shard_count)
+    packer = msgpack.Packer(use_bin_type=True, use_single_float=True)
+    ticker = ProgressTicker(progress)
+    shard_records: list[dict[str, Any]] = []
+    shard_file: Any | None = None
+    shard_digest: Any | None = None
+    shard_path: Path | None = None
+    shard_index = -1
+    shard_record_count = 0
+    shard_first_record_index = 0
+    total_written = 0
+
+    def close_shard() -> None:
+        nonlocal shard_file
+        if shard_file is None or shard_digest is None or shard_path is None:
+            return
+        shard_file.close()
+        shard_records.append(
+            {
+                "path": str(shard_path),
+                "sha256": shard_digest.hexdigest(),
+                "records": shard_record_count,
+                "first_record_index": shard_first_record_index,
+                "last_record_index": total_written,
+            }
+        )
+        shard_file = None
+
+    with input_path.open("rb") as input_file:
+        for line_number, line in enumerate(input_file, start=1):
+            if not line.strip():
+                continue
+            if shard_file is None or shard_record_count >= records_per_shard:
+                close_shard()
+                shard_index += 1
+                shard_path = output_dir / RECORD_SHARD_FILENAME_TEMPLATE.format(
+                    index=shard_index,
+                )
+                shard_digest = hashlib.sha256()
+                shard_file = shard_path.open("wb")
+                shard_record_count = 0
+                shard_first_record_index = total_written + 1
+            record = _loads_json(line)
+            if not isinstance(record, dict):
+                raise ConfigError(f"{input_path}:{line_number} row must be an object")
+            packed = packer.pack(
+                {
+                    "id": record["id"],
+                    "vector": record["vector"],
+                    "metadata": record.get("metadata", {}),
+                    "estimated_size_bytes": _estimated_json_size_bytes(line),
+                }
+            )
+            shard_file.write(packed)
+            shard_digest.update(packed)
+            shard_record_count += 1
+            total_written += 1
+            ticker.maybe(
+                "dataset_optimize: sharding "
+                f"records={total_written}/{total_records} shards={shard_index + 1}"
+            )
+    close_shard()
+    return shard_records
+
+
+def _manifest_written_rows(manifest: Mapping[str, Any]) -> int:
+    dataset = manifest.get("dataset")
+    if not isinstance(dataset, Mapping):
+        raise ConfigError("dataset manifest dataset must be a mapping")
+    rows = dataset.get("written_rows")
+    if not isinstance(rows, int) or rows < 0:
+        raise ConfigError("dataset manifest dataset.written_rows must be an integer")
+    return rows
 
 
 def _loads_json(line: bytes) -> Any:
