@@ -364,7 +364,11 @@ limit on benchmark hosts when testing large `load.concurrency` values.
 
 Useful load settings:
 
-- `batch_size`: maximum records per upsert request.
+- `write_mode`: `upsert` for regular batched writes, or `bulk_upsert` for
+  LambdaDB's S3-backed `bulk_upsert_docs()` import path.
+- `batch_size`: maximum records per write batch. For LambdaDB `upsert` this is
+  a direct docs upsert request; for LambdaDB `bulk_upsert` this is one bulk
+  object upload and import trigger.
 - `concurrency`: number of concurrent upsert workers. Defaults to `1`.
 - `processes`: optional process count for CPU parallelism. Defaults to `1`.
   `concurrency` remains the total in-flight upsert worker count; when

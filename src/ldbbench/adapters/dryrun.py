@@ -46,6 +46,8 @@ class StaticAdapter:
         self,
         target: TargetConfig,
         records: list[dict[str, Any] | VectorRecord],
+        *,
+        write_mode: str = "upsert",
     ) -> UpsertResult:
         raise NotImplementedError("dry-run adapters do not upsert records")
 

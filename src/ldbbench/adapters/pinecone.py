@@ -153,7 +153,13 @@ class PineconeAdapter:
         self,
         target: TargetConfig,
         records: Sequence[Mapping[str, Any] | VectorRecord],
+        *,
+        write_mode: str = "upsert",
     ) -> UpsertResult:
+        if write_mode != "upsert":
+            raise ConfigError(
+                f"Pinecone adapter does not support write_mode {write_mode!r}"
+            )
         settings = _settings_from_target(target)
         vectors = [_record_to_vector(record) for record in records]
         if not vectors:

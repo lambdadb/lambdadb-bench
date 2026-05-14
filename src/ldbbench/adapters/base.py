@@ -92,6 +92,8 @@ class VectorDBAdapter(Protocol):
         self,
         target: TargetConfig,
         records: Sequence[Mapping[str, Any] | VectorRecord],
+        *,
+        write_mode: str = "upsert",
     ) -> UpsertResult:
         """Upsert a batch of normalized benchmark records."""
 

@@ -192,6 +192,7 @@ def execute_benchmark(
             target=target,
             records=read_records(records_path, limit=max_records),
             record_source_path=records_path,
+            write_mode=str(scenario.load.get("write_mode")),
             batch_size=_batch_size(scenario),
             max_batch_bytes=_max_batch_bytes(scenario),
             concurrency=_load_concurrency(scenario),
@@ -205,6 +206,7 @@ def execute_benchmark(
                 dataset_manifest=dataset_manifest,
                 scenario=scenario,
                 target=target,
+                write_mode=str(scenario.load.get("write_mode")),
                 batch_size=_batch_size(scenario),
                 max_batch_bytes=_max_batch_bytes(scenario),
                 max_records=max_records,
@@ -296,6 +298,7 @@ def run_load_stage(
     target: TargetConfig,
     records: Iterable[VectorRecord],
     record_source_path: str | Path | None = None,
+    write_mode: str,
     batch_size: int,
     max_batch_bytes: int | None,
     concurrency: int,
@@ -336,7 +339,8 @@ def run_load_stage(
     process_count = _effective_process_count(processes, concurrency)
     worker_threads = _split_concurrency(concurrency, process_count)
     ticker.emit(
-        f"load: starting batch_size={batch_size} concurrency={concurrency} "
+        f"load: starting write_mode={write_mode} batch_size={batch_size} "
+        f"concurrency={concurrency} "
         f"processes={process_count} worker_threads_per_process={worker_threads} "
         f"resume={resume_load}"
     )
@@ -377,6 +381,7 @@ def run_load_stage(
                     args=(
                         target.vendor,
                         target,
+                        write_mode,
                         task_queue,
                         result_queue,
                         thread_count,
@@ -528,6 +533,7 @@ def run_load_stage(
                     target=target,
                     batch=batch,
                     batch_index=batch_index,
+                    write_mode=write_mode,
                 )
                 attempted_batches += 1
                 _write_event(file, event)
@@ -626,6 +632,7 @@ def run_load_stage(
                         _execute_load_batch_with_records,
                         adapter,
                         target,
+                        write_mode,
                         batch,
                         batch_index,
                     )
@@ -746,6 +753,7 @@ def run_load_stage(
             "status": final_status,
             "records": records_loaded,
             "records_read": records_read,
+            "write_mode": write_mode,
             "skipped_records": skipped_records,
             "batches": successful_batches,
             "skipped_batches": skipped_batches,
@@ -783,6 +791,7 @@ def run_load_stage(
 def _execute_load_batch_with_records(
     adapter: VectorDBAdapter,
     target: TargetConfig,
+    write_mode: str,
     batch: list[VectorRecord],
     batch_index: int,
 ) -> tuple[dict[str, Any], list[VectorRecord]]:
@@ -792,6 +801,7 @@ def _execute_load_batch_with_records(
             target=target,
             batch=batch,
             batch_index=batch_index,
+            write_mode=write_mode,
         ),
         batch,
     )
@@ -800,6 +810,7 @@ def _execute_load_batch_with_records(
 def _load_process_worker(
     vendor: str,
     target: TargetConfig,
+    write_mode: str,
     task_queue: Any,
     result_queue: Any,
     concurrency: int,
@@ -817,6 +828,7 @@ def _load_process_worker(
                     target=target,
                     batch=batch,
                     batch_index=batch_index,
+                    write_mode=write_mode,
                 )
             )
 
@@ -849,15 +861,17 @@ def execute_load_batch(
     target: TargetConfig,
     batch: list[VectorRecord],
     batch_index: int,
+    write_mode: str = "upsert",
 ) -> dict[str, Any]:
     batch_started = time.perf_counter()
     try:
-        result = adapter.upsert_batch(target, batch)
+        result = adapter.upsert_batch(target, batch, write_mode=write_mode)
     except Exception as exc:  # noqa: BLE001
         return {
             "stage": "load",
             "batch_index": batch_index,
             "records": len(batch),
+            "write_mode": write_mode,
             "latency_ms": _elapsed_ms(batch_started),
             "status": "error",
             "error_type": type(exc).__name__,
@@ -867,6 +881,7 @@ def execute_load_batch(
         "stage": "load",
         "batch_index": batch_index,
         "records": result.count,
+        "write_mode": write_mode,
         "latency_ms": _elapsed_ms(batch_started),
         "status": "ok",
     }
@@ -1919,6 +1934,7 @@ def _load_checkpoint_context(
     dataset_manifest: Mapping[str, Any],
     scenario: ScenarioConfig,
     target: TargetConfig,
+    write_mode: str,
     batch_size: int,
     max_batch_bytes: int | None,
     max_records: int | None,
@@ -1936,6 +1952,7 @@ def _load_checkpoint_context(
         "records_path": str(records_path),
         "records_sha256": checksum,
         "json_records_path": str(json_records_path) if json_records_path else None,
+        "write_mode": write_mode,
         "batch_size": batch_size,
         "max_batch_bytes": max_batch_bytes,
         "max_records": max_records,

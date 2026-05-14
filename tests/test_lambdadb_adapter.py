@@ -20,10 +20,15 @@ class FakeStatus:
 class FakeDocs:
     def __init__(self) -> None:
         self.upserts: list[dict[str, Any]] = []
+        self.bulk_upserts: list[dict[str, Any]] = []
         self.fetches: list[dict[str, Any]] = []
 
     def upsert(self, **kwargs: Any) -> dict[str, Any]:
         self.upserts.append(kwargs)
+        return {"ok": True}
+
+    def bulk_upsert_docs(self, **kwargs: Any) -> dict[str, Any]:
+        self.bulk_upserts.append(kwargs)
         return {"ok": True}
 
     def fetch(self, **kwargs: Any) -> dict[str, Any]:
@@ -117,6 +122,12 @@ class FakeClient:
             missing_after_gets=missing_after_gets,
             statuses=statuses,
             sdk_response_objects=sdk_response_objects,
+        )
+
+    def collection(self, name: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            name=name,
+            docs=self.collections.docs,
         )
 
 
@@ -441,7 +452,32 @@ def test_upsert_batch_maps_normalized_records_to_documents() -> None:
     assert result.count == 2
     assert client.collections.docs.upserts == [
         {
-            "collection_name": "smoke",
+            "docs": [
+                {"id": "a", "dense": [0.1, 0.2], "metadata": {"text": "alpha"}},
+                {"id": "b", "dense": [0.3, 0.4], "metadata": {}},
+            ],
+        }
+    ]
+    assert client.collections.docs.bulk_upserts == []
+
+
+def test_upsert_batch_uses_bulk_upsert_docs_for_bulk_write_mode() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    result = adapter.upsert_batch(
+        make_target(),
+        [
+            {"id": "a", "vector": [0.1, 0.2], "metadata": {"text": "alpha"}},
+            {"id": "b", "vector": [0.3, 0.4], "metadata": {}},
+        ],
+        write_mode="bulk_upsert",
+    )
+
+    assert result.count == 2
+    assert client.collections.docs.upserts == []
+    assert client.collections.docs.bulk_upserts == [
+        {
             "docs": [
                 {"id": "a", "dense": [0.1, 0.2], "metadata": {"text": "alpha"}},
                 {"id": "b", "dense": [0.3, 0.4], "metadata": {}},
@@ -474,7 +510,6 @@ def test_upsert_batch_copies_partition_field_from_metadata() -> None:
 
     assert client.collections.docs.upserts == [
         {
-            "collection_name": "smoke",
             "docs": [
                 {
                     "id": "a",

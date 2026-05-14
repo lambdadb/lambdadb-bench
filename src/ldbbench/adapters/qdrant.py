@@ -144,7 +144,13 @@ class QdrantAdapter:
         self,
         target: TargetConfig,
         records: Sequence[Mapping[str, Any] | VectorRecord],
+        *,
+        write_mode: str = "upsert",
     ) -> UpsertResult:
+        if write_mode != "upsert":
+            raise ConfigError(
+                f"Qdrant adapter does not support write_mode {write_mode!r}"
+            )
         settings = _settings_from_target(target)
         points = [
             _record_to_point(record, vector_name=settings.vector_name)

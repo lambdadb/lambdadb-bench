@@ -34,7 +34,7 @@ from ldbbench.runner.execute import (
 class FakeAdapter:
     vendor = "fake"
     capabilities = AdapterCapabilities(
-        supported_write_modes=frozenset({"upsert"}),
+        supported_write_modes=frozenset({"upsert", "bulk_upsert"}),
         supported_query_consistency=frozenset({"eventual"}),
         supports_query_partition_filter=True,
     )
@@ -49,6 +49,7 @@ class FakeAdapter:
     ) -> None:
         self.prepared: dict[str, Any] | None = None
         self.upserted: list[list[VectorRecord]] = []
+        self.write_modes: list[str] = []
         self.queries: list[list[float]] = []
         self.partition_filters: list[dict[str, Any] | None] = []
         self.fail_load_batch = fail_load_batch
@@ -80,6 +81,8 @@ class FakeAdapter:
         self,
         target: TargetConfig,
         records: list[VectorRecord],
+        *,
+        write_mode: str = "upsert",
     ) -> UpsertResult:
         if self.load_delay_seconds:
             time.sleep(self.load_delay_seconds)
@@ -87,6 +90,7 @@ class FakeAdapter:
             self.load_calls += 1
             load_call = self.load_calls
             self.upserted.append(list(records))
+            self.write_modes.append(write_mode)
         if self.fail_load_batch and load_call == self.fail_load_batch:
             raise RuntimeError("planned load failure")
         return UpsertResult(count=len(records))
@@ -155,6 +159,7 @@ def make_scenario(
     load_concurrency: int | None = None,
     wait_until_query_visible: bool = False,
     partition_filter: bool = False,
+    write_mode: str = "upsert",
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": 2,
@@ -181,7 +186,7 @@ def make_scenario(
             "metric": "cosine",
         },
         "load": {
-            "write_mode": "upsert",
+            "write_mode": write_mode,
             "batch_size": batch_size,
             "max_batch_bytes": "1MB",
             "wait_until_query_visible": wait_until_query_visible,
@@ -299,13 +304,16 @@ def test_execute_benchmark_writes_events_and_summary(tmp_path) -> None:
         "metric": "cosine",
     }
     assert [len(batch) for batch in adapter.upserted] == [2, 1]
+    assert adapter.write_modes == ["upsert", "upsert"]
     assert len(adapter.queries) == 1
     assert [event["records"] for event in ingest_events] == [2, 1]
+    assert [event["write_mode"] for event in ingest_events] == ["upsert", "upsert"]
     assert query_events[0]["query_id"] == "query"
     assert query_events[0]["matches"] == ["a", "c"]
     assert query_events[0]["recall_at_k"] == 1.0
     assert result.summary["load"]["records"] == 3
     assert result.summary["load"]["records_read"] == 3
+    assert result.summary["load"]["write_mode"] == "upsert"
     assert result.summary["load"]["record_source"]["format"] == "msgpack"
     assert result.summary["load"]["batching_duration_seconds"] >= 0
     assert result.summary["load"]["batching_records_per_second"] >= 0
@@ -314,6 +322,37 @@ def test_execute_benchmark_writes_events_and_summary(tmp_path) -> None:
     assert result.summary["query"]["queries"] == 1
     assert result.summary["query"]["recall_at_k"] == 1.0
     assert result.summary_path.exists()
+
+
+def test_execute_benchmark_forwards_bulk_write_mode(tmp_path) -> None:
+    scenario = make_scenario(write_mode="bulk_upsert")
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario, query_count=0)
+    adapter = FakeAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+
+    ingest_events = [
+        json.loads(line)
+        for line in result.ingest_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert adapter.write_modes == ["bulk_upsert", "bulk_upsert"]
+    assert [event["write_mode"] for event in ingest_events] == [
+        "bulk_upsert",
+        "bulk_upsert",
+    ]
+    assert result.summary["load"]["write_mode"] == "bulk_upsert"
 
 
 def test_execute_benchmark_applies_partition_filter_and_skips_recall(tmp_path) -> None:
@@ -768,11 +807,13 @@ def test_load_checkpoint_uses_contiguous_watermark_for_concurrent_loads(
             self,
             target: TargetConfig,
             records: list[VectorRecord],
+            *,
+            write_mode: str = "upsert",
         ) -> UpsertResult:
             if records[0].id == "b":
                 time.sleep(0.02)
                 raise RuntimeError("planned out-of-order failure")
-            return super().upsert_batch(target, records)
+            return super().upsert_batch(target, records, write_mode=write_mode)
 
     scenario = make_scenario(rows=4, batch_size=1, load_concurrency=2)
     target = make_target()

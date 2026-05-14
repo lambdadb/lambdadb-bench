@@ -155,6 +155,8 @@ class LambdaDBAdapter:
         self,
         target: TargetConfig,
         records: Sequence[Mapping[str, Any] | VectorRecord],
+        *,
+        write_mode: str = "upsert",
     ) -> UpsertResult:
         settings = _settings_from_target(target)
         docs = [
@@ -168,10 +170,15 @@ class LambdaDBAdapter:
         if not docs:
             return UpsertResult(count=0)
 
-        response = self._client(settings).collections.docs.upsert(
-            collection_name=settings.collection_name,
-            docs=docs,
-        )
+        collection = self._client(settings).collection(settings.collection_name)
+        if write_mode == "upsert":
+            response = collection.docs.upsert(docs=docs)
+        elif write_mode == "bulk_upsert":
+            response = collection.docs.bulk_upsert_docs(docs=docs)
+        else:
+            raise ConfigError(
+                f"LambdaDB adapter does not support write_mode {write_mode!r}"
+            )
         return UpsertResult(count=len(docs), raw_response=response)
 
     def query(
