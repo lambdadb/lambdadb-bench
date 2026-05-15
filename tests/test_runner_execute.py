@@ -163,6 +163,8 @@ def make_scenario(
     sharded_records: bool = False,
     shard_count: int | None = None,
     max_batch_bytes: str | None = "1MB",
+    workload: str = "standard",
+    search_under_ingest: dict[str, Any] | None = None,
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": 2,
@@ -178,6 +180,7 @@ def make_scenario(
         }
     mapping: dict[str, Any] = {
         "name": "runner-smoke",
+        "workload": workload,
         "dataset": {
             "provider": "huggingface",
             "source": "demo/source",
@@ -197,6 +200,8 @@ def make_scenario(
         },
         "query": query,
     }
+    if search_under_ingest is not None:
+        mapping["search_under_ingest"] = search_under_ingest
     if max_batch_bytes is not None:
         mapping["load"]["max_batch_bytes"] = max_batch_bytes
     if load_concurrency is not None:
@@ -494,6 +499,83 @@ def test_execute_benchmark_fails_partition_filter_when_query_metadata_missing(
             output_dir=tmp_path / "result",
             dataset_dir=dataset.output_dir,
         )
+
+
+def test_execute_benchmark_runs_search_under_ingest_upload_and_ask(tmp_path) -> None:
+    scenario = make_scenario(
+        rows=1,
+        workload="search_under_ingest",
+        search_under_ingest={
+            "pattern": "upload_and_ask",
+            "probe_source": "queries",
+            "document_group_field": "url",
+            "max_probe_documents": 1,
+            "min_chunks_per_document": 1,
+            "max_chunks_per_document": 10,
+            "probe_queries_per_document": 1,
+            "probe_concurrency": 1,
+            "top_k": 2,
+            "consistency": "eventual",
+            "poll_until_visible": True,
+            "visibility_timeout": "50ms",
+            "visibility_poll_interval": "1ms",
+        },
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_dataset(
+        scenario=scenario,
+        output_dir=tmp_path / "dataset",
+        limit=1,
+        query_count=3,
+        source_rows=[
+            {"_id": "q1", "emb": [1.0, 0.0], "text": "query one", "url": "doc-1"},
+            {"_id": "q2", "emb": [0.9, 0.1], "text": "query two", "url": "doc-1"},
+            {"_id": "q3", "emb": [0.0, 1.0], "text": "other", "url": "doc-2"},
+            {"_id": "base", "emb": [0.1, 0.9], "text": "base", "url": "base"},
+        ],
+    )
+    adapter = FakeAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        query_only=True,
+    )
+
+    search_events = [
+        json.loads(line)
+        for line in result.search_under_ingest_events_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+
+    assert result.summary["status"] == "completed"
+    assert result.summary["workload"] == "search_under_ingest"
+    assert result.summary["load"]["status"] == "skipped"
+    assert result.summary["query"]["skip_reason"] == "search_under_ingest"
+    assert [record.id for record in adapter.upserted[0]] == ["q1", "q2"]
+    assert adapter.write_modes == ["upsert"]
+    assert search_events[0]["document_group_value"] == "doc-1"
+    assert search_events[0]["probe_chunk_ids"] == ["q1", "q2"]
+    assert search_events[0]["exact_chunk_hit_at_k"] is True
+    assert search_events[0]["same_document_hit_at_k"] is True
+    assert search_events[0]["same_document_recall_at_k"] == 1.0
+    assert search_events[0]["visible"] is True
+    assert result.summary["search_under_ingest"]["probe_documents"] == 1
+    assert result.summary["search_under_ingest"]["probe_chunks"] == 2
+    assert (
+        result.summary["search_under_ingest"][
+            "read_after_write_same_document_hit_rate_at_k"
+        ]
+        == 1.0
+    )
+    assert result.query_events_path.read_text(encoding="utf-8") == ""
 
 
 def test_read_records_uses_msgpack_estimated_size(tmp_path) -> None:

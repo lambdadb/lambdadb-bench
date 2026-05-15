@@ -184,6 +184,19 @@ def _render_markdown(runs: list[RunReport]) -> str:
     lines.extend(
         [
             "",
+            "## Search-Under-Ingest Results",
+            "",
+        ]
+    )
+    search_rows = _search_under_ingest_rows(runs)
+    lines.extend(
+        _markdown_table(search_rows)
+        if search_rows
+        else ["No search-under-ingest results were found."]
+    )
+    lines.extend(
+        [
+            "",
             "## Recall And Quality Gates",
             "",
         ]
@@ -348,6 +361,41 @@ def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _search_under_ingest_rows(runs: list[RunReport]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for run in runs:
+        search = _mapping(run.summary.get("search_under_ingest"))
+        if not search or search.get("mode") == "skipped":
+            continue
+        write_latency = _mapping(search.get("write_latency_ms"))
+        query_latency = _mapping(search.get("immediate_query_latency_ms"))
+        visible_latency = _mapping(search.get("time_to_visible_ms"))
+        rows.append(
+            {
+                "result_dir": str(run.path),
+                "target": _target_label(run),
+                "consistency": _fmt(search.get("consistency")),
+                "probe_documents": _fmt(search.get("probe_documents")),
+                "probe_chunks": _fmt(search.get("probe_chunks")),
+                "same_document_hit_rate_at_k": _fmt_float(
+                    search.get("read_after_write_same_document_hit_rate_at_k"),
+                ),
+                "exact_chunk_hit_rate_at_k": _fmt_float(
+                    search.get("read_after_write_exact_chunk_hit_rate_at_k"),
+                ),
+                "same_document_recall_at_k": _fmt_float(
+                    search.get("read_after_write_same_document_recall_at_k"),
+                ),
+                "write_p95_ms": _fmt_float(write_latency.get("p95")),
+                "query_p95_ms": _fmt_float(query_latency.get("p95")),
+                "visible_p95_ms": _fmt_float(visible_latency.get("p95")),
+                "errors": _fmt(search.get("errors")),
+                "error_rate": _fmt_float(search.get("error_rate")),
+            }
+        )
+    return rows
+
+
 def _quality_rows(runs: list[RunReport]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for run in runs:
@@ -381,6 +429,7 @@ def _warning_lines(runs: list[RunReport]) -> list[str]:
             warnings.append(f"{target}: run status is {_fmt(status)}.")
         load = _mapping(run.summary.get("load"))
         query = _mapping(run.summary.get("query"))
+        search = _mapping(run.summary.get("search_under_ingest"))
         if load.get("status") == "skipped":
             warnings.append(
                 f"{target}: load stage skipped ({_fmt(load.get('skip_reason'))})."
@@ -398,6 +447,12 @@ def _warning_lines(runs: list[RunReport]) -> list[str]:
             errors = stage.get("errors")
             if isinstance(errors, int) and errors:
                 warnings.append(f"{target}: {stage_name} recorded {errors} errors.")
+        if search:
+            errors = search.get("errors")
+            if isinstance(errors, int) and errors:
+                warnings.append(
+                    f"{target}: search-under-ingest recorded {errors} errors."
+                )
         gate = _recall_gate(run)
         recall = query.get("recall_at_k")
         if (

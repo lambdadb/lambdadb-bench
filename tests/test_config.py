@@ -51,6 +51,46 @@ query:
     }
 
 
+def test_load_scenario_accepts_search_under_ingest_workload(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: search-under-ingest
+workload: search_under_ingest
+dataset:
+  rows: 1000000
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  top_k: 10
+search_under_ingest:
+  pattern: upload_and_ask
+  probe_source: queries
+  document_group_field: url
+  max_probe_documents: 100
+  duration: 5m
+  min_chunks_per_document: 1
+  max_chunks_per_document: 20
+  probe_queries_per_document: 1
+  probe_concurrency: 1
+  top_k: 10
+  consistency: strong
+  poll_until_visible: true
+  visibility_timeout: 5s
+  visibility_poll_interval: 25ms
+""",
+        encoding="utf-8",
+    )
+
+    scenario = load_scenario(scenario_path)
+
+    assert scenario.workload == "search_under_ingest"
+    assert scenario.search_under_ingest["document_group_field"] == "url"
+    assert scenario.search_under_ingest["consistency"] == "strong"
+
+
 def test_load_target_expands_env_and_redacts_secrets(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("QDRANT_ENDPOINT", "https://example.qdrant.io")
     target_path = tmp_path / "target.yaml"

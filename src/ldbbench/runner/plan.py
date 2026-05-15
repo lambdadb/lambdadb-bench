@@ -53,8 +53,11 @@ def build_run_plan(
     allow_destructive: bool = False,
 ) -> RunPlan:
     write_mode = str(scenario.load.get("write_mode"))
-    query_consistency = str(scenario.query.get("consistency", "eventual"))
-    partition_filter_requested = scenario.query.get("partition_filter") is not None
+    query_consistency = _planned_query_consistency(scenario)
+    partition_filter_requested = (
+        scenario.workload != "search_under_ingest"
+        and scenario.query.get("partition_filter") is not None
+    )
     unsupported: list[str] = []
     not_applicable: list[str] = []
     warnings: list[str] = []
@@ -115,3 +118,14 @@ def build_run_plan(
         unsupported=unsupported,
         not_applicable=not_applicable,
     )
+
+
+def _planned_query_consistency(scenario: ScenarioConfig) -> str:
+    if scenario.workload == "search_under_ingest":
+        return str(
+            scenario.search_under_ingest.get(
+                "consistency",
+                scenario.query.get("consistency", "eventual"),
+            )
+        )
+    return str(scenario.query.get("consistency", "eventual"))

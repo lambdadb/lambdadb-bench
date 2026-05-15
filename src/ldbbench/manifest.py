@@ -96,6 +96,7 @@ def build_run_manifest(
         },
         "scenario": {
             "name": scenario.name,
+            "workload": scenario.workload,
             "path": str(scenario_file),
             "sha256": sha256_file(scenario_file),
             "dataset": {
@@ -113,6 +114,7 @@ def build_run_manifest(
             "load": {
                 "write_mode": scenario.load.get("write_mode"),
             },
+            "search_under_ingest": scenario.search_under_ingest,
         },
         "target": {
             "vendor": target.vendor,

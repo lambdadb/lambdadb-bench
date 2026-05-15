@@ -454,8 +454,20 @@ def run_benchmark(args: argparse.Namespace) -> int:
             print(f"error_rate: {result.summary['query']['error_rate']}")
         if result.summary["query"]["recall_at_k"] is not None:
             print(f"recall_at_k: {result.summary['query']['recall_at_k']}")
+        if "search_under_ingest" in result.summary:
+            search_summary = result.summary["search_under_ingest"]
+            print(
+                "search_under_ingest_probe_documents: "
+                f"{search_summary['probe_documents']}"
+            )
+            print(
+                "search_under_ingest_same_document_hit_rate_at_k: "
+                f"{search_summary['read_after_write_same_document_hit_rate_at_k']}"
+            )
         print(f"wrote {result.ingest_events_path}")
         print(f"wrote {result.query_events_path}")
+        if result.search_under_ingest_events_path.exists():
+            print(f"wrote {result.search_under_ingest_events_path}")
         if result.load_checkpoint_path.exists():
             print(f"wrote {result.load_checkpoint_path}")
         print(f"wrote {result.summary_path}")

@@ -17,6 +17,8 @@ SECRET_KEY_PARTS = ("api_key", "apikey", "secret", "token", "password", "credent
 VALID_WRITE_MODES = {"upsert", "bulk_upsert"}
 VALID_QUERY_CONSISTENCY = {"eventual", "strong"}
 VALID_PREPARE_MODES = {"existing", "create", "recreate"}
+VALID_WORKLOADS = {"standard", "search_under_ingest"}
+VALID_SEARCH_UNDER_INGEST_PROBE_SOURCES = {"queries"}
 
 
 class ConfigError(ValueError):
@@ -32,6 +34,8 @@ class ScenarioConfig:
     load: dict[str, Any]
     query: dict[str, Any]
     description: str | None = None
+    workload: str = "standard"
+    search_under_ingest: dict[str, Any] = field(default_factory=dict)
     quality: dict[str, Any] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
@@ -43,6 +47,13 @@ class ScenarioConfig:
         dataset = _required_mapping(raw, "dataset")
         load = _required_mapping(raw, "load")
         query = _required_mapping(raw, "query")
+        workload = raw.get("workload", "standard")
+        if workload not in VALID_WORKLOADS:
+            raise ConfigError(
+                "scenario.workload must be one of "
+                f"{sorted(VALID_WORKLOADS)}"
+            )
+        search_under_ingest = _optional_mapping(raw, "search_under_ingest")
 
         _validate_positive_int(dataset, "rows")
         _validate_positive_int(dataset, "dimensions")
@@ -52,6 +63,11 @@ class ScenarioConfig:
             raise ConfigError(
                 "scenario.load.write_mode must be one of "
                 f"{sorted(VALID_WRITE_MODES)}"
+            )
+        if workload == "search_under_ingest" and write_mode != "upsert":
+            raise ConfigError(
+                "scenario.load.write_mode must be 'upsert' for "
+                "workload 'search_under_ingest'"
             )
         _validate_optional_positive_int(load, "concurrency")
         _validate_optional_positive_int(load, "processes")
@@ -66,6 +82,11 @@ class ScenarioConfig:
             )
         _validate_optional_positive_int(query, "processes")
         _validate_partition_filter(query)
+        _validate_search_under_ingest(
+            search_under_ingest,
+            workload=str(workload),
+            default_consistency=str(consistency),
+        )
 
         stages = query.get("stages", [])
         if stages is not None:
@@ -85,6 +106,8 @@ class ScenarioConfig:
             dataset=dataset,
             load=load,
             query=query,
+            workload=str(workload),
+            search_under_ingest=search_under_ingest,
             quality=_optional_mapping(raw, "quality"),
             metrics=_optional_mapping(raw, "metrics"),
             raw=raw,
@@ -317,6 +340,84 @@ def _validate_partition_filter(query: Mapping[str, Any]) -> None:
     if not isinstance(metadata_field, str) or not metadata_field:
         raise ConfigError(
             "scenario.query.partition_filter.metadata_field must be a string"
+        )
+
+
+def _validate_search_under_ingest(
+    config: Mapping[str, Any],
+    *,
+    workload: str,
+    default_consistency: str,
+) -> None:
+    if not config:
+        if workload == "search_under_ingest":
+            raise ConfigError(
+                "scenario.search_under_ingest must be set for "
+                "workload 'search_under_ingest'"
+            )
+        return
+
+    pattern = config.get("pattern", "upload_and_ask")
+    if pattern != "upload_and_ask":
+        raise ConfigError("scenario.search_under_ingest.pattern must be upload_and_ask")
+
+    probe_source = config.get("probe_source", "queries")
+    if probe_source not in VALID_SEARCH_UNDER_INGEST_PROBE_SOURCES:
+        raise ConfigError(
+            "scenario.search_under_ingest.probe_source must be one of "
+            f"{sorted(VALID_SEARCH_UNDER_INGEST_PROBE_SOURCES)}"
+        )
+
+    document_group_field = config.get("document_group_field", "url")
+    if not isinstance(document_group_field, str) or not document_group_field:
+        raise ConfigError(
+            "scenario.search_under_ingest.document_group_field must be a string"
+        )
+
+    consistency = config.get("consistency", default_consistency)
+    if consistency not in VALID_QUERY_CONSISTENCY:
+        raise ConfigError(
+            "scenario.search_under_ingest.consistency must be one of "
+            f"{sorted(VALID_QUERY_CONSISTENCY)}"
+        )
+
+    duration = config.get("duration")
+    if duration is not None and not isinstance(duration, str):
+        raise ConfigError("scenario.search_under_ingest.duration must be a string")
+
+    visibility_timeout = config.get("visibility_timeout")
+    if visibility_timeout is not None and not isinstance(visibility_timeout, str):
+        raise ConfigError(
+            "scenario.search_under_ingest.visibility_timeout must be a string"
+        )
+
+    visibility_poll_interval = config.get("visibility_poll_interval")
+    if visibility_poll_interval is not None and not isinstance(
+        visibility_poll_interval,
+        str,
+    ):
+        raise ConfigError(
+            "scenario.search_under_ingest.visibility_poll_interval must be a string"
+        )
+
+    _validate_optional_positive_int(config, "max_probe_documents")
+    _validate_optional_positive_int(config, "min_chunks_per_document")
+    _validate_optional_positive_int(config, "max_chunks_per_document")
+    _validate_optional_positive_int(config, "probe_queries_per_document")
+    _validate_optional_positive_int(config, "probe_concurrency")
+    _validate_optional_positive_int(config, "top_k")
+    _validate_optional_bool(config, "poll_until_visible")
+
+    min_chunks = config.get("min_chunks_per_document")
+    max_chunks = config.get("max_chunks_per_document")
+    if (
+        isinstance(min_chunks, int)
+        and isinstance(max_chunks, int)
+        and max_chunks < min_chunks
+    ):
+        raise ConfigError(
+            "scenario.search_under_ingest.max_chunks_per_document must be "
+            "greater than or equal to min_chunks_per_document"
         )
 
 

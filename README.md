@@ -265,9 +265,51 @@ Real runs write:
 - `ingest_events.jsonl`: one event per upsert batch, including load errors.
 - `load_checkpoint.json`: resumable load watermark and matching load context.
 - `query_events.jsonl`: one event per query attempt, including query errors.
+- `search_under_ingest_events.jsonl`: one event per upload-and-ask probe when
+  `workload: search_under_ingest` is used.
 - `summary.json`: load/query counts, latency percentiles, QPS, per-stage query
-  summaries, load batching/upsert timing, error rates, and recall when
-  `ground_truth.jsonl` is present.
+  summaries, load batching/upsert timing, error rates, recall when
+  `ground_truth.jsonl` is present, and search-under-ingest metrics when
+  applicable.
+
+### Search-under-ingest read-after-write runs
+
+Search-under-ingest workloads measure whether newly written document sets are
+search-visible immediately after write acknowledgement. The included Cohere
+Wikipedia scenario uses held-out `queries.msgpack` records as upload-and-ask
+probes, groups chunks by `metadata.url`, upserts one URL group, then immediately
+queries with one chunk vector from that group.
+
+This workload reports read-after-write document visibility metrics separately
+from normal FAISS recall:
+
+- `read_after_write_exact_chunk_hit_rate_at_k`
+- `read_after_write_same_document_hit_rate_at_k`
+- `read_after_write_same_document_recall_at_k`
+- `write_latency_ms`
+- `immediate_query_latency_ms`
+- `time_to_visible_ms`
+
+The first implementation supports `probe_source: queries`,
+`probe_concurrency: 1`, and `probe_queries_per_document: 1`. Use `upsert`, not
+`bulk_upsert`, because this workload models interactive read-after-write
+behavior.
+
+Run it against an existing loaded collection:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m-search-under-ingest.yaml \
+  --target configs/lambdadb.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --query-only \
+  --allow-large-run \
+  --out results/example-lambdadb-search-under-ingest
+```
+
+For LambdaDB, `search_under_ingest.consistency: strong` maps to
+`consistent_read=True`. Targets that do not declare a comparable portable
+strong read-after-write query guarantee plan strong variants as `N/A`.
 
 Combine one or more run directories into Markdown and CSV report artifacts:
 
@@ -278,7 +320,9 @@ uv run ldbbench report \
 ```
 
 The report command writes the Markdown file plus sibling `*-load.csv` and
-`*-query-stages.csv` files for spreadsheet-friendly comparisons.
+`*-query-stages.csv` files for spreadsheet-friendly comparisons. The Markdown
+report also includes a Search-Under-Ingest Results section when runs contain
+that workload.
 
 Runs at 1M rows or larger require `--allow-large-run` unless `--max-records`
 keeps the run below that threshold.

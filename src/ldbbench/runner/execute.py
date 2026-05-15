@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover - kept for source-tree reuse without dep
 
 INGEST_EVENTS_FILENAME = "ingest_events.jsonl"
 QUERY_EVENTS_FILENAME = "query_events.jsonl"
+SEARCH_UNDER_INGEST_EVENTS_FILENAME = "search_under_ingest_events.jsonl"
 SUMMARY_FILENAME = "summary.json"
 LOAD_CHECKPOINT_FILENAME = "load_checkpoint.json"
 LARGE_RUN_ROW_THRESHOLD = 1_000_000
@@ -53,6 +54,7 @@ class BenchmarkRunResult:
     output_dir: Path
     ingest_events_path: Path
     query_events_path: Path
+    search_under_ingest_events_path: Path
     load_checkpoint_path: Path
     summary_path: Path
     summary: dict[str, Any]
@@ -202,8 +204,10 @@ def execute_benchmark(
 
     ingest_events_path = out / INGEST_EVENTS_FILENAME
     query_events_path = out / QUERY_EVENTS_FILENAME
+    search_under_ingest_events_path = out / SEARCH_UNDER_INGEST_EVENTS_FILENAME
     load_checkpoint_path = out / LOAD_CHECKPOINT_FILENAME
     summary_path = out / SUMMARY_FILENAME
+    workload = scenario.workload
 
     ticker = ProgressTicker(progress)
     ticker.emit(
@@ -277,11 +281,43 @@ def execute_benchmark(
             )
 
     skip_reason = _query_skip_reason(load_summary=ingest_summary, load_only=load_only)
+    search_under_ingest_summary = None
     if skip_reason is not None:
         ticker.emit(f"run: skipping query reason={skip_reason}")
         query_events_path.write_text("", encoding="utf-8")
         query_summary = skipped_query_summary(reason=skip_reason)
+        if workload == "search_under_ingest":
+            search_under_ingest_events_path.write_text("", encoding="utf-8")
+            search_under_ingest_summary = skipped_search_under_ingest_summary(
+                reason=skip_reason,
+            )
+    elif workload == "search_under_ingest":
+        query_events_path.write_text("", encoding="utf-8")
+        query_summary = skipped_query_summary(reason="search_under_ingest")
+        ticker.emit("run: loading search-under-ingest probes")
+        probes = list(read_records(queries_path, limit=max_queries))
+        ticker.emit(
+            "run: starting search-under-ingest stage "
+            f"probe_records={len(probes)}"
+        )
+        search_under_ingest_summary = run_search_under_ingest_stage(
+            adapter=adapter,
+            target=target,
+            probes=probes,
+            config=scenario.search_under_ingest,
+            default_top_k=_top_k(scenario),
+            default_consistency=str(scenario.query.get("consistency", "eventual")),
+            write_mode=str(scenario.load.get("write_mode")),
+            events_path=search_under_ingest_events_path,
+            progress=progress,
+        )
+        ticker.emit(
+            "run: search-under-ingest stage finished "
+            f"probe_documents={search_under_ingest_summary['probe_documents']} "
+            f"errors={search_under_ingest_summary['errors']}"
+        )
     else:
+        search_under_ingest_events_path.write_text("", encoding="utf-8")
         ticker.emit("run: loading query vectors")
         queries = list(read_records(queries_path, limit=max_queries))
         ticker.emit(f"run: starting query stage query_vectors={len(queries)}")
@@ -306,13 +342,20 @@ def execute_benchmark(
         )
 
     summary = {
-        "status": run_status(load_summary=ingest_summary, query_summary=query_summary),
+        "status": run_status(
+            load_summary=ingest_summary,
+            query_summary=query_summary,
+            search_under_ingest_summary=search_under_ingest_summary,
+        ),
         "run_manifest": str(paths.run_manifest),
         "dataset_dir": str(dataset_path),
         "ground_truth": str(truth_path) if truth_path.exists() else None,
         "load": ingest_summary,
         "query": query_summary,
+        "workload": workload,
     }
+    if search_under_ingest_summary is not None:
+        summary["search_under_ingest"] = search_under_ingest_summary
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -323,6 +366,7 @@ def execute_benchmark(
         output_dir=out,
         ingest_events_path=ingest_events_path,
         query_events_path=query_events_path,
+        search_under_ingest_events_path=search_under_ingest_events_path,
         load_checkpoint_path=load_checkpoint_path,
         summary_path=summary_path,
         summary=summary,
@@ -2211,6 +2255,419 @@ def execute_query_once(
     return base_event
 
 
+def run_search_under_ingest_stage(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    probes: Sequence[VectorRecord],
+    config: Mapping[str, Any],
+    default_top_k: int,
+    default_consistency: str,
+    write_mode: str,
+    events_path: str | Path,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    events_output = Path(events_path)
+    events_output.parent.mkdir(parents=True, exist_ok=True)
+    probe_concurrency = _search_under_ingest_probe_concurrency(config)
+    if probe_concurrency != 1:
+        raise ConfigError(
+            "scenario.search_under_ingest.probe_concurrency > 1 is not supported yet"
+        )
+    probe_queries_per_document = _search_under_ingest_probe_queries_per_document(
+        config,
+    )
+    if probe_queries_per_document != 1:
+        raise ConfigError(
+            "scenario.search_under_ingest.probe_queries_per_document > 1 "
+            "is not supported yet"
+        )
+
+    top_k = _search_under_ingest_top_k(config, default_top_k=default_top_k)
+    consistency = _search_under_ingest_consistency(
+        config,
+        default_consistency=default_consistency,
+    )
+    group_field = _search_under_ingest_group_field(config)
+    max_probe_documents = _search_under_ingest_max_probe_documents(config)
+    duration_seconds = _search_under_ingest_duration_seconds(config)
+    poll_until_visible = _search_under_ingest_poll_until_visible(config)
+    visibility_timeout_seconds = _search_under_ingest_visibility_timeout_seconds(
+        config,
+    )
+    visibility_poll_interval_seconds = (
+        _search_under_ingest_visibility_poll_interval_seconds(config)
+    )
+
+    started = time.perf_counter()
+    deadline = started + duration_seconds if duration_seconds is not None else None
+    write_latencies: list[float] = []
+    immediate_query_latencies: list[float] = []
+    time_to_visible_values: list[float] = []
+    exact_hit_at_1 = 0
+    exact_hit_at_k = 0
+    same_document_hit_at_1 = 0
+    same_document_hit_at_k = 0
+    same_document_recalls: list[float] = []
+    visible_count = 0
+    error_count = 0
+    attempted_documents = 0
+    probe_documents = 0
+    probe_chunks = 0
+    ticker = ProgressTicker(progress)
+    ticker.emit(
+        "search_under_ingest: starting "
+        f"pattern=upload_and_ask probe_source=queries "
+        f"document_group_field={group_field} top_k={top_k} "
+        f"consistency={consistency}"
+    )
+
+    with events_output.open("w", encoding="utf-8") as events_file:
+        for probe_document_index, document_set in enumerate(
+            _iter_probe_document_sets(
+                probes,
+                group_field=group_field,
+                min_chunks=_search_under_ingest_min_chunks(config),
+                max_chunks=_search_under_ingest_max_chunks(config),
+            ),
+            start=1,
+        ):
+            if (
+                max_probe_documents is not None
+                and attempted_documents >= max_probe_documents
+            ):
+                break
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            attempted_documents += 1
+
+            event = execute_search_under_ingest_probe(
+                adapter=adapter,
+                target=target,
+                document_set=document_set,
+                probe_document_index=probe_document_index,
+                group_field=group_field,
+                top_k=top_k,
+                consistency=consistency,
+                write_mode=write_mode,
+                poll_until_visible=poll_until_visible,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                visibility_poll_interval_seconds=visibility_poll_interval_seconds,
+            )
+            _write_event(events_file, event)
+
+            if event["status"] == "ok":
+                probe_documents += 1
+                probe_chunks += int(event["probe_chunk_count"])
+                write_latencies.append(float(event["write_latency_ms"]))
+                immediate_query_latencies.append(
+                    float(event["immediate_query_latency_ms"])
+                )
+                exact_hit_at_1 += int(bool(event["exact_chunk_hit_at_1"]))
+                exact_hit_at_k += int(bool(event["exact_chunk_hit_at_k"]))
+                same_document_hit_at_1 += int(bool(event["same_document_hit_at_1"]))
+                same_document_hit_at_k += int(bool(event["same_document_hit_at_k"]))
+                same_document_recalls.append(float(event["same_document_recall_at_k"]))
+                if event.get("visible"):
+                    visible_count += 1
+                if event.get("time_to_visible_ms") is not None:
+                    time_to_visible_values.append(float(event["time_to_visible_ms"]))
+            else:
+                error_count += 1
+
+            ticker.maybe(
+                "search_under_ingest: progress "
+                f"probe_documents={probe_documents} errors={error_count} "
+                f"same_document_hit_at_k={same_document_hit_at_k}"
+            )
+
+    duration = time.perf_counter() - started
+    attempts = attempted_documents
+    summary: dict[str, Any] = {
+        "mode": "search_under_ingest",
+        "pattern": "upload_and_ask",
+        "probe_source": _search_under_ingest_probe_source(config),
+        "document_group_field": group_field,
+        "probe_documents": probe_documents,
+        "probe_chunks": probe_chunks,
+        "errors": error_count,
+        "attempts": attempts,
+        "error_rate": _error_rate(error_count, attempts),
+        "duration_seconds": duration,
+        "probe_documents_per_second": _rate(probe_documents, duration),
+        "attempts_per_second": _rate(attempts, duration),
+        "top_k": top_k,
+        "consistency": consistency,
+        "probe_concurrency": probe_concurrency,
+        "write_mode": write_mode,
+        "read_after_write_exact_chunk_hit_rate_at_1": _ratio(
+            exact_hit_at_1,
+            probe_documents,
+        ),
+        "read_after_write_exact_chunk_hit_rate_at_k": _ratio(
+            exact_hit_at_k,
+            probe_documents,
+        ),
+        "read_after_write_same_document_hit_rate_at_1": _ratio(
+            same_document_hit_at_1,
+            probe_documents,
+        ),
+        "read_after_write_same_document_hit_rate_at_k": _ratio(
+            same_document_hit_at_k,
+            probe_documents,
+        ),
+        "read_after_write_same_document_recall_at_k": (
+            _mean(same_document_recalls) if same_document_recalls else None
+        ),
+        "visible": visible_count,
+        "time_to_visible_ms": latency_summary(time_to_visible_values),
+        "write_latency_ms": latency_summary(write_latencies),
+        "immediate_query_latency_ms": latency_summary(immediate_query_latencies),
+        "poll_until_visible": poll_until_visible,
+    }
+    ticker.emit(
+        "search_under_ingest: finished "
+        f"probe_documents={probe_documents} errors={error_count}"
+    )
+    return summary
+
+
+def execute_search_under_ingest_probe(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    document_set: list[VectorRecord],
+    probe_document_index: int,
+    group_field: str,
+    top_k: int,
+    consistency: str,
+    write_mode: str,
+    poll_until_visible: bool,
+    visibility_timeout_seconds: float,
+    visibility_poll_interval_seconds: float,
+) -> dict[str, Any]:
+    query_record = document_set[0]
+    group_value = _metadata_string(query_record, group_field)
+    expected_ids = [record.id for record in document_set]
+    expected_set = set(expected_ids)
+    event: dict[str, Any] = {
+        "stage": "search_under_ingest",
+        "probe_document_index": probe_document_index,
+        "document_group_field": group_field,
+        "document_group_value": group_value,
+        "probe_chunk_ids": expected_ids,
+        "probe_chunk_count": len(document_set),
+        "query_chunk_id": query_record.id,
+        "top_k": top_k,
+        "consistency": consistency,
+        "write_mode": write_mode,
+    }
+
+    write_started = time.perf_counter()
+    try:
+        adapter.upsert_batch(target, document_set, write_mode=write_mode)
+    except Exception as exc:  # noqa: BLE001
+        event.update(
+            {
+                "error_message": str(exc),
+                "error_type": type(exc).__name__,
+                "write_latency_ms": _elapsed_ms(write_started),
+                "status": "error",
+            }
+        )
+        return event
+    write_latency_ms = _elapsed_ms(write_started)
+    visibility_started = time.perf_counter()
+
+    query_started = time.perf_counter()
+    try:
+        result = adapter.query(
+            target,
+            vector=query_record.vector,
+            top_k=top_k,
+            consistency=consistency,
+            include_vectors=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        event.update(
+            {
+                "error_message": str(exc),
+                "error_type": type(exc).__name__,
+                "write_latency_ms": write_latency_ms,
+                "immediate_query_latency_ms": _elapsed_ms(query_started),
+                "status": "error",
+            }
+        )
+        return event
+
+    immediate_query_latency_ms = _elapsed_ms(query_started)
+    match_ids = [match.id for match in result.matches]
+    metrics = _search_under_ingest_match_metrics(
+        match_ids=match_ids,
+        query_record_id=query_record.id,
+        expected_ids=expected_set,
+        top_k=top_k,
+    )
+    visible = bool(metrics["same_document_hit_at_k"])
+    visibility_error: dict[str, str] | None = None
+    time_to_visible_ms = (
+        _elapsed_ms(visibility_started)
+        if visible and poll_until_visible
+        else None
+    )
+    if poll_until_visible and not visible:
+        time_to_visible_ms, visible, visibility_error = (
+            _poll_search_under_ingest_visible(
+                adapter=adapter,
+                target=target,
+                query_record=query_record,
+                expected_ids=expected_set,
+                top_k=top_k,
+                consistency=consistency,
+                started=visibility_started,
+                timeout_seconds=visibility_timeout_seconds,
+                poll_interval_seconds=visibility_poll_interval_seconds,
+            )
+        )
+
+    event.update(
+        {
+            "write_latency_ms": write_latency_ms,
+            "immediate_query_latency_ms": immediate_query_latency_ms,
+            "matches": match_ids,
+            "visible": visible,
+            "time_to_visible_ms": time_to_visible_ms,
+            "status": "ok",
+        }
+    )
+    event.update(metrics)
+    if visibility_error is not None:
+        event.update(visibility_error)
+    return event
+
+
+def _poll_search_under_ingest_visible(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    query_record: VectorRecord,
+    expected_ids: set[str],
+    top_k: int,
+    consistency: str,
+    started: float,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+) -> tuple[float | None, bool, dict[str, str] | None]:
+    deadline = started + timeout_seconds
+    last_error: dict[str, str] | None = None
+    while time.perf_counter() <= deadline:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval_seconds, remaining))
+        try:
+            result = adapter.query(
+                target,
+                vector=query_record.vector,
+                top_k=top_k,
+                consistency=consistency,
+                include_vectors=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = {
+                "visibility_error_type": type(exc).__name__,
+                "visibility_error_message": str(exc),
+            }
+            continue
+        if expected_ids.intersection(match.id for match in result.matches):
+            return _elapsed_ms(started), True, last_error
+    return None, False, last_error
+
+
+def _search_under_ingest_match_metrics(
+    *,
+    match_ids: list[str],
+    query_record_id: str,
+    expected_ids: set[str],
+    top_k: int,
+) -> dict[str, Any]:
+    first_match = match_ids[:1]
+    top_matches = match_ids[:top_k]
+    expected_top_matches = expected_ids.intersection(top_matches)
+    return {
+        "exact_chunk_hit_at_1": query_record_id in first_match,
+        "exact_chunk_hit_at_k": query_record_id in top_matches,
+        "same_document_hit_at_1": bool(expected_ids.intersection(first_match)),
+        "same_document_hit_at_k": bool(expected_top_matches),
+        "same_document_recall_at_k": (
+            len(expected_top_matches) / len(expected_ids) if expected_ids else None
+        ),
+    }
+
+
+def _iter_probe_document_sets(
+    probes: Sequence[VectorRecord],
+    *,
+    group_field: str,
+    min_chunks: int,
+    max_chunks: int | None,
+) -> Iterator[list[VectorRecord]]:
+    grouped: dict[str, list[VectorRecord]] = {}
+    order: list[str] = []
+    for probe in probes:
+        group_value = _metadata_string(probe, group_field)
+        if group_value not in grouped:
+            grouped[group_value] = []
+            order.append(group_value)
+        if max_chunks is None or len(grouped[group_value]) < max_chunks:
+            grouped[group_value].append(probe)
+
+    for group_value in order:
+        document_set = grouped[group_value]
+        if len(document_set) >= min_chunks:
+            yield document_set
+
+
+def _metadata_string(record: VectorRecord, field: str) -> str:
+    value = record.metadata.get(field)
+    if not isinstance(value, str) or not value:
+        raise ConfigError(
+            f"search_under_ingest document_group_field {field!r} must be a "
+            "non-empty string in probe metadata"
+        )
+    return value
+
+
+def skipped_search_under_ingest_summary(*, reason: str) -> dict[str, Any]:
+    summary = _empty_search_under_ingest_summary()
+    summary["skip_reason"] = reason
+    return summary
+
+
+def _empty_search_under_ingest_summary() -> dict[str, Any]:
+    return {
+        "mode": "skipped",
+        "pattern": "upload_and_ask",
+        "probe_documents": 0,
+        "probe_chunks": 0,
+        "errors": 0,
+        "attempts": 0,
+        "error_rate": 0.0,
+        "duration_seconds": 0.0,
+        "probe_documents_per_second": 0.0,
+        "attempts_per_second": 0.0,
+        "read_after_write_exact_chunk_hit_rate_at_1": None,
+        "read_after_write_exact_chunk_hit_rate_at_k": None,
+        "read_after_write_same_document_hit_rate_at_1": None,
+        "read_after_write_same_document_hit_rate_at_k": None,
+        "read_after_write_same_document_recall_at_k": None,
+        "visible": 0,
+        "time_to_visible_ms": latency_summary([]),
+        "write_latency_ms": latency_summary([]),
+        "immediate_query_latency_ms": latency_summary([]),
+    }
+
+
 def _write_event(
     file: Any,
     event: Mapping[str, Any],
@@ -2392,6 +2849,7 @@ def run_status(
     *,
     load_summary: Mapping[str, Any],
     query_summary: Mapping[str, Any],
+    search_under_ingest_summary: Mapping[str, Any] | None = None,
 ) -> str:
     if load_summary.get("errors", 0):
         return "failed"
@@ -2399,6 +2857,11 @@ def run_status(
     if isinstance(visibility, Mapping) and visibility.get("status") == "timeout":
         return "failed"
     if query_summary.get("errors", 0):
+        return "completed_with_errors"
+    if (
+        search_under_ingest_summary is not None
+        and search_under_ingest_summary.get("errors", 0)
+    ):
         return "completed_with_errors"
     return "completed"
 
@@ -2928,6 +3391,143 @@ def _top_k(scenario: ScenarioConfig) -> int:
     return top_k
 
 
+def _search_under_ingest_probe_source(config: Mapping[str, Any]) -> str:
+    value = config.get("probe_source", "queries")
+    if value != "queries":
+        raise ConfigError(
+            "scenario.search_under_ingest.probe_source only supports 'queries' "
+            "in the first implementation"
+        )
+    return str(value)
+
+
+def _search_under_ingest_group_field(config: Mapping[str, Any]) -> str:
+    value = config.get("document_group_field", "url")
+    if not isinstance(value, str) or not value:
+        raise ConfigError(
+            "scenario.search_under_ingest.document_group_field must be a string"
+        )
+    return value
+
+
+def _search_under_ingest_top_k(
+    config: Mapping[str, Any],
+    *,
+    default_top_k: int,
+) -> int:
+    value = config.get("top_k", default_top_k)
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError("scenario.search_under_ingest.top_k must be a positive int")
+    return value
+
+
+def _search_under_ingest_consistency(
+    config: Mapping[str, Any],
+    *,
+    default_consistency: str,
+) -> str:
+    value = config.get("consistency", default_consistency)
+    if value not in {"eventual", "strong"}:
+        raise ConfigError(
+            "scenario.search_under_ingest.consistency must be 'eventual' or 'strong'"
+        )
+    return str(value)
+
+
+def _search_under_ingest_max_probe_documents(
+    config: Mapping[str, Any],
+) -> int | None:
+    value = config.get("max_probe_documents")
+    if value is None:
+        return None
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            "scenario.search_under_ingest.max_probe_documents must be positive"
+        )
+    return value
+
+
+def _search_under_ingest_duration_seconds(config: Mapping[str, Any]) -> float | None:
+    value = config.get("duration")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError("scenario.search_under_ingest.duration must be a string")
+    return parse_duration_seconds(value)
+
+
+def _search_under_ingest_min_chunks(config: Mapping[str, Any]) -> int:
+    value = config.get("min_chunks_per_document", 1)
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            "scenario.search_under_ingest.min_chunks_per_document must be positive"
+        )
+    return value
+
+
+def _search_under_ingest_max_chunks(config: Mapping[str, Any]) -> int | None:
+    value = config.get("max_chunks_per_document")
+    if value is None:
+        return None
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            "scenario.search_under_ingest.max_chunks_per_document must be positive"
+        )
+    return value
+
+
+def _search_under_ingest_probe_queries_per_document(
+    config: Mapping[str, Any],
+) -> int:
+    value = config.get("probe_queries_per_document", 1)
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            "scenario.search_under_ingest.probe_queries_per_document "
+            "must be positive"
+        )
+    return value
+
+
+def _search_under_ingest_probe_concurrency(config: Mapping[str, Any]) -> int:
+    value = config.get("probe_concurrency", 1)
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            "scenario.search_under_ingest.probe_concurrency must be positive"
+        )
+    return value
+
+
+def _search_under_ingest_poll_until_visible(config: Mapping[str, Any]) -> bool:
+    value = config.get("poll_until_visible", False)
+    if not isinstance(value, bool):
+        raise ConfigError(
+            "scenario.search_under_ingest.poll_until_visible must be a boolean"
+        )
+    return value
+
+
+def _search_under_ingest_visibility_timeout_seconds(
+    config: Mapping[str, Any],
+) -> float:
+    value = config.get("visibility_timeout", "5s")
+    if not isinstance(value, str):
+        raise ConfigError(
+            "scenario.search_under_ingest.visibility_timeout must be a string"
+        )
+    return parse_duration_seconds(value)
+
+
+def _search_under_ingest_visibility_poll_interval_seconds(
+    config: Mapping[str, Any],
+) -> float:
+    value = config.get("visibility_poll_interval", "25ms")
+    if not isinstance(value, str):
+        raise ConfigError(
+            "scenario.search_under_ingest.visibility_poll_interval must be a string"
+        )
+    return parse_duration_seconds(value)
+
+
 def _query_stages(scenario: ScenarioConfig) -> list[dict[str, Any]] | None:
     stages = scenario.query.get("stages")
     if not stages:
@@ -3089,6 +3689,12 @@ def _rate(count: int, duration_seconds: float) -> float:
     if duration_seconds <= 0:
         return 0.0
     return count / duration_seconds
+
+
+def _ratio(count: int, total: int) -> float | None:
+    if total <= 0:
+        return None
+    return count / total
 
 
 def _error_rate(error_count: int, attempts: int) -> float:

@@ -1,0 +1,51 @@
+name: cohere-wikipedia-1m-search-under-ingest
+description: Cohere Wikipedia upload-and-ask read-after-write workload.
+workload: search_under_ingest
+
+dataset:
+  provider: huggingface
+  source: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+  subset: en
+  rows: 1000000
+  id_field: _id
+  vector_field: emb
+  text_field: text
+  dimensions: 1024
+  metric: cosine
+  seed: 20260511
+
+load:
+  write_mode: upsert
+  batch_size: 500
+  concurrency: 16
+  wait_until_query_visible: false
+
+query:
+  top_k: 10
+  query_count: 1000
+  query_source: heldout_dataset_vectors
+  consistency: eventual
+  include_vectors: false
+
+search_under_ingest:
+  pattern: upload_and_ask
+  probe_source: queries
+  document_group_field: url
+  max_probe_documents: 1000
+  duration: 10m
+  min_chunks_per_document: 1
+  max_chunks_per_document: 20
+  probe_queries_per_document: 1
+  probe_concurrency: 1
+  top_k: 10
+  consistency: strong
+  poll_until_visible: true
+  visibility_timeout: 5s
+  visibility_poll_interval: 25ms
+
+metrics:
+  latency_percentiles: [50, 95, 99]
+  include_qps: true
+  include_error_rate: true
+  include_recall: false
+  include_cost_estimates: true
