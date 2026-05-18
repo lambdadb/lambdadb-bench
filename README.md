@@ -295,17 +295,87 @@ The first implementation supports `probe_source: queries`,
 `bulk_upsert`, because this workload models interactive read-after-write
 behavior.
 
-Run it against an existing loaded collection:
+Follow this sequence for a first run with a 100k preloaded background corpus.
+The scenario still declares the full 1M Cohere Wikipedia source; `--limit
+100000` creates a smaller local dataset for this first run.
+
+1. Prepare local records and held-out probes.
+
+```bash
+uv run ldbbench dataset prepare \
+  --scenario scenarios/cohere-wikipedia-1m-search-under-ingest.yaml \
+  --limit 100000 \
+  --query-count 1000 \
+  --out data/datasets/cohere-wikipedia-search-under-ingest-100k
+```
+
+This writes 100k load records plus 1,000 held-out query/probe records. The
+search-under-ingest stage uses the held-out `queries.msgpack` rows as new
+document groups to upload and immediately query.
+
+2. Configure the target collection.
+
+Copy the target example for the database you want to test, then set a dedicated
+collection name. For a fresh preload, the target must create or recreate the
+collection:
+
+```bash
+cp configs/lambdadb.example.yaml configs/lambdadb-search-under-ingest.yaml
+```
+
+```yaml
+collection_name: cohere_wikipedia_search_under_ingest_100k
+
+prepare:
+  mode: create
+```
+
+Use `mode: recreate` only when you intentionally want to delete and rebuild an
+existing benchmark collection.
+
+3. Preload the 100k background corpus.
 
 ```bash
 uv run ldbbench run \
   --scenario scenarios/cohere-wikipedia-1m-search-under-ingest.yaml \
-  --target configs/lambdadb.example.yaml \
-  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --target configs/lambdadb-search-under-ingest.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-search-under-ingest-100k \
+  --max-records 100000 \
+  --load-only \
+  --out results/example-lambdadb-search-under-ingest-preload-100k
+```
+
+After this succeeds, change the same target config to `prepare.mode: existing`.
+`--query-only` requires `existing` so the runner does not create, recreate, or
+delete the collection before probing it.
+
+4. Run the search-under-ingest probes.
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m-search-under-ingest.yaml \
+  --target configs/lambdadb-search-under-ingest.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-search-under-ingest-100k \
   --query-only \
   --allow-large-run \
   --out results/example-lambdadb-search-under-ingest
 ```
+
+For this workload, `--query-only` skips only the background load stage. Each
+probe still upserts one held-out document group, immediately queries for it, and
+writes `search_under_ingest_events.jsonl`. `--allow-large-run` is still needed
+because the scenario declares a 1M-row dataset, even though the example preload
+uses only 100k background records.
+
+5. Check the result summary.
+
+```bash
+jq '.search_under_ingest' results/example-lambdadb-search-under-ingest/summary.json
+```
+
+The CLI prints the probe count and same-document hit rate. The full
+`summary.json` also includes exact-chunk hit rate, same-document recall, write
+latency, immediate query latency, and time-to-visible metrics.
 
 For LambdaDB, `search_under_ingest.consistency: strong` maps to
 `consistent_read=True`. Targets that do not declare a comparable portable
