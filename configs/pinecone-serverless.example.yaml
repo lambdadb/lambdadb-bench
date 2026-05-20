@@ -1,8 +1,7 @@
 vendor: pinecone
 name: pinecone-serverless-user-index
-endpoint: ${PINECONE_INDEX_HOST}
 api_key_env: PINECONE_API_KEY
-collection_name: cohere-wikipedia-1m
+collection_name: ${PINECONE_INDEX_NAME}
 region: us-east-1
 cloud: aws
 namespace: ""

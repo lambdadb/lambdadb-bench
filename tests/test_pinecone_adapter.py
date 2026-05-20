@@ -108,7 +108,6 @@ def make_target(**overrides: Any) -> TargetConfig:
     data = {
         "vendor": "pinecone",
         "name": "pinecone-ci",
-        "endpoint": "https://index-host.pinecone.io",
         "api_key_env": "PINECONE_API_KEY",
         "collection_name": "smoke-index",
         "region": "us-east-1",
@@ -137,7 +136,7 @@ def test_check_validates_pinecone_metadata_without_requiring_api_key() -> None:
 
     assert result.ok
     assert result.details["index_name"] == "smoke-index"
-    assert result.details["index_host_present"] is True
+    assert result.details["index_host_present"] is False
     assert result.details["api_key_present"] is False
     assert result.details["namespace"] == "bench"
 
@@ -185,6 +184,18 @@ def test_adapter_reuses_client_and_index_for_same_target() -> None:
     adapter.fetch(target, ids=["a"], consistency="eventual")
 
     assert len(clients) == 1
+    assert client.index_calls == [{"name": "smoke-index"}]
+
+
+def test_adapter_can_use_explicit_index_host_when_configured() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    adapter.upsert_batch(
+        make_target(endpoint="https://index-host.pinecone.io"),
+        [{"id": "a", "vector": [0.1], "metadata": {}}],
+    )
+
     assert client.index_calls == [{"host": "https://index-host.pinecone.io"}]
 
 
@@ -247,7 +258,7 @@ def test_upsert_batch_maps_normalized_records_to_vectors() -> None:
     )
 
     assert result.count == 2
-    assert client.index_calls == [{"host": "https://index-host.pinecone.io"}]
+    assert client.index_calls == [{"name": "smoke-index"}]
     assert client.index.upserts == [
         {
             "vectors": [
@@ -276,7 +287,7 @@ def test_query_uses_eventual_consistency() -> None:
     assert result.matches[0].document == {"id": "a", "text": "alpha"}
     assert client.index_calls == [
         {
-            "host": "https://index-host.pinecone.io",
+            "name": "smoke-index",
             "pool_threads": 10,
             "connection_pool_maxsize": 20,
         }
@@ -310,7 +321,7 @@ def test_fetch_returns_documents_by_id() -> None:
     adapter = make_adapter(client)
 
     docs = adapter.fetch(
-        make_target(endpoint=None),
+        make_target(),
         ids=["a", "b"],
         consistency="eventual",
         include_vectors=True,
@@ -349,7 +360,6 @@ def test_pinecone_integration_existing_index_check() -> None:
         {
             "vendor": "pinecone",
             "name": "pinecone-integration",
-            "endpoint": os.getenv("PINECONE_INDEX_HOST"),
             "api_key_env": "PINECONE_API_KEY",
             "collection_name": os.environ["PINECONE_INDEX_NAME"],
             "region": os.getenv("PINECONE_REGION", "us-east-1"),

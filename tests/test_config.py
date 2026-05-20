@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from ldbbench.config import (
@@ -158,6 +160,28 @@ partition_config:
         "data_type": "keyword",
         "num_partitions": 16,
     }
+
+
+def test_example_targets_load_collection_names_from_env(monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("LAMBDADB_ENDPOINT", "https://api.lambdadb.ai")
+    monkeypatch.setenv("LAMBDADB_PROJECT_NAME", "demo")
+    monkeypatch.setenv("LAMBDADB_COLLECTION_NAME", "lambda-demo")
+    monkeypatch.setenv("QDRANT_ENDPOINT", "https://example.qdrant.io")
+    monkeypatch.setenv("QDRANT_COLLECTION_NAME", "qdrant-demo")
+    monkeypatch.setenv("PINECONE_INDEX_NAME", "pinecone-demo")
+
+    lambdadb = load_target(repo_root / "configs/lambdadb.example.yaml")
+    lambdadb_partitioned = load_target(
+        repo_root / "configs/lambdadb-partitioned.example.yaml"
+    )
+    qdrant = load_target(repo_root / "configs/qdrant-cloud.example.yaml")
+    pinecone = load_target(repo_root / "configs/pinecone-serverless.example.yaml")
+
+    assert lambdadb.collection_name == "lambda-demo"
+    assert lambdadb_partitioned.collection_name == "lambda-demo"
+    assert qdrant.collection_name == "qdrant-demo"
+    assert pinecone.collection_name == "pinecone-demo"
 
 
 def test_conflicting_collection_names_fail(tmp_path) -> None:

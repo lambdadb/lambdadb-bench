@@ -3,7 +3,7 @@ name: lambdadb-user-project-partitioned
 endpoint: ${LAMBDADB_ENDPOINT}
 project_name: ${LAMBDADB_PROJECT_NAME}
 api_key_env: LAMBDADB_API_KEY
-collection_name: cohere_wikipedia_1m_partitioned
+collection_name: ${LAMBDADB_COLLECTION_NAME}
 vector_field: vector
 region: us-east-1
 

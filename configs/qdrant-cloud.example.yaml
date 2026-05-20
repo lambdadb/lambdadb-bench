@@ -2,7 +2,7 @@ vendor: qdrant
 name: qdrant-cloud-user-cluster
 endpoint: ${QDRANT_ENDPOINT}
 api_key_env: QDRANT_API_KEY
-collection_name: cohere_wikipedia_1m
+collection_name: ${QDRANT_COLLECTION_NAME}
 region: us-east-1
 prefer_grpc: true
 

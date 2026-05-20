@@ -99,6 +99,7 @@ For LambdaDB, set:
 ```bash
 export LAMBDADB_ENDPOINT=https://api.lambdadb.ai
 export LAMBDADB_PROJECT_NAME=your-project
+export LAMBDADB_COLLECTION_NAME=your-collection
 export LAMBDADB_API_KEY=...
 ```
 
@@ -106,13 +107,14 @@ For Qdrant Cloud, set:
 
 ```bash
 export QDRANT_ENDPOINT=https://example.qdrant.io
+export QDRANT_COLLECTION_NAME=your-collection
 export QDRANT_API_KEY=...
 ```
 
 For Pinecone Serverless, set:
 
 ```bash
-export PINECONE_INDEX_HOST=https://example-index.svc.us-east-1-aws.pinecone.io
+export PINECONE_INDEX_NAME=your-index
 export PINECONE_API_KEY=...
 ```
 
