@@ -187,6 +187,40 @@ def test_adapter_reuses_client_and_index_for_same_target() -> None:
     assert client.index_calls == [{"name": "smoke-index"}]
 
 
+def test_adapter_passes_connection_pool_maxsize_to_client() -> None:
+    client = FakeClient()
+    client_kwargs: list[dict[str, Any]] = []
+
+    def factory(**kwargs: Any) -> FakeClient:
+        client_kwargs.append(kwargs)
+        return client
+
+    adapter = PineconeAdapter(
+        client_factory=factory,
+        environ={"PINECONE_API_KEY": "secret"},
+    )
+
+    adapter.query(
+        make_target(
+            pool_threads=10,
+            connection_pool_maxsize=20,
+            timeout=5.0,
+        ),
+        vector=[0.1],
+        top_k=1,
+        consistency="eventual",
+    )
+
+    assert client_kwargs == [
+        {
+            "api_key": "secret",
+            "timeout": 5.0,
+            "connection_pool_maxsize": 20,
+        }
+    ]
+    assert client.index_calls == [{"name": "smoke-index", "pool_threads": 10}]
+
+
 def test_adapter_can_use_explicit_index_host_when_configured() -> None:
     client = FakeClient()
     adapter = make_adapter(client)
@@ -289,7 +323,6 @@ def test_query_uses_eventual_consistency() -> None:
         {
             "name": "smoke-index",
             "pool_threads": 10,
-            "connection_pool_maxsize": 20,
         }
     ]
     assert client.index.queries == [

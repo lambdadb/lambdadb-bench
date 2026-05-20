@@ -220,7 +220,7 @@ class PineconeAdapter:
 
     def _client(self, settings: PineconeTargetSettings) -> Any:
         api_key = _api_key(settings, self._environ)
-        cache_key = (api_key, settings.timeout)
+        cache_key = (api_key, settings.timeout, settings.connection_pool_maxsize)
         with self._client_lock:
             client = self._clients.get(cache_key)
             if client is not None:
@@ -238,6 +238,8 @@ class PineconeAdapter:
         kwargs: dict[str, Any] = {"api_key": api_key}
         if settings.timeout is not None:
             kwargs["timeout"] = settings.timeout
+        if settings.connection_pool_maxsize is not None:
+            kwargs["connection_pool_maxsize"] = settings.connection_pool_maxsize
         return self._client_factory(**kwargs)
 
     def _index(self, settings: PineconeTargetSettings) -> Any:
@@ -262,8 +264,6 @@ class PineconeAdapter:
         kwargs: dict[str, Any] = {}
         if settings.pool_threads is not None:
             kwargs["pool_threads"] = settings.pool_threads
-        if settings.connection_pool_maxsize is not None:
-            kwargs["connection_pool_maxsize"] = settings.connection_pool_maxsize
         client = self._client(settings)
         if settings.index_host:
             return client.Index(host=settings.index_host, **kwargs)
