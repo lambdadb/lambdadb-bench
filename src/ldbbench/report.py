@@ -368,13 +368,22 @@ def _search_under_ingest_rows(runs: list[RunReport]) -> list[dict[str, str]]:
         if not search or search.get("mode") == "skipped":
             continue
         write_latency = _mapping(search.get("write_latency_ms"))
-        query_latency = _mapping(search.get("immediate_query_latency_ms"))
+        query_latency = _mapping(
+            search.get("immediate_query_latency_ms") or search.get("query_latency_ms")
+        )
         visible_latency = _mapping(search.get("time_to_visible_ms"))
         rows.append(
             {
                 "result_dir": str(run.path),
                 "target": _target_label(run),
+                "pattern": _fmt(search.get("pattern")),
                 "consistency": _fmt(search.get("consistency")),
+                "records": _fmt(search.get("records")),
+                "records_per_second": _fmt_float(search.get("records_per_second")),
+                "queries": _fmt(search.get("queries")),
+                "queries_per_second": _fmt_float(search.get("queries_per_second")),
+                "ingest_concurrency": _fmt(search.get("ingest_concurrency")),
+                "query_concurrency": _fmt(search.get("query_concurrency")),
                 "probe_documents": _fmt(search.get("probe_documents")),
                 "probe_chunks": _fmt(search.get("probe_chunks")),
                 "same_document_hit_rate_at_k": _fmt_float(
@@ -389,6 +398,7 @@ def _search_under_ingest_rows(runs: list[RunReport]) -> list[dict[str, str]]:
                 "write_p95_ms": _fmt_float(write_latency.get("p95")),
                 "query_p95_ms": _fmt_float(query_latency.get("p95")),
                 "visible_p95_ms": _fmt_float(visible_latency.get("p95")),
+                "recall_at_k": _fmt_float(search.get("recall_at_k")),
                 "errors": _fmt(search.get("errors")),
                 "error_rate": _fmt_float(search.get("error_rate")),
             }

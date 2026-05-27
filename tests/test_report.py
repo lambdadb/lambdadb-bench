@@ -59,6 +59,48 @@ def test_generate_report_writes_markdown_and_csv(tmp_path) -> None:
     assert query_rows[1]["queries_per_second"] == "700.000"
 
 
+def test_generate_report_includes_parallel_search_under_ingest(tmp_path) -> None:
+    result_dir = write_result(
+        tmp_path,
+        "parallel",
+        target_label="lambdadb-parallel",
+        vendor="lambdadb",
+        load_rps=1200.0,
+        query_qps=700.0,
+    )
+    summary_path = result_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["search_under_ingest"] = {
+        "mode": "search_under_ingest",
+        "pattern": "parallel_upsert_query",
+        "consistency": "eventual",
+        "records": 100000,
+        "records_per_second": 1200.0,
+        "queries": 30000,
+        "queries_per_second": 700.0,
+        "ingest_concurrency": 16,
+        "query_concurrency": 16,
+        "write_latency_ms": {"p95": 42.0},
+        "query_latency_ms": {"p95": 51.5},
+        "recall_at_k": 0.98,
+        "errors": 0,
+        "error_rate": 0.0,
+    }
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = generate_report(
+        [result_dir],
+        output_path=tmp_path / "reports" / "parallel.md",
+    )
+
+    markdown = result.markdown_path.read_text(encoding="utf-8")
+    assert "parallel_upsert_query" in markdown
+    assert "records_per_second" in markdown
+    assert "queries_per_second" in markdown
+    assert "1200.000" in markdown
+    assert "700.000" in markdown
+
+
 def test_generate_report_rejects_missing_manifest(tmp_path) -> None:
     result_dir = tmp_path / "empty-result"
     result_dir.mkdir()

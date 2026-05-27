@@ -456,14 +456,28 @@ def run_benchmark(args: argparse.Namespace) -> int:
             print(f"recall_at_k: {result.summary['query']['recall_at_k']}")
         if "search_under_ingest" in result.summary:
             search_summary = result.summary["search_under_ingest"]
-            print(
-                "search_under_ingest_probe_documents: "
-                f"{search_summary['probe_documents']}"
-            )
-            print(
-                "search_under_ingest_same_document_hit_rate_at_k: "
-                f"{search_summary['read_after_write_same_document_hit_rate_at_k']}"
-            )
+            pattern = search_summary.get("pattern")
+            print(f"search_under_ingest_pattern: {pattern}")
+            if pattern == "parallel_upsert_query":
+                print(f"search_under_ingest_records: {search_summary['records']}")
+                print(f"search_under_ingest_queries: {search_summary['queries']}")
+                print(
+                    "search_under_ingest_records_per_second: "
+                    f"{search_summary['records_per_second']}"
+                )
+                print(
+                    "search_under_ingest_queries_per_second: "
+                    f"{search_summary['queries_per_second']}"
+                )
+            else:
+                print(
+                    "search_under_ingest_probe_documents: "
+                    f"{search_summary['probe_documents']}"
+                )
+                print(
+                    "search_under_ingest_same_document_hit_rate_at_k: "
+                    f"{search_summary['read_after_write_same_document_hit_rate_at_k']}"
+                )
         print(f"wrote {result.ingest_events_path}")
         print(f"wrote {result.query_events_path}")
         if result.search_under_ingest_events_path.exists():

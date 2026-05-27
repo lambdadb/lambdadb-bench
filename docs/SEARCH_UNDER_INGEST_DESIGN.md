@@ -112,17 +112,21 @@ The first implementation can run document-set probes sequentially or with low
 controlled concurrency. Higher-concurrency search-under-ingest can be a follow-up
 once the metric contract is stable.
 
-### 3. Optional Background Ingest
+### 3. Concurrent Upsert/Query Load
 
-After the immediate probe loop is working, add optional background ingest:
+The parallel workload pattern measures query behavior while writes are actively
+running:
 
-- A background writer continuously upserts small batches from another held-out
-  stream.
-- Foreground probes continue to write one held-out document set and immediately
-  query it.
+- Writer workers continuously upsert batches from `records.msgpack`.
+- Query workers continuously query held-out `queries.msgpack` vectors.
+- Both streams run until the configured duration is reached or the record
+  stream is exhausted, whichever happens first.
+- The runner records write latency, records/s, query latency, queries/s, errors,
+  and recall when ground truth is available.
 
-This separates "visibility after my document upload" from generic load
-throughput.
+This pattern is different from upload-and-ask. It does not prove
+read-after-write visibility for a specific just-written document set; it measures
+serving behavior under active ingest.
 
 ## Scenario Configuration
 
@@ -152,6 +156,18 @@ search_under_ingest:
   visibility_poll_interval: 25ms
   background_ingest:
     enabled: false
+```
+
+For concurrent upsert/query load, use:
+
+```yaml
+search_under_ingest:
+  pattern: parallel_upsert_query
+  duration: 10m
+  ingest_concurrency: 16
+  query_concurrency: 16
+  top_k: 10
+  consistency: eventual
 ```
 
 For LambdaDB, `consistency: strong` maps to `consistent_read=True`.

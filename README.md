@@ -268,7 +268,9 @@ Real runs write:
 - `load_checkpoint.json`: resumable load watermark and matching load context.
 - `query_events.jsonl`: one event per query attempt, including query errors.
 - `search_under_ingest_events.jsonl`: one event per upload-and-ask probe when
-  `workload: search_under_ingest` is used.
+  `search_under_ingest.pattern: upload_and_ask` is used. Parallel
+  upsert/query runs write their operation events to `ingest_events.jsonl` and
+  `query_events.jsonl`.
 - `summary.json`: load/query counts, latency percentiles, QPS, per-stage query
   summaries, load batching/upsert timing, error rates, recall when
   `ground_truth.jsonl` is present, and search-under-ingest metrics when
@@ -292,7 +294,15 @@ from normal FAISS recall:
 - `immediate_query_latency_ms`
 - `time_to_visible_ms`
 
-The first implementation supports `probe_source: queries`,
+There are two search-under-ingest patterns:
+
+- `upload_and_ask`: upserts one held-out document group, then immediately
+  queries for that same group. This is the read-after-write visibility check.
+- `parallel_upsert_query`: runs upsert workers and query workers at the same
+  time until the configured duration or record stream is exhausted. This is the
+  concurrent ingest/query load workload.
+
+The `upload_and_ask` implementation supports `probe_source: queries`,
 `probe_concurrency: 1`, and `probe_queries_per_document: 1`. Use `upsert`, not
 `bulk_upsert`, because this workload models interactive read-after-write
 behavior.
@@ -382,6 +392,23 @@ latency, immediate query latency, and time-to-visible metrics.
 For LambdaDB, `search_under_ingest.consistency: strong` maps to
 `consistent_read=True`. Targets that do not declare a comparable portable
 strong read-after-write query guarantee plan strong variants as `N/A`.
+
+To run concurrent upserts and queries instead, use the parallel scenario:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m-parallel-search-under-ingest.yaml \
+  --target configs/lambdadb.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-search-under-ingest-100k \
+  --max-records 100000 \
+  --allow-large-run \
+  --out results/example-lambdadb-parallel-search-under-ingest
+```
+
+The parallel pattern writes upsert events to `ingest_events.jsonl`, query events
+to `query_events.jsonl`, and a `search_under_ingest` summary with concurrent
+records/s, queries/s, write latency, query latency, and recall when ground truth
+is available.
 
 Combine one or more run directories into Markdown and CSV report artifacts:
 

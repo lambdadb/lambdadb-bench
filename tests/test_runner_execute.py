@@ -578,6 +578,130 @@ def test_execute_benchmark_runs_search_under_ingest_upload_and_ask(tmp_path) -> 
     assert result.query_events_path.read_text(encoding="utf-8") == ""
 
 
+def test_execute_benchmark_runs_parallel_search_under_ingest(tmp_path) -> None:
+    scenario = make_scenario(
+        rows=4,
+        batch_size=2,
+        load_concurrency=2,
+        workload="search_under_ingest",
+        search_under_ingest={
+            "pattern": "parallel_upsert_query",
+            "duration": "50ms",
+            "ingest_concurrency": 2,
+            "query_concurrency": 2,
+            "top_k": 2,
+            "consistency": "eventual",
+        },
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_dataset(
+        scenario=scenario,
+        output_dir=tmp_path / "dataset",
+        limit=4,
+        query_count=2,
+        source_rows=[
+            {"_id": "q1", "emb": [1.0, 0.0], "text": "query one"},
+            {"_id": "q2", "emb": [0.0, 1.0], "text": "query two"},
+            {"_id": "a", "emb": [1.0, 0.0], "text": "alpha"},
+            {"_id": "b", "emb": [0.0, 1.0], "text": "beta"},
+            {"_id": "c", "emb": [0.8, 0.2], "text": "gamma"},
+            {"_id": "d", "emb": [0.2, 0.8], "text": "delta"},
+        ],
+    )
+    adapter = FakeAdapter(load_delay_seconds=0.005, query_delay_seconds=0.001)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+    )
+
+    ingest_events = [
+        json.loads(line)
+        for line in result.ingest_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result.summary["status"] == "completed"
+    assert result.summary["workload"] == "search_under_ingest"
+    assert result.summary["search_under_ingest"]["pattern"] == "parallel_upsert_query"
+    assert result.summary["load"]["records"] == 4
+    assert result.summary["load"]["concurrency"] == 2
+    assert result.summary["query"]["mode"] == "parallel_under_ingest"
+    assert result.summary["query"]["queries"] > 0
+    assert result.summary["search_under_ingest"]["queries"] == len(query_events)
+    assert result.summary["search_under_ingest"]["records"] == 4
+    assert len(ingest_events) == 2
+    assert {event["query_stage_index"] for event in query_events} == {1}
+    assert result.search_under_ingest_events_path.read_text(encoding="utf-8") == ""
+
+
+def test_parallel_search_under_ingest_rejects_sharded_load(tmp_path) -> None:
+    scenario = make_scenario(
+        workload="search_under_ingest",
+        sharded_records=True,
+        search_under_ingest={
+            "pattern": "parallel_upsert_query",
+            "duration": "50ms",
+            "ingest_concurrency": 1,
+            "query_concurrency": 1,
+            "top_k": 2,
+            "consistency": "eventual",
+        },
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    optimize_dataset(dataset_dir=dataset.output_dir, shards=2)
+
+    with pytest.raises(ConfigError, match="sharded_records"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+        )
+
+
+def test_parallel_search_under_ingest_requires_queries(tmp_path) -> None:
+    scenario = make_scenario(
+        workload="search_under_ingest",
+        search_under_ingest={
+            "pattern": "parallel_upsert_query",
+            "duration": "50ms",
+            "ingest_concurrency": 1,
+            "query_concurrency": 1,
+            "top_k": 2,
+            "consistency": "eventual",
+        },
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario, query_count=0)
+
+    with pytest.raises(ConfigError, match="at least one query record"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+        )
+
+
 def test_read_records_uses_msgpack_estimated_size(tmp_path) -> None:
     dataset = prepare_fixture_dataset(tmp_path, make_scenario())
 

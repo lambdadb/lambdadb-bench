@@ -93,6 +93,41 @@ search_under_ingest:
     assert scenario.search_under_ingest["consistency"] == "strong"
 
 
+def test_load_scenario_accepts_parallel_search_under_ingest_pattern(
+    tmp_path,
+) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: parallel-search-under-ingest
+workload: search_under_ingest
+dataset:
+  rows: 1000000
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  top_k: 10
+search_under_ingest:
+  pattern: parallel_upsert_query
+  duration: 5m
+  ingest_concurrency: 8
+  query_concurrency: 16
+  top_k: 10
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+
+    scenario = load_scenario(scenario_path)
+
+    assert scenario.workload == "search_under_ingest"
+    assert scenario.search_under_ingest["pattern"] == "parallel_upsert_query"
+    assert scenario.search_under_ingest["ingest_concurrency"] == 8
+    assert scenario.search_under_ingest["query_concurrency"] == 16
+
+
 def test_load_target_expands_env_and_redacts_secrets(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("QDRANT_ENDPOINT", "https://example.qdrant.io")
     target_path = tmp_path / "target.yaml"

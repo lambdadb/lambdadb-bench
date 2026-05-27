@@ -220,6 +220,87 @@ def execute_benchmark(
     )
     ticker.emit("run: target prepared")
 
+    if (
+        workload == "search_under_ingest"
+        and _search_under_ingest_pattern(scenario.search_under_ingest)
+        == "parallel_upsert_query"
+    ):
+        if load_only:
+            raise ConfigError(
+                "--load-only cannot be used with "
+                "search_under_ingest.pattern: parallel_upsert_query"
+            )
+        if query_only:
+            raise ConfigError(
+                "--query-only cannot be used with "
+                "search_under_ingest.pattern: parallel_upsert_query"
+            )
+        if resume_load:
+            raise ConfigError(
+                "--resume-load cannot be used with "
+                "search_under_ingest.pattern: parallel_upsert_query"
+            )
+        if scenario.load.get("sharded_records", False):
+            raise ConfigError(
+                "search_under_ingest.pattern: parallel_upsert_query does not "
+                "support load.sharded_records yet"
+            )
+        ticker.emit("run: loading parallel search-under-ingest query vectors")
+        queries = list(read_records(queries_path, limit=max_queries))
+        search_under_ingest_events_path.write_text("", encoding="utf-8")
+        ingest_summary, query_summary, search_under_ingest_summary = (
+            run_parallel_search_under_ingest_stage(
+                adapter=adapter,
+                target=target,
+                records=read_records(records_path, limit=max_records),
+                record_source_path=records_path,
+                queries=queries,
+                ground_truth=ground_truth,
+                config=scenario.search_under_ingest,
+                default_top_k=_top_k(scenario),
+                default_consistency=str(scenario.query.get("consistency", "eventual")),
+                write_mode=str(scenario.load.get("write_mode")),
+                batch_size=_batch_size(scenario),
+                max_batch_bytes=_max_batch_bytes(scenario),
+                default_ingest_concurrency=_load_concurrency(scenario),
+                default_query_concurrency=_parallel_default_query_concurrency(
+                    scenario,
+                ),
+                include_vectors=bool(scenario.query.get("include_vectors", False)),
+                ingest_events_path=ingest_events_path,
+                query_events_path=query_events_path,
+                progress=progress,
+            )
+        )
+        summary = {
+            "status": run_status(
+                load_summary=ingest_summary,
+                query_summary=query_summary,
+                search_under_ingest_summary=search_under_ingest_summary,
+            ),
+            "run_manifest": str(paths.run_manifest),
+            "dataset_dir": str(dataset_path),
+            "ground_truth": str(truth_path) if truth_path.exists() else None,
+            "load": ingest_summary,
+            "query": query_summary,
+            "workload": workload,
+            "search_under_ingest": search_under_ingest_summary,
+        }
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        ticker.emit(f"run: wrote summary status={summary['status']}")
+        return BenchmarkRunResult(
+            output_dir=out,
+            ingest_events_path=ingest_events_path,
+            query_events_path=query_events_path,
+            search_under_ingest_events_path=search_under_ingest_events_path,
+            load_checkpoint_path=load_checkpoint_path,
+            summary_path=summary_path,
+            summary=summary,
+        )
+
     if query_only:
         ticker.emit("run: skipping load query_only=true")
         ingest_events_path.write_text("", encoding="utf-8")
@@ -2845,6 +2926,301 @@ def wait_until_query_visible(
     return summary
 
 
+def run_parallel_search_under_ingest_stage(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    records: Iterable[VectorRecord],
+    record_source_path: str | Path | None,
+    queries: Sequence[VectorRecord],
+    ground_truth: Mapping[str, list[str]],
+    config: Mapping[str, Any],
+    default_top_k: int,
+    default_consistency: str,
+    write_mode: str,
+    batch_size: int,
+    max_batch_bytes: int | None,
+    default_ingest_concurrency: int,
+    default_query_concurrency: int,
+    include_vectors: bool,
+    ingest_events_path: str | Path,
+    query_events_path: str | Path,
+    progress: ProgressCallback | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ingest_concurrency = _search_under_ingest_ingest_concurrency(
+        config,
+        default_concurrency=default_ingest_concurrency,
+    )
+    query_concurrency = _search_under_ingest_query_concurrency(
+        config,
+        default_concurrency=default_query_concurrency,
+    )
+    top_k = _search_under_ingest_top_k(config, default_top_k=default_top_k)
+    consistency = _search_under_ingest_consistency(
+        config,
+        default_consistency=default_consistency,
+    )
+    duration_seconds = _search_under_ingest_duration_seconds(config)
+    deadline = (
+        time.perf_counter() + duration_seconds
+        if duration_seconds is not None
+        else None
+    )
+    query_list = list(queries)
+    if not query_list:
+        raise ConfigError(
+            "search_under_ingest.pattern: parallel_upsert_query requires at "
+            "least one query record"
+        )
+    ingest_output = Path(ingest_events_path)
+    query_output = Path(query_events_path)
+    ingest_output.parent.mkdir(parents=True, exist_ok=True)
+    query_output.parent.mkdir(parents=True, exist_ok=True)
+
+    load_latencies: list[float] = []
+    load_attempt_latencies: list[float] = []
+    query_state = QueryRunState()
+    load_state = {
+        "records_loaded": 0,
+        "records_read": 0,
+        "successful_batches": 0,
+        "attempted_batches": 0,
+        "load_errors": 0,
+        "batching_duration_seconds": 0.0,
+        "upsert_attempt_duration_seconds": 0.0,
+    }
+    next_query_index = 1
+    stop_queries = Event()
+    load_lock = Lock()
+    query_lock = Lock()
+    query_index_lock = Lock()
+    task_queue: Queue[tuple[int, list[VectorRecord], float] | None] = Queue(
+        maxsize=max(1, ingest_concurrency * 2),
+    )
+    started = time.perf_counter()
+    ticker = ProgressTicker(progress)
+    ticker.emit(
+        "search_under_ingest: starting parallel_upsert_query "
+        f"ingest_concurrency={ingest_concurrency} "
+        f"query_concurrency={query_concurrency} top_k={top_k} "
+        f"consistency={consistency}"
+    )
+
+    def deadline_reached() -> bool:
+        return deadline is not None and time.perf_counter() >= deadline
+
+    def reader() -> None:
+        try:
+            batch_iter = enumerate(
+                _batches(records, batch_size, max_batch_bytes=max_batch_bytes),
+                start=1,
+            )
+            while not deadline_reached():
+                item = _next_load_batch(batch_iter)
+                if item is None:
+                    break
+                batch_index, batch, batching_duration = item
+                with load_lock:
+                    load_state["records_read"] += len(batch)
+                    load_state["batching_duration_seconds"] += batching_duration
+                task_queue.put((batch_index, batch, batching_duration))
+        finally:
+            for _ in range(ingest_concurrency):
+                task_queue.put(None)
+
+    def ingest_worker() -> None:
+        while True:
+            item = task_queue.get()
+            try:
+                if item is None:
+                    return
+                batch_index, batch, _batching_duration = item
+                event = execute_load_batch(
+                    adapter=adapter,
+                    target=target,
+                    batch=batch,
+                    batch_index=batch_index,
+                    write_mode=write_mode,
+                )
+                with load_lock:
+                    _write_event(
+                        ingest_file,
+                        event,
+                        flush=False,
+                        sort_keys=False,
+                    )
+                    event_latency = float(event["latency_ms"])
+                    load_attempt_latencies.append(event_latency)
+                    load_state["attempted_batches"] += 1
+                    load_state["upsert_attempt_duration_seconds"] += (
+                        event_latency / 1000
+                    )
+                    if event["status"] == "ok":
+                        load_state["successful_batches"] += 1
+                        load_state["records_loaded"] += int(event["records"])
+                        load_latencies.append(event_latency)
+                    else:
+                        load_state["load_errors"] += 1
+                    ticker.maybe(
+                        "search_under_ingest: parallel progress "
+                        f"records={load_state['records_loaded']} "
+                        f"queries={query_state.queries} "
+                        f"load_errors={load_state['load_errors']} "
+                        f"query_errors={query_state.errors}"
+                    )
+            finally:
+                task_queue.task_done()
+
+    def query_worker(worker_index: int) -> None:
+        nonlocal next_query_index
+        if not query_list:
+            return
+        while not stop_queries.is_set() and not deadline_reached():
+            with query_index_lock:
+                query_index = next_query_index
+                query = query_list[(query_index - 1) % len(query_list)]
+                next_query_index += 1
+            event = execute_query_once(
+                adapter=adapter,
+                target=target,
+                query=query,
+                query_index=query_index,
+                query_stage_index=1,
+                worker_index=worker_index,
+                top_k=top_k,
+                consistency=consistency,
+                include_vectors=include_vectors,
+                ground_truth=ground_truth,
+                partition_filter_spec=None,
+            )
+            with query_lock:
+                query_state.record(event)
+                _write_event(query_file, event, flush=False, sort_keys=False)
+
+    with (
+        ingest_output.open("w", encoding="utf-8") as ingest_file,
+        query_output.open("w", encoding="utf-8") as query_file,
+    ):
+        reader_thread = Thread(target=reader, name="search-under-ingest-reader")
+        reader_thread.start()
+        with ThreadPoolExecutor(
+            max_workers=ingest_concurrency + query_concurrency,
+        ) as executor:
+            ingest_futures = [
+                executor.submit(ingest_worker) for _ in range(ingest_concurrency)
+            ]
+            query_futures = [
+                executor.submit(query_worker, index)
+                for index in range(1, query_concurrency + 1)
+            ]
+            reader_thread.join()
+            for future in ingest_futures:
+                future.result()
+            stop_queries.set()
+            for future in query_futures:
+                future.result()
+        ingest_file.flush()
+        query_file.flush()
+
+    duration = time.perf_counter() - started
+    records_loaded = int(load_state["records_loaded"])
+    records_read = int(load_state["records_read"])
+    successful_batches = int(load_state["successful_batches"])
+    attempted_batches = int(load_state["attempted_batches"])
+    load_errors = int(load_state["load_errors"])
+    batching_duration_seconds = float(load_state["batching_duration_seconds"])
+    upsert_attempt_duration_seconds = float(
+        load_state["upsert_attempt_duration_seconds"],
+    )
+    load_summary = {
+        "status": "completed" if load_errors == 0 else "failed",
+        "records": records_loaded,
+        "records_read": records_read,
+        "write_mode": write_mode,
+        "skipped_records": 0,
+        "batches": successful_batches,
+        "skipped_batches": 0,
+        "attempts": attempted_batches,
+        "errors": load_errors,
+        "error_rate": _error_rate(load_errors, attempted_batches),
+        "concurrency": ingest_concurrency,
+        "processes": 1,
+        "worker_threads_per_process": [ingest_concurrency],
+        "checkpoint": {
+            "path": None,
+            "resume_enabled": False,
+            "resumed_from_batch_index": 0,
+            "highest_contiguous_successful_batch_index": successful_batches,
+        },
+        "duration_seconds": duration,
+        "batching_duration_seconds": batching_duration_seconds,
+        "upsert_attempt_duration_seconds": upsert_attempt_duration_seconds,
+        "records_per_second": _rate(records_loaded, duration),
+        "batching_records_per_second": _rate(
+            records_read,
+            batching_duration_seconds,
+        ),
+        "attempts_per_second": _rate(attempted_batches, duration),
+        "latency_ms": latency_summary(load_latencies),
+        "attempt_latency_ms": latency_summary(load_attempt_latencies),
+        "record_source": _record_source_summary(record_source_path),
+    }
+    query_summary = _query_summary(
+        mode="parallel_under_ingest",
+        started=started,
+        latencies=query_state.latencies,
+        recalls=query_state.recalls,
+        query_count=query_state.queries,
+        error_count=query_state.errors,
+        processes=1,
+        stage_summaries=[
+            _query_stage_summary(
+                stage_index=1,
+                concurrency=query_concurrency,
+                processes=1,
+                worker_threads_per_process=[query_concurrency],
+                configured_duration_seconds=duration_seconds or duration,
+                elapsed_seconds=duration,
+                state=query_state,
+                partition_filter_spec=None,
+            ),
+        ],
+    )
+    search_summary = {
+        "mode": "search_under_ingest",
+        "pattern": "parallel_upsert_query",
+        "duration_seconds": duration,
+        "configured_duration_seconds": duration_seconds,
+        "ingest_concurrency": ingest_concurrency,
+        "query_concurrency": query_concurrency,
+        "top_k": top_k,
+        "consistency": consistency,
+        "write_mode": write_mode,
+        "records": records_loaded,
+        "batches": successful_batches,
+        "queries": query_state.queries,
+        "load_errors": load_errors,
+        "query_errors": query_state.errors,
+        "errors": load_errors + query_state.errors,
+        "error_rate": _error_rate(
+            load_errors + query_state.errors,
+            attempted_batches + query_state.queries + query_state.errors,
+        ),
+        "records_per_second": _rate(records_loaded, duration),
+        "queries_per_second": _rate(query_state.queries, duration),
+        "write_latency_ms": latency_summary(load_latencies),
+        "query_latency_ms": latency_summary(query_state.latencies),
+        "recall_at_k": _mean(query_state.recalls) if query_state.recalls else None,
+        "recall_samples": len(query_state.recalls),
+    }
+    ticker.emit(
+        "search_under_ingest: finished parallel_upsert_query "
+        f"records={records_loaded} queries={query_state.queries} "
+        f"errors={search_summary['errors']}"
+    )
+    return load_summary, query_summary, search_summary
+
+
 def run_status(
     *,
     load_summary: Mapping[str, Any],
@@ -3295,6 +3671,13 @@ def _query_processes(scenario: ScenarioConfig) -> int:
     return processes
 
 
+def _parallel_default_query_concurrency(scenario: ScenarioConfig) -> int:
+    stages = _query_stages(scenario)
+    if stages:
+        return _stage_concurrency(stages[0], stage_index=1)
+    return 1
+
+
 def _effective_process_count(processes: int, concurrency: int) -> int:
     return max(1, min(processes, concurrency))
 
@@ -3401,11 +3784,47 @@ def _search_under_ingest_probe_source(config: Mapping[str, Any]) -> str:
     return str(value)
 
 
+def _search_under_ingest_pattern(config: Mapping[str, Any]) -> str:
+    value = config.get("pattern", "upload_and_ask")
+    if value not in {"upload_and_ask", "parallel_upsert_query"}:
+        raise ConfigError(
+            "scenario.search_under_ingest.pattern must be 'upload_and_ask' "
+            "or 'parallel_upsert_query'"
+        )
+    return str(value)
+
+
 def _search_under_ingest_group_field(config: Mapping[str, Any]) -> str:
     value = config.get("document_group_field", "url")
     if not isinstance(value, str) or not value:
         raise ConfigError(
             "scenario.search_under_ingest.document_group_field must be a string"
+        )
+    return value
+
+
+def _search_under_ingest_ingest_concurrency(
+    config: Mapping[str, Any],
+    *,
+    default_concurrency: int,
+) -> int:
+    value = config.get("ingest_concurrency", default_concurrency)
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            "scenario.search_under_ingest.ingest_concurrency must be positive"
+        )
+    return value
+
+
+def _search_under_ingest_query_concurrency(
+    config: Mapping[str, Any],
+    *,
+    default_concurrency: int,
+) -> int:
+    value = config.get("query_concurrency", default_concurrency)
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            "scenario.search_under_ingest.query_concurrency must be positive"
         )
     return value
 

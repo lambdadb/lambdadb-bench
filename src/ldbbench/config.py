@@ -18,6 +18,7 @@ VALID_WRITE_MODES = {"upsert", "bulk_upsert"}
 VALID_QUERY_CONSISTENCY = {"eventual", "strong"}
 VALID_PREPARE_MODES = {"existing", "create", "recreate"}
 VALID_WORKLOADS = {"standard", "search_under_ingest"}
+VALID_SEARCH_UNDER_INGEST_PATTERNS = {"upload_and_ask", "parallel_upsert_query"}
 VALID_SEARCH_UNDER_INGEST_PROBE_SOURCES = {"queries"}
 
 
@@ -358,8 +359,11 @@ def _validate_search_under_ingest(
         return
 
     pattern = config.get("pattern", "upload_and_ask")
-    if pattern != "upload_and_ask":
-        raise ConfigError("scenario.search_under_ingest.pattern must be upload_and_ask")
+    if pattern not in VALID_SEARCH_UNDER_INGEST_PATTERNS:
+        raise ConfigError(
+            "scenario.search_under_ingest.pattern must be one of "
+            f"{sorted(VALID_SEARCH_UNDER_INGEST_PATTERNS)}"
+        )
 
     probe_source = config.get("probe_source", "queries")
     if probe_source not in VALID_SEARCH_UNDER_INGEST_PROBE_SOURCES:
@@ -405,6 +409,8 @@ def _validate_search_under_ingest(
     _validate_optional_positive_int(config, "max_chunks_per_document")
     _validate_optional_positive_int(config, "probe_queries_per_document")
     _validate_optional_positive_int(config, "probe_concurrency")
+    _validate_optional_positive_int(config, "ingest_concurrency")
+    _validate_optional_positive_int(config, "query_concurrency")
     _validate_optional_positive_int(config, "top_k")
     _validate_optional_bool(config, "poll_until_visible")
 

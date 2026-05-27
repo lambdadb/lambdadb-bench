@@ -1,0 +1,43 @@
+name: cohere-wikipedia-1m-parallel-search-under-ingest
+description: Cohere Wikipedia concurrent upsert and query workload.
+workload: search_under_ingest
+
+dataset:
+  provider: huggingface
+  source: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+  subset: en
+  rows: 1000000
+  id_field: _id
+  vector_field: emb
+  text_field: text
+  dimensions: 1024
+  metric: cosine
+  seed: 20260511
+
+load:
+  write_mode: upsert
+  batch_size: 500
+  concurrency: 16
+  wait_until_query_visible: false
+
+query:
+  top_k: 10
+  query_count: 1000
+  query_source: heldout_dataset_vectors
+  consistency: eventual
+  include_vectors: false
+
+search_under_ingest:
+  pattern: parallel_upsert_query
+  duration: 10m
+  ingest_concurrency: 16
+  query_concurrency: 16
+  top_k: 10
+  consistency: eventual
+
+metrics:
+  latency_percentiles: [50, 95, 99]
+  include_qps: true
+  include_error_rate: true
+  include_recall: true
+  include_cost_estimates: true
