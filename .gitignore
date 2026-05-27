@@ -13,5 +13,5 @@ reports/
 
 # Local credentials/configs.
 .env
+.envrc
 configs/*.local.yaml
-

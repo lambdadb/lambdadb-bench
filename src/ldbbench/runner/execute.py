@@ -11,7 +11,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -2983,7 +2983,9 @@ def run_parallel_search_under_ingest_stage(
     load_state = {
         "records_loaded": 0,
         "records_read": 0,
+        "skipped_records": 0,
         "successful_batches": 0,
+        "skipped_batches": 0,
         "attempted_batches": 0,
         "load_errors": 0,
         "batching_duration_seconds": 0.0,
@@ -3023,10 +3025,25 @@ def run_parallel_search_under_ingest_stage(
                 with load_lock:
                     load_state["records_read"] += len(batch)
                     load_state["batching_duration_seconds"] += batching_duration
-                task_queue.put((batch_index, batch, batching_duration))
+                while not deadline_reached():
+                    try:
+                        task_queue.put(
+                            (batch_index, batch, batching_duration),
+                            timeout=0.1,
+                        )
+                        break
+                    except Full:
+                        continue
+                else:
+                    break
         finally:
             for _ in range(ingest_concurrency):
-                task_queue.put(None)
+                while True:
+                    try:
+                        task_queue.put(None, timeout=0.1)
+                        break
+                    except Full:
+                        continue
 
     def ingest_worker() -> None:
         while True:
@@ -3035,6 +3052,11 @@ def run_parallel_search_under_ingest_stage(
                 if item is None:
                     return
                 batch_index, batch, _batching_duration = item
+                if deadline_reached():
+                    with load_lock:
+                        load_state["skipped_batches"] += 1
+                        load_state["skipped_records"] += len(batch)
+                    continue
                 event = execute_load_batch(
                     adapter=adapter,
                     target=target,
@@ -3125,7 +3147,9 @@ def run_parallel_search_under_ingest_stage(
     duration = time.perf_counter() - started
     records_loaded = int(load_state["records_loaded"])
     records_read = int(load_state["records_read"])
+    skipped_records = int(load_state["skipped_records"])
     successful_batches = int(load_state["successful_batches"])
+    skipped_batches = int(load_state["skipped_batches"])
     attempted_batches = int(load_state["attempted_batches"])
     load_errors = int(load_state["load_errors"])
     batching_duration_seconds = float(load_state["batching_duration_seconds"])
@@ -3137,9 +3161,9 @@ def run_parallel_search_under_ingest_stage(
         "records": records_loaded,
         "records_read": records_read,
         "write_mode": write_mode,
-        "skipped_records": 0,
+        "skipped_records": skipped_records,
         "batches": successful_batches,
-        "skipped_batches": 0,
+        "skipped_batches": skipped_batches,
         "attempts": attempted_batches,
         "errors": load_errors,
         "error_rate": _error_rate(load_errors, attempted_batches),

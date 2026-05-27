@@ -6,6 +6,7 @@ api_key_env: LAMBDADB_API_KEY
 collection_name: ${LAMBDADB_COLLECTION_NAME}
 vector_field: vector
 region: us-east-1
+timeout_ms: 30000
 
 prepare:
   mode: existing

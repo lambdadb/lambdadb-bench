@@ -702,6 +702,56 @@ def test_parallel_search_under_ingest_requires_queries(tmp_path) -> None:
         )
 
 
+def test_parallel_search_under_ingest_drops_queued_batches_after_deadline(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(
+        rows=20,
+        batch_size=1,
+        load_concurrency=1,
+        workload="search_under_ingest",
+        search_under_ingest={
+            "pattern": "parallel_upsert_query",
+            "duration": "1ms",
+            "ingest_concurrency": 1,
+            "query_concurrency": 1,
+            "top_k": 2,
+            "consistency": "eventual",
+        },
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_dataset(
+        scenario=scenario,
+        output_dir=tmp_path / "dataset",
+        limit=20,
+        query_count=1,
+        source_rows=[
+            {"_id": f"q{i}", "emb": [1.0, 0.0], "text": f"query {i}"}
+            for i in range(1, 2)
+        ]
+        + [
+            {"_id": f"r{i}", "emb": [1.0, 0.0], "text": f"record {i}"}
+            for i in range(1, 21)
+        ],
+    )
+    adapter = FakeAdapter(load_delay_seconds=0.02, query_delay_seconds=0.02)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+    )
+
+    assert result.summary["load"]["records"] < 20
+    assert result.summary["load"]["skipped_batches"] > 0
+    assert result.summary["load"]["skipped_records"] > 0
+
+
 def test_read_records_uses_msgpack_estimated_size(tmp_path) -> None:
     dataset = prepare_fixture_dataset(tmp_path, make_scenario())
 

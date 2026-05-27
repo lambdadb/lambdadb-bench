@@ -495,6 +495,8 @@ LambdaDB targets with:
 - `collection_name`: target collection.
 - `vector_field`: field that stores normalized benchmark vectors. Defaults to
   `vector`.
+- `timeout_ms`: per-request SDK timeout in milliseconds. The example targets
+  use `30000` to keep long-tail concurrent ingest/query calls bounded.
 - `index_configs`: LambdaDB collection index config used by create/recreate
   preparation modes.
 - `partition_config`: optional LambdaDB hash partition config for create/recreate
