@@ -635,8 +635,14 @@ def test_execute_benchmark_runs_parallel_search_under_ingest(tmp_path) -> None:
     assert result.summary["search_under_ingest"]["pattern"] == "parallel_upsert_query"
     assert result.summary["load"]["records"] == 4
     assert result.summary["load"]["concurrency"] == 2
+    assert result.summary["load"]["processes"] == 1
+    assert result.summary["load"]["worker_threads_per_process"] == [2]
     assert result.summary["query"]["mode"] == "parallel_under_ingest"
+    assert result.summary["query"]["processes"] == 1
+    assert result.summary["query"]["stages"][0]["worker_threads_per_process"] == [2]
     assert result.summary["query"]["queries"] > 0
+    assert result.summary["search_under_ingest"]["ingest_processes"] == 1
+    assert result.summary["search_under_ingest"]["query_processes"] == 1
     assert result.summary["search_under_ingest"]["queries"] == len(query_events)
     assert result.summary["search_under_ingest"]["records"] == 4
     assert len(ingest_events) == 2

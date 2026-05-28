@@ -266,6 +266,8 @@ def execute_benchmark(
                 default_query_concurrency=_parallel_default_query_concurrency(
                     scenario,
                 ),
+                default_ingest_processes=_load_processes(scenario),
+                default_query_processes=_query_processes(scenario),
                 include_vectors=bool(scenario.query.get("include_vectors", False)),
                 ingest_events_path=ingest_events_path,
                 query_events_path=query_events_path,
@@ -2216,6 +2218,48 @@ def _query_process_worker(
             future.result()
 
 
+def _parallel_ingest_process_worker(
+    vendor: str,
+    target: TargetConfig,
+    write_mode: str,
+    task_queue: Any,
+    result_queue: Any,
+    concurrency: int,
+    deadline: float | None,
+) -> None:
+    def worker() -> None:
+        adapter = _worker_adapter(vendor)
+        while True:
+            item = task_queue.get()
+            if item is None:
+                return
+            batch_index, batch, _batching_duration = item
+            if deadline is not None and time.perf_counter() >= deadline:
+                result_queue.put(
+                    {
+                        "_type": "skipped_load_batch",
+                        "batch_index": batch_index,
+                        "records": len(batch),
+                    }
+                )
+                continue
+            result_queue.put(
+                execute_load_batch(
+                    adapter=adapter,
+                    target=target,
+                    batch=batch,
+                    batch_index=batch_index,
+                    write_mode=write_mode,
+                )
+            )
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(worker) for _ in range(concurrency)]
+        for future in futures:
+            future.result()
+    result_queue.put({"_type": "worker_done"})
+
+
 @dataclass
 class QueryRunState:
     queries: int = 0
@@ -2942,6 +2986,8 @@ def run_parallel_search_under_ingest_stage(
     max_batch_bytes: int | None,
     default_ingest_concurrency: int,
     default_query_concurrency: int,
+    default_ingest_processes: int,
+    default_query_processes: int,
     include_vectors: bool,
     ingest_events_path: str | Path,
     query_events_path: str | Path,
@@ -2954,6 +3000,22 @@ def run_parallel_search_under_ingest_stage(
     query_concurrency = _search_under_ingest_query_concurrency(
         config,
         default_concurrency=default_query_concurrency,
+    )
+    ingest_process_count = _effective_process_count(
+        default_ingest_processes,
+        ingest_concurrency,
+    )
+    query_process_count = _effective_process_count(
+        default_query_processes,
+        query_concurrency,
+    )
+    ingest_worker_threads = _split_concurrency(
+        ingest_concurrency,
+        ingest_process_count,
+    )
+    query_worker_threads = _split_concurrency(
+        query_concurrency,
+        query_process_count,
     )
     top_k = _search_under_ingest_top_k(config, default_top_k=default_top_k)
     consistency = _search_under_ingest_consistency(
@@ -2996,15 +3058,23 @@ def run_parallel_search_under_ingest_stage(
     load_lock = Lock()
     query_lock = Lock()
     query_index_lock = Lock()
-    task_queue: Queue[tuple[int, list[VectorRecord], float] | None] = Queue(
-        maxsize=max(1, ingest_concurrency * 2),
+    use_processes = ingest_process_count > 1 or query_process_count > 1
+    task_queue: Any = (
+        mp.Queue(maxsize=max(1, ingest_concurrency * 2))
+        if use_processes
+        else Queue(maxsize=max(1, ingest_concurrency * 2))
     )
     started = time.perf_counter()
     ticker = ProgressTicker(progress)
     ticker.emit(
         "search_under_ingest: starting parallel_upsert_query "
         f"ingest_concurrency={ingest_concurrency} "
-        f"query_concurrency={query_concurrency} top_k={top_k} "
+        f"ingest_processes={ingest_process_count} "
+        f"ingest_worker_threads_per_process={ingest_worker_threads} "
+        f"query_concurrency={query_concurrency} "
+        f"query_processes={query_process_count} "
+        f"query_worker_threads_per_process={query_worker_threads} "
+        f"top_k={top_k} "
         f"consistency={consistency}"
     )
 
@@ -3123,24 +3193,198 @@ def run_parallel_search_under_ingest_stage(
         ingest_output.open("w", encoding="utf-8") as ingest_file,
         query_output.open("w", encoding="utf-8") as query_file,
     ):
-        reader_thread = Thread(target=reader, name="search-under-ingest-reader")
-        reader_thread.start()
-        with ThreadPoolExecutor(
-            max_workers=ingest_concurrency + query_concurrency,
-        ) as executor:
-            ingest_futures = [
-                executor.submit(ingest_worker) for _ in range(ingest_concurrency)
+        if ingest_process_count > 1 or query_process_count > 1:
+            process_errors: list[BaseException] = []
+            ingest_result_queue: Any = mp.Queue()
+            query_task_queue: Any = mp.Queue(maxsize=max(1, query_concurrency * 2))
+            query_result_queue: Any = mp.Queue()
+            ingest_processes = [
+                mp.Process(
+                    target=_parallel_ingest_process_worker,
+                    args=(
+                        target.vendor,
+                        target,
+                        write_mode,
+                        task_queue,
+                        ingest_result_queue,
+                        thread_count,
+                        deadline,
+                    ),
+                    name=f"ldbbench-parallel-ingest-{index}",
+                )
+                for index, thread_count in enumerate(
+                    ingest_worker_threads,
+                    start=1,
+                )
             ]
-            query_futures = [
-                executor.submit(query_worker, index)
-                for index in range(1, query_concurrency + 1)
+            query_processes = [
+                mp.Process(
+                    target=_query_process_worker,
+                    args=(
+                        target.vendor,
+                        target,
+                        query_task_queue,
+                        query_result_queue,
+                        thread_count,
+                        worker_offset,
+                        1,
+                        top_k,
+                        consistency,
+                        include_vectors,
+                        dict(ground_truth),
+                        None,
+                    ),
+                    name=f"ldbbench-parallel-query-{index}",
+                )
+                for index, (thread_count, worker_offset) in enumerate(
+                    _worker_offsets(query_worker_threads),
+                    start=1,
+                )
             ]
+
+            def ingest_collector() -> None:
+                done_workers = 0
+                try:
+                    while done_workers < len(ingest_processes):
+                        try:
+                            event = ingest_result_queue.get(timeout=0.1)
+                        except Empty:
+                            for worker_process in ingest_processes:
+                                if worker_process.exitcode not in (None, 0):
+                                    raise RuntimeError(
+                                        "parallel ingest worker process exited "
+                                        f"with code {worker_process.exitcode}"
+                                    ) from None
+                            continue
+                        if event.get("_type") == "worker_done":
+                            done_workers += 1
+                            continue
+                        with load_lock:
+                            if event.get("_type") == "skipped_load_batch":
+                                load_state["skipped_batches"] += 1
+                                load_state["skipped_records"] += int(
+                                    event["records"],
+                                )
+                                continue
+                            _write_event(
+                                ingest_file,
+                                event,
+                                flush=False,
+                                sort_keys=False,
+                            )
+                            event_latency = float(event["latency_ms"])
+                            load_attempt_latencies.append(event_latency)
+                            load_state["attempted_batches"] += 1
+                            load_state["upsert_attempt_duration_seconds"] += (
+                                event_latency / 1000
+                            )
+                            if event["status"] == "ok":
+                                load_state["successful_batches"] += 1
+                                load_state["records_loaded"] += int(event["records"])
+                                load_latencies.append(event_latency)
+                            else:
+                                load_state["load_errors"] += 1
+                            ticker.maybe(
+                                "search_under_ingest: parallel progress "
+                                f"records={load_state['records_loaded']} "
+                                f"queries={query_state.queries} "
+                                f"load_errors={load_state['load_errors']} "
+                                f"query_errors={query_state.errors}"
+                            )
+                except BaseException as exc:  # noqa: BLE001
+                    process_errors.append(exc)
+                    stop_queries.set()
+
+            def query_scheduler() -> None:
+                nonlocal next_query_index
+                in_flight = 0
+
+                def submit_query() -> bool:
+                    nonlocal in_flight, next_query_index
+                    if stop_queries.is_set() or deadline_reached():
+                        return False
+                    with query_index_lock:
+                        query_index = next_query_index
+                        query = query_list[(query_index - 1) % len(query_list)]
+                        next_query_index += 1
+                    query_task_queue.put((query_index, query))
+                    in_flight += 1
+                    return True
+
+                try:
+                    while in_flight < query_concurrency and submit_query():
+                        pass
+                    while in_flight:
+                        try:
+                            event = query_result_queue.get(timeout=0.1)
+                        except Empty:
+                            for worker_process in query_processes:
+                                if worker_process.exitcode not in (None, 0):
+                                    raise RuntimeError(
+                                        "parallel query worker process exited "
+                                        f"with code {worker_process.exitcode}"
+                                    ) from None
+                            continue
+                        in_flight -= 1
+                        with query_lock:
+                            query_state.record(event)
+                            _write_event(
+                                query_file,
+                                event,
+                                flush=False,
+                                sort_keys=False,
+                            )
+                        while in_flight < query_concurrency and submit_query():
+                            pass
+                except BaseException as exc:  # noqa: BLE001
+                    process_errors.append(exc)
+                    stop_queries.set()
+                finally:
+                    for _ in range(sum(query_worker_threads)):
+                        query_task_queue.put(None)
+
+            for worker_process in ingest_processes + query_processes:
+                worker_process.start()
+            reader_thread = Thread(target=reader, name="search-under-ingest-reader")
+            collector_thread = Thread(
+                target=ingest_collector,
+                name="search-under-ingest-ingest-events",
+            )
+            query_thread = Thread(
+                target=query_scheduler,
+                name="search-under-ingest-query-processes",
+            )
+            reader_thread.start()
+            collector_thread.start()
+            query_thread.start()
             reader_thread.join()
-            for future in ingest_futures:
-                future.result()
+            collector_thread.join()
             stop_queries.set()
-            for future in query_futures:
-                future.result()
+            query_thread.join()
+            for worker_process in ingest_processes + query_processes:
+                worker_process.join()
+            if process_errors:
+                raise process_errors[0]
+        else:
+            reader_thread = Thread(target=reader, name="search-under-ingest-reader")
+            reader_thread.start()
+            with ThreadPoolExecutor(
+                max_workers=ingest_concurrency + query_concurrency,
+            ) as executor:
+                ingest_futures = [
+                    executor.submit(ingest_worker)
+                    for _ in range(ingest_concurrency)
+                ]
+                query_futures = [
+                    executor.submit(query_worker, index)
+                    for index in range(1, query_concurrency + 1)
+                ]
+                reader_thread.join()
+                for future in ingest_futures:
+                    future.result()
+                stop_queries.set()
+                for future in query_futures:
+                    future.result()
         ingest_file.flush()
         query_file.flush()
 
@@ -3168,8 +3412,8 @@ def run_parallel_search_under_ingest_stage(
         "errors": load_errors,
         "error_rate": _error_rate(load_errors, attempted_batches),
         "concurrency": ingest_concurrency,
-        "processes": 1,
-        "worker_threads_per_process": [ingest_concurrency],
+        "processes": ingest_process_count,
+        "worker_threads_per_process": ingest_worker_threads,
         "checkpoint": {
             "path": None,
             "resume_enabled": False,
@@ -3196,13 +3440,13 @@ def run_parallel_search_under_ingest_stage(
         recalls=query_state.recalls,
         query_count=query_state.queries,
         error_count=query_state.errors,
-        processes=1,
+        processes=query_process_count,
         stage_summaries=[
             _query_stage_summary(
                 stage_index=1,
                 concurrency=query_concurrency,
-                processes=1,
-                worker_threads_per_process=[query_concurrency],
+                processes=query_process_count,
+                worker_threads_per_process=query_worker_threads,
                 configured_duration_seconds=duration_seconds or duration,
                 elapsed_seconds=duration,
                 state=query_state,
@@ -3216,7 +3460,11 @@ def run_parallel_search_under_ingest_stage(
         "duration_seconds": duration,
         "configured_duration_seconds": duration_seconds,
         "ingest_concurrency": ingest_concurrency,
+        "ingest_processes": ingest_process_count,
+        "ingest_worker_threads_per_process": ingest_worker_threads,
         "query_concurrency": query_concurrency,
+        "query_processes": query_process_count,
+        "query_worker_threads_per_process": query_worker_threads,
         "top_k": top_k,
         "consistency": consistency,
         "write_mode": write_mode,

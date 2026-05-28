@@ -300,7 +300,9 @@ There are two search-under-ingest patterns:
   queries for that same group. This is the read-after-write visibility check.
 - `parallel_upsert_query`: runs upsert workers and query workers at the same
   time until the configured duration or record stream is exhausted. This is the
-  concurrent ingest/query load workload.
+  concurrent ingest/query load workload. It uses `load.processes` for upsert
+  workers and `query.processes` for query workers; each concurrency value remains
+  the total in-flight worker count and is split across the configured processes.
 
 The `upload_and_ask` implementation supports `probe_source: queries`,
 `probe_concurrency: 1`, and `probe_queries_per_document: 1`. Use `upsert`, not
@@ -542,6 +544,9 @@ Useful load settings:
 For staged queries, `query.processes` works the same way: each
 `query.stages[].concurrency` value remains the total in-flight query count, and
 the runner splits that total across worker processes when `query.processes > 1`.
+The `parallel_upsert_query` search-under-ingest workload also uses
+`query.processes`, with `search_under_ingest.query_concurrency` as the total
+in-flight query count.
 
 Partition-pruned query workloads can set `query.partition_filter` with a target
 field and query metadata source field. These runs intentionally skip global

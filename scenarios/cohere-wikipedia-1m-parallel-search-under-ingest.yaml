@@ -18,6 +18,7 @@ load:
   write_mode: upsert
   batch_size: 500
   concurrency: 16
+  # processes: 4
   wait_until_query_visible: false
 
 query:
@@ -26,6 +27,7 @@ query:
   query_source: heldout_dataset_vectors
   consistency: eventual
   include_vectors: false
+  # processes: 4
 
 search_under_ingest:
   pattern: parallel_upsert_query
