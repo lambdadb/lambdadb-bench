@@ -18,6 +18,7 @@ from ldbbench.adapters.base import (
     UpsertResult,
     VectorRecord,
 )
+from ldbbench.adapters.filters import lambdadb_filter
 from ldbbench.config import ConfigError, TargetConfig
 
 DEFAULT_VECTOR_FIELD = "vector"
@@ -26,6 +27,13 @@ DEFAULT_DELETE_WAIT_POLL_SECONDS = 1.0
 DEFAULT_CREATE_WAIT_TIMEOUT_SECONDS = 300.0
 DEFAULT_CREATE_WAIT_POLL_SECONDS = 1.0
 ACTIVE_COLLECTION_STATUS = "ACTIVE"
+FILTER_BUCKET_FIELD_PREFIX = "filter_bucket_"
+FILTER_BUCKET_INDEX_FIELDS = (
+    "filter_bucket_2",
+    "filter_bucket_10",
+    "filter_bucket_100",
+    "filter_bucket_1000",
+)
 SUPPORTED_METRIC_MAP = {
     "cosine": "cosine",
     "dot": "dot_product",
@@ -38,6 +46,7 @@ LAMBDADB_CAPABILITIES = AdapterCapabilities(
     supported_write_modes=frozenset({"upsert", "bulk_upsert"}),
     supported_query_consistency=frozenset({"eventual", "strong"}),
     supports_read_after_write_strong=True,
+    supports_query_filter=True,
     supports_query_partition_filter=True,
     vendor_consistency_options={
         "consistent_read": True,
@@ -199,7 +208,7 @@ class LambdaDBAdapter:
             "k": top_k,
         }
         if filter_query is not None:
-            knn["filter"] = dict(filter_query)
+            knn["filter"] = lambdadb_filter(filter_query)
 
         query_kwargs: dict[str, Any] = {
             "collection_name": settings.collection_name,
@@ -508,7 +517,7 @@ def _index_configs(
     metric: str | None,
 ) -> dict[str, Any]:
     if settings.index_configs:
-        return settings.index_configs
+        return _with_filter_bucket_index_configs(settings.index_configs)
     if dimensions is None:
         raise ConfigError(
             "target.index_configs or dataset dimensions are required for create mode"
@@ -520,13 +529,22 @@ def _index_configs(
             "LambdaDB vector similarity must be one of "
             f"{sorted(SUPPORTED_METRIC_MAP)}"
         )
-    return {
+    return _with_filter_bucket_index_configs({
         settings.vector_field: {
             "type": "vector",
             "dimensions": dimensions,
             "similarity": similarity,
         }
-    }
+    })
+
+
+def _with_filter_bucket_index_configs(
+    index_configs: Mapping[str, Any],
+) -> dict[str, Any]:
+    configs = dict(index_configs)
+    for field in FILTER_BUCKET_INDEX_FIELDS:
+        configs.setdefault(field, {"type": "keyword"})
+    return configs
 
 
 def _record_to_doc(
@@ -543,6 +561,7 @@ def _record_to_doc(
             "metadata": metadata,
         }
         _copy_partition_field(doc, metadata, partition_field=partition_field)
+        _copy_filter_bucket_fields(doc, metadata)
         return doc
 
     record_id = record.get("id")
@@ -561,6 +580,7 @@ def _record_to_doc(
         "metadata": metadata_dict,
     }
     _copy_partition_field(doc, metadata_dict, partition_field=partition_field)
+    _copy_filter_bucket_fields(doc, metadata_dict)
     return doc
 
 
@@ -582,6 +602,15 @@ def _copy_partition_field(
     value = metadata.get(partition_field)
     if value is not None:
         doc[partition_field] = value
+
+
+def _copy_filter_bucket_fields(
+    doc: dict[str, Any],
+    metadata: Mapping[str, Any],
+) -> None:
+    for key, value in metadata.items():
+        if isinstance(key, str) and key.startswith(FILTER_BUCKET_FIELD_PREFIX):
+            doc.setdefault(key, value)
 
 
 def _vector_values(vector: Sequence[float]) -> Sequence[float]:

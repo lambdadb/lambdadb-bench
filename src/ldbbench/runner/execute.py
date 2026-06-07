@@ -29,6 +29,7 @@ from ldbbench.datasets.prepare import (
     QUERIES_MSGPACK_FILENAME,
     RECORDS_FILENAME,
     RECORDS_MSGPACK_FILENAME,
+    filter_bucket_metadata,
 )
 from ldbbench.manifest import initialize_run_artifacts
 from ldbbench.progress import ProgressCallback, ProgressTicker
@@ -79,6 +80,33 @@ class PartitionFilterSpec:
 
 
 @dataclass(frozen=True)
+class LogicalFilterSpec:
+    name: str
+    field: str
+    operator: str
+    expected_selectivity: float | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "name": self.name,
+            "field": self.field,
+            "operator": self.operator,
+        }
+        if self.expected_selectivity is not None:
+            data["expected_selectivity"] = self.expected_selectivity
+        return data
+
+
+@dataclass(frozen=True)
+class GroundTruthEntry:
+    ids: list[str]
+    filter_query: dict[str, Any] | None = None
+    filter_name: str | None = None
+    candidate_count: int | None = None
+    expected_count: int | None = None
+
+
+@dataclass(frozen=True)
 class RecordShard:
     path: Path
     sha256: str | None
@@ -88,6 +116,7 @@ class RecordShard:
     batch_base: int = 0
     effective_records: int | None = None
     manifest_shard_count: int | None = None
+    query_offset: int = 0
 
     def as_checkpoint_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +128,7 @@ class RecordShard:
             "batch_base": self.batch_base,
             "effective_records": self.effective_records,
             "manifest_shard_count": self.manifest_shard_count,
+            "query_offset": self.query_offset,
         }
 
 
@@ -252,7 +282,10 @@ def execute_benchmark(
             run_parallel_search_under_ingest_stage(
                 adapter=adapter,
                 target=target,
-                records=read_records(records_path, limit=max_records),
+                records=_records_with_filter_bucket_metadata(
+                    read_records(records_path, limit=max_records),
+                    dataset_manifest=dataset_manifest,
+                ),
                 record_source_path=records_path,
                 queries=queries,
                 ground_truth=ground_truth,
@@ -312,7 +345,10 @@ def execute_benchmark(
         load_result = run_load_stage(
             adapter=adapter,
             target=target,
-            records=read_records(records_path, limit=max_records),
+            records=_records_with_filter_bucket_metadata(
+                read_records(records_path, limit=max_records),
+                dataset_manifest=dataset_manifest,
+            ),
             record_source_path=records_path,
             record_shards=record_shards,
             write_mode=str(scenario.load.get("write_mode")),
@@ -413,6 +449,7 @@ def execute_benchmark(
             include_vectors=bool(scenario.query.get("include_vectors", False)),
             ground_truth=ground_truth,
             partition_filter_spec=_partition_filter_spec(scenario),
+            query_filter_spec=_query_filter_spec(scenario),
             events_path=query_events_path,
             stages=None if max_queries is not None else _query_stages(scenario),
             processes=_query_processes(scenario),
@@ -1517,7 +1554,11 @@ def _iter_shard_batches(
     *,
     batch_size: int,
 ) -> Iterator[tuple[int, list[VectorRecord], float]]:
-    records = read_records(shard.path, limit=shard.effective_records)
+    records = _records_with_filter_bucket_metadata(
+        read_records(shard.path, limit=shard.effective_records),
+        query_offset=shard.query_offset,
+        ordinal_start=max(0, shard.first_record_index - 1),
+    )
     for local_batch_index, (batch, batching_duration) in enumerate(
         _timed_batches(records, batch_size),
         start=1,
@@ -1770,9 +1811,10 @@ def run_query_stage(
     top_k: int,
     consistency: str,
     include_vectors: bool,
-    ground_truth: Mapping[str, list[str]],
+    ground_truth: Mapping[str, GroundTruthEntry],
     events_path: str | Path,
     partition_filter_spec: PartitionFilterSpec | None = None,
+    query_filter_spec: LogicalFilterSpec | None = None,
     stages: list[dict[str, Any]] | None = None,
     processes: int = 1,
     progress: ProgressCallback | None = None,
@@ -1782,6 +1824,7 @@ def run_query_stage(
     query_list = list(queries)
     ticker = ProgressTicker(progress)
     _validate_partition_filter_query_records(query_list, partition_filter_spec)
+    _validate_query_filter_ground_truth(query_list, query_filter_spec, ground_truth)
     if not query_list:
         events_output.write_text("", encoding="utf-8")
         return _query_summary(
@@ -1789,11 +1832,16 @@ def run_query_stage(
             started=time.perf_counter(),
             latencies=[],
             recalls=[],
+            candidate_counts=[],
+            expected_counts=[],
+            returned_counts=[],
+            underfilled_results=0,
             query_count=0,
             error_count=0,
             processes=1,
             stage_summaries=[],
             partition_filter_spec=partition_filter_spec,
+            query_filter_spec=query_filter_spec,
         )
 
     if stages:
@@ -1806,6 +1854,7 @@ def run_query_stage(
             include_vectors=include_vectors,
             ground_truth=ground_truth,
             partition_filter_spec=partition_filter_spec,
+            query_filter_spec=query_filter_spec,
             events_path=events_output,
             stages=stages,
             processes=processes,
@@ -1829,6 +1878,7 @@ def run_query_stage(
                 include_vectors=include_vectors,
                 ground_truth=ground_truth,
                 partition_filter_spec=partition_filter_spec,
+                query_filter_spec=query_filter_spec,
             )
             state.record(event)
             _write_event(file, event, flush=False, sort_keys=False)
@@ -1847,11 +1897,16 @@ def run_query_stage(
         started=started,
         latencies=state.latencies,
         recalls=state.recalls,
+        candidate_counts=state.candidate_counts,
+        expected_counts=state.expected_counts,
+        returned_counts=state.returned_counts,
+        underfilled_results=state.underfilled_results,
         query_count=state.queries,
         error_count=state.errors,
         processes=1,
         stage_summaries=[],
         partition_filter_spec=partition_filter_spec,
+        query_filter_spec=query_filter_spec,
     )
 
 
@@ -1863,8 +1918,9 @@ def run_staged_query_stage(
     top_k: int,
     consistency: str,
     include_vectors: bool,
-    ground_truth: Mapping[str, list[str]],
+    ground_truth: Mapping[str, GroundTruthEntry],
     partition_filter_spec: PartitionFilterSpec | None,
+    query_filter_spec: LogicalFilterSpec | None,
     events_path: Path,
     stages: list[dict[str, Any]],
     processes: int = 1,
@@ -1905,6 +1961,7 @@ def run_staged_query_stage(
                     include_vectors=include_vectors,
                     ground_truth=ground_truth,
                     partition_filter_spec=partition_filter_spec,
+                    query_filter_spec=query_filter_spec,
                     file=file,
                     stage_index=stage_index,
                     concurrency=concurrency,
@@ -1927,6 +1984,7 @@ def run_staged_query_stage(
                         elapsed_seconds=time.perf_counter() - stage_started,
                         state=stage_state,
                         partition_filter_spec=partition_filter_spec,
+                        query_filter_spec=query_filter_spec,
                     )
                 )
                 ticker.emit(
@@ -1974,6 +2032,7 @@ def run_staged_query_stage(
                         include_vectors=include_vectors,
                         ground_truth=ground_truth,
                         partition_filter_spec=partition_filter_spec,
+                        query_filter_spec=query_filter_spec,
                     )
                     current_event_queue.put(event)
 
@@ -2038,6 +2097,7 @@ def run_staged_query_stage(
                     elapsed_seconds=time.perf_counter() - stage_started,
                     state=stage_state,
                     partition_filter_spec=partition_filter_spec,
+                    query_filter_spec=query_filter_spec,
                 )
             )
             ticker.emit(
@@ -2051,6 +2111,10 @@ def run_staged_query_stage(
         started=started,
         latencies=state.latencies,
         recalls=state.recalls,
+        candidate_counts=state.candidate_counts,
+        expected_counts=state.expected_counts,
+        returned_counts=state.returned_counts,
+        underfilled_results=state.underfilled_results,
         query_count=state.queries,
         error_count=state.errors,
         processes=_effective_process_count(processes, max(1, max(
@@ -2059,6 +2123,7 @@ def run_staged_query_stage(
         ))),
         stage_summaries=stage_summaries,
         partition_filter_spec=partition_filter_spec,
+        query_filter_spec=query_filter_spec,
     )
 
 
@@ -2070,8 +2135,9 @@ def _run_staged_query_processes(
     top_k: int,
     consistency: str,
     include_vectors: bool,
-    ground_truth: Mapping[str, list[str]],
+    ground_truth: Mapping[str, GroundTruthEntry],
     partition_filter_spec: PartitionFilterSpec | None,
+    query_filter_spec: LogicalFilterSpec | None,
     file: Any,
     stage_index: int,
     concurrency: int,
@@ -2103,6 +2169,7 @@ def _run_staged_query_processes(
                 include_vectors,
                 dict(ground_truth),
                 partition_filter_spec,
+                query_filter_spec,
             ),
             name=f"ldbbench-query-{stage_index}-{index}",
         )
@@ -2182,8 +2249,9 @@ def _query_process_worker(
     top_k: int,
     consistency: str,
     include_vectors: bool,
-    ground_truth: Mapping[str, list[str]],
+    ground_truth: Mapping[str, GroundTruthEntry],
     partition_filter_spec: PartitionFilterSpec | None,
+    query_filter_spec: LogicalFilterSpec | None,
 ) -> None:
     def worker(local_index: int) -> None:
         adapter = _worker_adapter(vendor)
@@ -2206,6 +2274,7 @@ def _query_process_worker(
                     include_vectors=include_vectors,
                     ground_truth=ground_truth,
                     partition_filter_spec=partition_filter_spec,
+                    query_filter_spec=query_filter_spec,
                 )
             )
 
@@ -2266,6 +2335,10 @@ class QueryRunState:
     errors: int = 0
     latencies: list[float] = field(default_factory=list)
     recalls: list[float] = field(default_factory=list)
+    candidate_counts: list[int] = field(default_factory=list)
+    expected_counts: list[int] = field(default_factory=list)
+    returned_counts: list[int] = field(default_factory=list)
+    underfilled_results: int = 0
 
     def record(self, event: Mapping[str, Any]) -> None:
         if event["status"] == "ok":
@@ -2276,6 +2349,17 @@ class QueryRunState:
             recall = event.get("recall_at_k")
             if isinstance(recall, int | float):
                 self.recalls.append(float(recall))
+            candidate_count = event.get("candidate_count")
+            if isinstance(candidate_count, int):
+                self.candidate_counts.append(candidate_count)
+            expected_count = event.get("expected_count")
+            if isinstance(expected_count, int):
+                self.expected_counts.append(expected_count)
+            returned_count = event.get("returned_count")
+            if isinstance(returned_count, int):
+                self.returned_counts.append(returned_count)
+                if isinstance(expected_count, int) and returned_count < expected_count:
+                    self.underfilled_results += 1
         else:
             self.errors += 1
 
@@ -2308,6 +2392,45 @@ def _validate_partition_filter_query_records(
         _query_partition_filter(query, partition_filter_spec)
 
 
+def _validate_query_filter_ground_truth(
+    queries: Sequence[VectorRecord],
+    query_filter_spec: LogicalFilterSpec | None,
+    ground_truth: Mapping[str, GroundTruthEntry],
+) -> None:
+    if query_filter_spec is None:
+        return
+    for query in queries:
+        entry = ground_truth.get(query.id)
+        if entry is None or entry.filter_query is None:
+            raise ConfigError(
+                "scenario.query.filter requires filtered ground truth rows for "
+                f"query {query.id!r}"
+            )
+
+
+def _query_filter(
+    query: VectorRecord,
+    query_filter_spec: LogicalFilterSpec | None,
+    ground_truth_entry: GroundTruthEntry | None,
+) -> dict[str, Any] | None:
+    if query_filter_spec is None:
+        return None
+    if ground_truth_entry is None or ground_truth_entry.filter_query is None:
+        raise ConfigError(
+            "scenario.query.filter requires filtered ground truth row for "
+            f"query {query.id!r}"
+        )
+    query_filter = dict(ground_truth_entry.filter_query)
+    if (
+        query_filter.get("field") != query_filter_spec.field
+        or query_filter.get("operator") != query_filter_spec.operator
+    ):
+        raise ConfigError(
+            "filtered ground truth filter does not match scenario.query.filter"
+        )
+    return query_filter
+
+
 def execute_query_once(
     *,
     adapter: VectorDBAdapter,
@@ -2319,8 +2442,9 @@ def execute_query_once(
     top_k: int,
     consistency: str,
     include_vectors: bool,
-    ground_truth: Mapping[str, list[str]],
+    ground_truth: Mapping[str, GroundTruthEntry],
     partition_filter_spec: PartitionFilterSpec | None = None,
+    query_filter_spec: LogicalFilterSpec | None = None,
 ) -> dict[str, Any]:
     query_started = time.perf_counter()
     base_event: dict[str, Any] = {
@@ -2332,9 +2456,19 @@ def execute_query_once(
         base_event["query_stage_index"] = query_stage_index
     if worker_index is not None:
         base_event["worker_index"] = worker_index
+    ground_truth_entry = ground_truth.get(query.id)
     partition_filter = _query_partition_filter(query, partition_filter_spec)
     if partition_filter is not None:
         base_event["partition_filter"] = partition_filter
+    filter_query = _query_filter(query, query_filter_spec, ground_truth_entry)
+    if filter_query is not None:
+        base_event["filter"] = filter_query
+        if query_filter_spec is not None:
+            base_event["filter_name"] = query_filter_spec.name
+            if query_filter_spec.expected_selectivity is not None:
+                base_event["filter_selectivity"] = (
+                    query_filter_spec.expected_selectivity
+                )
 
     try:
         result = adapter.query(
@@ -2343,6 +2477,7 @@ def execute_query_once(
             top_k=top_k,
             consistency=consistency,
             include_vectors=include_vectors,
+            filter_query=filter_query,
             partition_filter=partition_filter,
         )
     except Exception as exc:  # noqa: BLE001
@@ -2364,7 +2499,7 @@ def execute_query_once(
     else:
         recall = recall_at_k(
             actual=match_ids,
-            expected=ground_truth.get(query.id),
+            expected=_ground_truth_ids(ground_truth_entry),
             k=top_k,
         )
     base_event.update(
@@ -2372,9 +2507,17 @@ def execute_query_once(
             "matches": match_ids,
             "latency_ms": _elapsed_ms(query_started),
             "recall_at_k": recall,
+            "returned_count": len(match_ids),
             "status": "ok",
         }
     )
+    if ground_truth_entry is not None:
+        if ground_truth_entry.candidate_count is not None:
+            base_event["candidate_count"] = ground_truth_entry.candidate_count
+        expected_count = ground_truth_entry.expected_count
+        if expected_count is None:
+            expected_count = len(ground_truth_entry.ids[:top_k])
+        base_event["expected_count"] = expected_count
     if recall_skip_reason is not None:
         base_event["recall_skip_reason"] = recall_skip_reason
     return base_event
@@ -2811,11 +2954,16 @@ def _query_summary(
     started: float,
     latencies: list[float],
     recalls: list[float],
+    candidate_counts: list[int],
+    expected_counts: list[int],
+    returned_counts: list[int],
+    underfilled_results: int,
     query_count: int,
     error_count: int,
     processes: int,
     stage_summaries: list[dict[str, Any]],
     partition_filter_spec: PartitionFilterSpec | None = None,
+    query_filter_spec: LogicalFilterSpec | None = None,
 ) -> dict[str, Any]:
     duration_seconds = time.perf_counter() - started
     attempts = query_count + error_count
@@ -2837,6 +2985,16 @@ def _query_summary(
         summary["partition_filter"] = partition_filter_spec.as_dict()
         summary["partition_filter_applied"] = True
         summary["recall_skip_reason"] = "partition_filtered"
+    if query_filter_spec is not None:
+        summary["filter"] = query_filter_spec.as_dict()
+        summary["filter_applied"] = True
+        summary["candidate_count"] = count_summary_from_values(candidate_counts)
+        summary["expected_count"] = count_summary_from_values(expected_counts)
+        summary["returned_count"] = count_summary_from_values(returned_counts)
+        summary["underfilled_result_rate"] = _error_rate(
+            underfilled_results,
+            len(returned_counts),
+        )
     if stage_summaries:
         summary["stages"] = stage_summaries
     return summary
@@ -2848,11 +3006,16 @@ def skipped_query_summary(*, reason: str) -> dict[str, Any]:
         started=time.perf_counter(),
         latencies=[],
         recalls=[],
+        candidate_counts=[],
+        expected_counts=[],
+        returned_counts=[],
+        underfilled_results=0,
         query_count=0,
         error_count=0,
         processes=1,
         stage_summaries=[],
         partition_filter_spec=None,
+        query_filter_spec=None,
     )
     summary["skip_reason"] = reason
     return summary
@@ -2977,7 +3140,7 @@ def run_parallel_search_under_ingest_stage(
     records: Iterable[VectorRecord],
     record_source_path: str | Path | None,
     queries: Sequence[VectorRecord],
-    ground_truth: Mapping[str, list[str]],
+    ground_truth: Mapping[str, GroundTruthEntry],
     config: Mapping[str, Any],
     default_top_k: int,
     default_consistency: str,
@@ -3184,6 +3347,7 @@ def run_parallel_search_under_ingest_stage(
                 include_vectors=include_vectors,
                 ground_truth=ground_truth,
                 partition_filter_spec=None,
+                query_filter_spec=None,
             )
             with query_lock:
                 query_state.record(event)
@@ -3438,6 +3602,10 @@ def run_parallel_search_under_ingest_stage(
         started=started,
         latencies=query_state.latencies,
         recalls=query_state.recalls,
+        candidate_counts=query_state.candidate_counts,
+        expected_counts=query_state.expected_counts,
+        returned_counts=query_state.returned_counts,
+        underfilled_results=query_state.underfilled_results,
         query_count=query_state.queries,
         error_count=query_state.errors,
         processes=query_process_count,
@@ -3451,8 +3619,10 @@ def run_parallel_search_under_ingest_stage(
                 elapsed_seconds=duration,
                 state=query_state,
                 partition_filter_spec=None,
+                query_filter_spec=None,
             ),
         ],
+        query_filter_spec=None,
     )
     search_summary = {
         "mode": "search_under_ingest",
@@ -3539,6 +3709,7 @@ def _query_stage_summary(
     elapsed_seconds: float,
     state: QueryRunState,
     partition_filter_spec: PartitionFilterSpec | None,
+    query_filter_spec: LogicalFilterSpec | None,
 ) -> dict[str, Any]:
     attempts = state.queries + state.errors
     summary: dict[str, Any] = {
@@ -3562,6 +3733,16 @@ def _query_stage_summary(
         summary["partition_filter"] = partition_filter_spec.as_dict()
         summary["partition_filter_applied"] = True
         summary["recall_skip_reason"] = "partition_filtered"
+    if query_filter_spec is not None:
+        summary["filter"] = query_filter_spec.as_dict()
+        summary["filter_applied"] = True
+        summary["candidate_count"] = count_summary_from_values(state.candidate_counts)
+        summary["expected_count"] = count_summary_from_values(state.expected_counts)
+        summary["returned_count"] = count_summary_from_values(state.returned_counts)
+        summary["underfilled_result_rate"] = _error_rate(
+            state.underfilled_results,
+            len(state.returned_counts),
+        )
     return summary
 
 
@@ -3587,6 +3768,56 @@ def read_records(
             )
 
 
+def _records_with_filter_bucket_metadata(
+    records: Iterable[VectorRecord],
+    *,
+    dataset_manifest: Mapping[str, Any] | None = None,
+    query_offset: int | None = None,
+    ordinal_start: int = 0,
+) -> Iterable[VectorRecord]:
+    if query_offset is None:
+        query_offset = _dataset_query_offset(dataset_manifest or {})
+    for index, record in enumerate(records, start=ordinal_start):
+        yield _record_with_filter_bucket_metadata(
+            record,
+            ordinal=query_offset + index,
+        )
+
+
+def _record_with_filter_bucket_metadata(
+    record: VectorRecord,
+    *,
+    ordinal: int,
+) -> VectorRecord:
+    if all(
+        field in record.metadata
+        for field in (
+            "filter_bucket_2",
+            "filter_bucket_10",
+            "filter_bucket_100",
+            "filter_bucket_1000",
+        )
+    ):
+        return record
+    metadata = dict(record.metadata)
+    metadata.update(
+        {
+            key: value
+            for key, value in filter_bucket_metadata(
+                record_id=record.id,
+                ordinal=ordinal,
+            ).items()
+            if key not in metadata
+        }
+    )
+    return VectorRecord(
+        id=record.id,
+        vector=record.vector,
+        metadata=metadata,
+        estimated_size_bytes=record.estimated_size_bytes,
+    )
+
+
 def _read_msgpack_records(
     path: Path,
     *,
@@ -3600,8 +3831,8 @@ def _read_msgpack_records(
             yield _parse_msgpack_record(raw, path=path, record_number=index)
 
 
-def load_ground_truth(path: str | Path) -> dict[str, list[str]]:
-    truth: dict[str, list[str]] = {}
+def load_ground_truth(path: str | Path) -> dict[str, GroundTruthEntry]:
+    truth: dict[str, GroundTruthEntry] = {}
     with Path(path).open("rb") as file:
         for line_number, line in enumerate(file, start=1):
             if not line.strip():
@@ -3611,11 +3842,34 @@ def load_ground_truth(path: str | Path) -> dict[str, list[str]]:
             matches = raw.get("matches")
             if not isinstance(query_id, str) or not isinstance(matches, list):
                 raise ConfigError(f"{path}:{line_number} invalid ground truth row")
-            truth[query_id] = [
+            ids = [
                 str(match["id"])
                 for match in matches
                 if isinstance(match, dict) and "id" in match
             ]
+            filter_query = raw.get("filter")
+            if filter_query is not None and not isinstance(filter_query, dict):
+                raise ConfigError(f"{path}:{line_number} filter must be a mapping")
+            filter_name = raw.get("filter_name")
+            if filter_name is not None and not isinstance(filter_name, str):
+                raise ConfigError(f"{path}:{line_number} filter_name must be a string")
+            candidate_count = raw.get("candidate_count")
+            if candidate_count is not None and not isinstance(candidate_count, int):
+                raise ConfigError(
+                    f"{path}:{line_number} candidate_count must be an integer"
+                )
+            expected_count = raw.get("expected_count")
+            if expected_count is not None and not isinstance(expected_count, int):
+                raise ConfigError(
+                    f"{path}:{line_number} expected_count must be an integer"
+                )
+            truth[query_id] = GroundTruthEntry(
+                ids=ids,
+                filter_query=dict(filter_query) if filter_query is not None else None,
+                filter_name=filter_name,
+                candidate_count=candidate_count,
+                expected_count=expected_count,
+            )
     return truth
 
 
@@ -3729,6 +3983,12 @@ def recall_at_k(
     return len(actual_k.intersection(expected_k)) / len(expected_k)
 
 
+def _ground_truth_ids(entry: GroundTruthEntry | None) -> list[str] | None:
+    if entry is None:
+        return None
+    return entry.ids
+
+
 def latency_summary(values: list[float]) -> dict[str, float | None]:
     if not values:
         return {"min": None, "p50": None, "p95": None, "p99": None, "max": None}
@@ -3738,6 +3998,18 @@ def latency_summary(values: list[float]) -> dict[str, float | None]:
         "p50": percentile(ordered, 50),
         "p95": percentile(ordered, 95),
         "p99": percentile(ordered, 99),
+        "max": ordered[-1],
+    }
+
+
+def count_summary_from_values(values: list[int]) -> dict[str, float | int | None]:
+    if not values:
+        return {"min": None, "p50": None, "p95": None, "max": None}
+    ordered = sorted(values)
+    return {
+        "min": ordered[0],
+        "p50": percentile([float(value) for value in ordered], 50),
+        "p95": percentile([float(value) for value in ordered], 95),
         "max": ordered[-1],
     }
 
@@ -3840,6 +4112,7 @@ def _record_shards_for_load(
             raise ConfigError(f"records_shards[{index}] must be a mapping")
         shard = _record_shard_from_manifest(
             dataset_dir=dataset_dir,
+            dataset_manifest=dataset_manifest,
             raw_shard=raw_shard,
             index=index,
             max_records=max_records,
@@ -3858,6 +4131,7 @@ def _record_shards_for_load(
 def _record_shard_from_manifest(
     *,
     dataset_dir: Path,
+    dataset_manifest: Mapping[str, Any],
     raw_shard: Mapping[str, Any],
     index: int,
     max_records: int | None,
@@ -3905,6 +4179,7 @@ def _record_shard_from_manifest(
         batch_base=batch_base,
         effective_records=effective_records,
         manifest_shard_count=manifest_shard_count,
+        query_offset=_dataset_query_offset(dataset_manifest),
     )
 
 
@@ -4248,6 +4523,37 @@ def _partition_filter_spec(scenario: ScenarioConfig) -> PartitionFilterSpec | No
     return PartitionFilterSpec(field=field, metadata_field=metadata_field)
 
 
+def _query_filter_spec(scenario: ScenarioConfig) -> LogicalFilterSpec | None:
+    value = scenario.query.get("filter")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ConfigError("scenario.query.filter must be a mapping")
+    field = value.get("field")
+    operator = value.get("operator")
+    if not isinstance(field, str) or not field:
+        raise ConfigError("scenario.query.filter.field must be a string")
+    if operator != "eq":
+        raise ConfigError("scenario.query.filter.operator must be 'eq'")
+    name = value.get("name")
+    if name is None:
+        name = f"{field}_{operator}"
+    if not isinstance(name, str) or not name:
+        raise ConfigError("scenario.query.filter.name must be a string")
+    selectivity = value.get("expected_selectivity")
+    expected_selectivity = (
+        float(selectivity)
+        if isinstance(selectivity, int | float) and selectivity > 0
+        else None
+    )
+    return LogicalFilterSpec(
+        name=name,
+        field=field,
+        operator=str(operator),
+        expected_selectivity=expected_selectivity,
+    )
+
+
 def _as_stage_mapping(stage: Any, *, stage_index: int) -> Mapping[str, Any]:
     if not isinstance(stage, Mapping):
         raise ConfigError(f"scenario.query.stages[{stage_index}] must be a mapping")
@@ -4318,6 +4624,11 @@ def _dataset_metric(
         return value
     configured = scenario.dataset.get("metric")
     return configured if isinstance(configured, str) else None
+
+
+def _dataset_query_offset(dataset_manifest: Mapping[str, Any]) -> int:
+    value = dataset_manifest.get("dataset", {}).get("written_query_rows")
+    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def _ground_truth_path(dataset_dir: Path, ground_truth_path: str | Path | None) -> Path:

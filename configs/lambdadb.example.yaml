@@ -16,6 +16,14 @@ index_configs:
     type: vector
     dimensions: 1024
     similarity: cosine
+  filter_bucket_2:
+    type: keyword
+  filter_bucket_10:
+    type: keyword
+  filter_bucket_100:
+    type: keyword
+  filter_bucket_1000:
+    type: keyword
 
 metadata:
   deployment_mode: serverless

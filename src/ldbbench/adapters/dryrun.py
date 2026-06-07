@@ -81,6 +81,7 @@ LAMBDADB_DRYRUN = StaticAdapter(
         supported_write_modes=frozenset({"upsert", "bulk_upsert"}),
         supported_query_consistency=frozenset({"eventual", "strong"}),
         supports_read_after_write_strong=True,
+        supports_query_filter=True,
         supports_query_partition_filter=True,
         vendor_consistency_options={"consistent_read": True},
     ),
@@ -92,6 +93,7 @@ QDRANT_DRYRUN = StaticAdapter(
         supported_write_modes=frozenset({"upsert"}),
         supported_query_consistency=frozenset({"eventual"}),
         supports_read_after_write_strong=False,
+        supports_query_filter=True,
         supports_query_partition_filter=False,
         vendor_consistency_options={
             "read_consistency": ["all", "majority", "quorum"],
@@ -107,6 +109,7 @@ PINECONE_DRYRUN = StaticAdapter(
         supported_write_modes=frozenset({"upsert"}),
         supported_query_consistency=frozenset({"eventual"}),
         supports_read_after_write_strong=False,
+        supports_query_filter=True,
         supports_query_partition_filter=False,
         vendor_consistency_options={"data_freshness_model": "eventual"},
     ),

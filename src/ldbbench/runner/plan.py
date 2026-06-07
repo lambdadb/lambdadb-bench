@@ -58,6 +58,10 @@ def build_run_plan(
         scenario.workload != "search_under_ingest"
         and scenario.query.get("partition_filter") is not None
     )
+    query_filter_requested = (
+        scenario.workload != "search_under_ingest"
+        and scenario.query.get("filter") is not None
+    )
     unsupported: list[str] = []
     not_applicable: list[str] = []
     warnings: list[str] = []
@@ -91,6 +95,12 @@ def build_run_plan(
         not_applicable.append(
             f"query partition_filter is N/A for {target.vendor}: "
             "no equivalent physical partition pruning support is declared"
+        )
+
+    if query_filter_requested and not capabilities.supports_query_filter:
+        not_applicable.append(
+            f"query filter is N/A for {target.vendor}: "
+            "no logical metadata filter support is declared"
         )
 
     if not target.endpoint:

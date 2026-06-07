@@ -11,6 +11,13 @@ import pytest
 from ldbbench.adapters.lambdadb import LambdaDBAdapter
 from ldbbench.config import ConfigError, TargetConfig
 
+FILTER_BUCKET_INDEX_CONFIGS = {
+    "filter_bucket_2": {"type": "keyword"},
+    "filter_bucket_10": {"type": "keyword"},
+    "filter_bucket_100": {"type": "keyword"},
+    "filter_bucket_1000": {"type": "keyword"},
+}
+
 
 class FakeStatus:
     def __init__(self, value: str) -> None:
@@ -194,7 +201,8 @@ def test_prepare_create_builds_vector_index_config() -> None:
                     "type": "vector",
                     "dimensions": 1024,
                     "similarity": "dot_product",
-                }
+                },
+                **FILTER_BUCKET_INDEX_CONFIGS,
             },
         }
     ]
@@ -224,7 +232,8 @@ def test_prepare_create_passes_partition_config() -> None:
                     "type": "vector",
                     "dimensions": 1024,
                     "similarity": "cosine",
-                }
+                },
+                **FILTER_BUCKET_INDEX_CONFIGS,
             },
             "partition_config": {
                 "field_name": "url",
@@ -413,7 +422,10 @@ def test_prepare_recreate_waits_for_delete_then_active_collection() -> None:
     assert client.collections.creates == [
         {
             "collection_name": "smoke",
-            "index_configs": {"dense": {"type": "vector", "dimensions": 3}},
+            "index_configs": {
+                "dense": {"type": "vector", "dimensions": 3},
+                **FILTER_BUCKET_INDEX_CONFIGS,
+            },
         }
     ]
     assert result.details["ready_response"].collection.collection_status.value == (
@@ -525,6 +537,27 @@ def test_upsert_batch_copies_partition_field_from_metadata() -> None:
     ]
 
 
+def test_upsert_batch_copies_filter_bucket_fields_from_metadata() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    adapter.upsert_batch(
+        make_target(),
+        [
+            {
+                "id": "a",
+                "vector": [0.1, 0.2],
+                "metadata": {
+                    "text": "alpha",
+                    "filter_bucket_100": "42",
+                },
+            },
+        ],
+    )
+
+    assert client.collections.docs.upserts[0]["docs"][0]["filter_bucket_100"] == "42"
+
+
 def test_query_maps_strong_consistency_to_consistent_read() -> None:
     client = FakeClient()
     adapter = make_adapter(client)
@@ -555,6 +588,27 @@ def test_query_maps_strong_consistency_to_consistent_read() -> None:
             "include_vectors": False,
         }
     ]
+
+
+def test_query_translates_portable_filter() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    adapter.query(
+        make_target(),
+        vector=[0.1, 0.2],
+        top_k=2,
+        consistency="eventual",
+        filter_query={
+            "field": "filter_bucket_100",
+            "operator": "eq",
+            "value": "42",
+        },
+    )
+
+    assert client.collections.queries[0]["query"]["knn"]["filter"] == {
+        "queryString": {"query": "filter_bucket_100:42"}
+    }
 
 
 def test_query_passes_partition_filter() -> None:

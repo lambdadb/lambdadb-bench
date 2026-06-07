@@ -25,6 +25,7 @@ RECORD_SHARD_FILENAME_TEMPLATE = "records-{index:05d}.msgpack"
 DATASET_MANIFEST_FILENAME = "dataset_manifest.json"
 SUPPORTED_PROVIDERS = {"huggingface"}
 DEFAULT_QUERY_COUNT = 1000
+FILTER_BUCKET_COUNTS = (2, 10, 100, 1000)
 
 try:
     import orjson
@@ -605,11 +606,40 @@ def normalize_record(
     }
     if text_field is not None and text_field in row:
         metadata["text"] = row[text_field]
+    _add_filter_bucket_metadata(metadata, record_id=str(record_id), ordinal=ordinal)
 
     return {
         "id": str(record_id),
         "vector": vector,
         "metadata": metadata,
+    }
+
+
+def _add_filter_bucket_metadata(
+    metadata: dict[str, Any],
+    *,
+    record_id: str,
+    ordinal: int,
+) -> None:
+    metadata.update(
+        {
+            key: value
+            for key, value in filter_bucket_metadata(
+                record_id=record_id,
+                ordinal=ordinal,
+            ).items()
+            if key not in metadata
+        }
+    )
+
+
+def filter_bucket_metadata(*, record_id: str, ordinal: int) -> dict[str, str]:
+    seed = f"{record_id}:{ordinal}".encode()
+    digest = hashlib.sha256(seed).digest()
+    value = int.from_bytes(digest[:8], "big", signed=False)
+    return {
+        f"filter_bucket_{bucket_count}": str(value % bucket_count)
+        for bucket_count in FILTER_BUCKET_COUNTS
     }
 
 
@@ -661,6 +691,7 @@ def build_dataset_manifest(
             "written_rows": written_rows,
             "requested_query_rows": requested_query_rows,
             "written_query_rows": written_queries,
+            "filter_buckets": list(FILTER_BUCKET_COUNTS),
         },
         "artifacts": {
             "raw_records": str(raw_records_path),

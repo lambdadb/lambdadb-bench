@@ -14,6 +14,7 @@ class AdapterCapabilities:
     supported_write_modes: frozenset[str]
     supported_query_consistency: frozenset[str]
     supports_read_after_write_strong: bool = False
+    supports_query_filter: bool = False
     supports_query_partition_filter: bool = False
     supported_prepare_modes: frozenset[str] = frozenset(
         {"existing", "create", "recreate"}
@@ -25,6 +26,7 @@ class AdapterCapabilities:
             "supported_write_modes": sorted(self.supported_write_modes),
             "supported_query_consistency": sorted(self.supported_query_consistency),
             "supports_read_after_write_strong": self.supports_read_after_write_strong,
+            "supports_query_filter": self.supports_query_filter,
             "supports_query_partition_filter": self.supports_query_partition_filter,
             "supported_prepare_modes": sorted(self.supported_prepare_modes),
             "vendor_consistency_options": self.vendor_consistency_options,

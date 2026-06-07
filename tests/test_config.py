@@ -292,6 +292,64 @@ query:
         load_scenario(scenario_path)
 
 
+def test_load_scenario_accepts_query_filter(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: filtered
+dataset:
+  rows: 1000000
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  filter:
+    name: synthetic_bucket_1pct
+    field: filter_bucket_100
+    operator: eq
+    value_source:
+      type: eligible_record_buckets
+      min_candidates: top_k
+      seed: 20260511
+    expected_selectivity: 0.01
+""",
+        encoding="utf-8",
+    )
+
+    scenario = load_scenario(scenario_path)
+
+    assert scenario.query["filter"]["field"] == "filter_bucket_100"
+    assert scenario.query["filter"]["value_source"]["type"] == (
+        "eligible_record_buckets"
+    )
+
+
+def test_invalid_query_filter_fails(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: filtered
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  filter:
+    field: filter_bucket_100
+    operator: in
+    value_source:
+      type: eligible_record_buckets
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="query.filter.operator"):
+        load_scenario(scenario_path)
+
+
 def test_invalid_process_counts_fail(tmp_path) -> None:
     scenario_path = tmp_path / "scenario.yaml"
     scenario_path.write_text(

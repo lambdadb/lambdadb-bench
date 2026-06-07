@@ -102,6 +102,65 @@ def test_prepare_ground_truth_limit_queries(tmp_path) -> None:
     assert len(result.ground_truth_path.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_prepare_ground_truth_writes_filtered_exact_matches(tmp_path) -> None:
+    prepare_fixture_dataset(tmp_path)
+
+    result = prepare_ground_truth(
+        dataset_dir=tmp_path,
+        top_k=1,
+        filter_name="synthetic_bucket_50pct",
+        filter_field="filter_bucket_2",
+        filter_value_source="eligible-record-buckets",
+    )
+
+    lines = result.ground_truth_path.read_text(encoding="utf-8").splitlines()
+    truth = json.loads(lines[0])
+    assert result.ground_truth_path.name == (
+        "ground_truth.filtered.synthetic_bucket_50pct.jsonl"
+    )
+    assert result.manifest_path.name == (
+        "ground_truth.filtered.synthetic_bucket_50pct.manifest.json"
+    )
+    assert result.manifest["ground_truth"]["filter"]["field"] == "filter_bucket_2"
+    assert result.manifest["ground_truth"]["candidate_count"]["eligible_values"] >= 1
+    assert truth["filter"] == {
+        "field": "filter_bucket_2",
+        "operator": "eq",
+        "value": truth["filter"]["value"],
+    }
+    assert truth["candidate_count"] >= 1
+    assert truth["expected_count"] == 1
+    assert [match["id"] for match in truth["matches"]]
+
+
+def test_prepare_ground_truth_backfills_missing_filter_buckets(tmp_path) -> None:
+    dataset = prepare_fixture_dataset(tmp_path)
+    stripped = []
+    for line in dataset.records_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        record["metadata"] = {
+            key: value
+            for key, value in record["metadata"].items()
+            if not key.startswith("filter_bucket_")
+        }
+        stripped.append(json.dumps(record, sort_keys=True))
+    dataset.records_path.write_text("\n".join(stripped) + "\n", encoding="utf-8")
+
+    result = prepare_ground_truth(
+        dataset_dir=tmp_path,
+        top_k=1,
+        filter_name="synthetic_bucket_50pct",
+        filter_field="filter_bucket_2",
+        filter_value_source="eligible-record-buckets",
+    )
+
+    truth = json.loads(
+        result.ground_truth_path.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert truth["candidate_count"] >= 1
+    assert truth["filter"]["field"] == "filter_bucket_2"
+
+
 def test_prepare_ground_truth_writes_faiss_matches(tmp_path, monkeypatch) -> None:
     np = pytest.importorskip("numpy")
     fake_faiss = types.ModuleType("faiss")

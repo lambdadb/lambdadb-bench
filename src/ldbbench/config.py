@@ -83,6 +83,7 @@ class ScenarioConfig:
             )
         _validate_optional_positive_int(query, "processes")
         _validate_partition_filter(query)
+        _validate_query_filter(query)
         _validate_search_under_ingest(
             search_under_ingest,
             workload=str(workload),
@@ -342,6 +343,48 @@ def _validate_partition_filter(query: Mapping[str, Any]) -> None:
         raise ConfigError(
             "scenario.query.partition_filter.metadata_field must be a string"
         )
+
+
+def _validate_query_filter(query: Mapping[str, Any]) -> None:
+    value = query.get("filter")
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ConfigError("scenario.query.filter must be a mapping")
+    name = value.get("name")
+    field = value.get("field")
+    operator = value.get("operator")
+    if name is not None and (not isinstance(name, str) or not name):
+        raise ConfigError("scenario.query.filter.name must be a string")
+    if not isinstance(field, str) or not field:
+        raise ConfigError("scenario.query.filter.field must be a string")
+    if operator != "eq":
+        raise ConfigError("scenario.query.filter.operator must be 'eq'")
+    source = value.get("value_source")
+    if not isinstance(source, dict):
+        raise ConfigError("scenario.query.filter.value_source must be a mapping")
+    source_type = source.get("type")
+    if source_type != "eligible_record_buckets":
+        raise ConfigError(
+            "scenario.query.filter.value_source.type must be "
+            "'eligible_record_buckets'"
+        )
+    seed = source.get("seed")
+    if seed is not None and not isinstance(seed, int):
+        raise ConfigError("scenario.query.filter.value_source.seed must be an integer")
+    min_candidates = source.get("min_candidates", "top_k")
+    if min_candidates != "top_k" and (
+        not isinstance(min_candidates, int) or min_candidates <= 0
+    ):
+        raise ConfigError(
+            "scenario.query.filter.value_source.min_candidates must be 'top_k' "
+            "or a positive integer"
+        )
+    selectivity = value.get("expected_selectivity")
+    if selectivity is not None and (
+        not isinstance(selectivity, int | float) or selectivity <= 0
+    ):
+        raise ConfigError("scenario.query.filter.expected_selectivity must be positive")
 
 
 def _validate_search_under_ingest(

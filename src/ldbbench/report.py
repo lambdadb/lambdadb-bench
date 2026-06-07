@@ -41,6 +41,9 @@ QUERY_CSV_HEADERS = [
     "processes",
     "worker_threads_per_process",
     "partition_filter_applied",
+    "filter_applied",
+    "filter_name",
+    "filter_selectivity",
     "recall_skip_reason",
     "queries",
     "queries_per_second",
@@ -49,6 +52,10 @@ QUERY_CSV_HEADERS = [
     "p95_ms",
     "p99_ms",
     "recall_at_k",
+    "candidate_count_p50",
+    "expected_count_p50",
+    "returned_count_p50",
+    "underfilled_result_rate",
     "errors",
     "error_rate",
 ]
@@ -338,6 +345,10 @@ def _query_stage_rows(runs: list[RunReport]) -> list[dict[str, str]]:
 
 def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
     latency = _mapping(stage.get("latency_ms"))
+    filter_config = _mapping(stage.get("filter"))
+    candidate_count = _mapping(stage.get("candidate_count"))
+    expected_count = _mapping(stage.get("expected_count"))
+    returned_count = _mapping(stage.get("returned_count"))
     return {
         "result_dir": str(run.path),
         "target": _target_label(run),
@@ -348,6 +359,9 @@ def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
             stage.get("worker_threads_per_process"),
         ),
         "partition_filter_applied": _fmt(stage.get("partition_filter_applied")),
+        "filter_applied": _fmt(stage.get("filter_applied")),
+        "filter_name": _fmt(filter_config.get("name")),
+        "filter_selectivity": _fmt_float(filter_config.get("expected_selectivity")),
         "recall_skip_reason": _fmt(stage.get("recall_skip_reason")),
         "queries": _fmt(stage.get("queries")),
         "queries_per_second": _fmt_float(stage.get("queries_per_second")),
@@ -356,6 +370,10 @@ def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
         "p95_ms": _fmt_float(latency.get("p95")),
         "p99_ms": _fmt_float(latency.get("p99")),
         "recall_at_k": _fmt_float(stage.get("recall_at_k")),
+        "candidate_count_p50": _fmt_float(candidate_count.get("p50")),
+        "expected_count_p50": _fmt_float(expected_count.get("p50")),
+        "returned_count_p50": _fmt_float(returned_count.get("p50")),
+        "underfilled_result_rate": _fmt_float(stage.get("underfilled_result_rate")),
         "errors": _fmt(stage.get("errors")),
         "error_rate": _fmt_float(stage.get("error_rate")),
     }
@@ -452,6 +470,12 @@ def _warning_lines(runs: list[RunReport]) -> list[str]:
             warnings.append(
                 f"{target}: recall is N/A because partition-filtered search "
                 "uses a restricted candidate set."
+            )
+        underfilled = query.get("underfilled_result_rate")
+        if isinstance(underfilled, int | float) and underfilled > 0:
+            warnings.append(
+                f"{target}: filtered search underfilled "
+                f"{_fmt_float(underfilled)} of successful query results."
             )
         for stage_name, stage in (("load", load), ("query", query)):
             errors = stage.get("errors")

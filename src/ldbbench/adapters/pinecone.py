@@ -17,6 +17,7 @@ from ldbbench.adapters.base import (
     UpsertResult,
     VectorRecord,
 )
+from ldbbench.adapters.filters import pinecone_filter
 from ldbbench.config import ConfigError, TargetConfig
 
 DEFAULT_CLOUD = "aws"
@@ -34,6 +35,7 @@ PINECONE_CAPABILITIES = AdapterCapabilities(
     supported_write_modes=frozenset({"upsert"}),
     supported_query_consistency=frozenset({"eventual"}),
     supports_read_after_write_strong=False,
+    supports_query_filter=True,
     supports_query_partition_filter=False,
     vendor_consistency_options={"data_freshness_model": "eventual"},
 )
@@ -196,7 +198,7 @@ class PineconeAdapter:
             "include_metadata": True,
         }
         if filter_query is not None:
-            kwargs["filter"] = dict(filter_query)
+            kwargs["filter"] = pinecone_filter(filter_query)
         response = self._index(settings).query(**kwargs)
         return QueryResult(matches=_query_matches(response), raw_response=response)
 

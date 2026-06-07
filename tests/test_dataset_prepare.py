@@ -114,18 +114,21 @@ def test_prepare_dataset_writes_normalized_records_and_queries(tmp_path) -> None
     )
     assert raw == rows[:3]
     assert queries[0]["id"] == "q"
-    assert records == [
-        {
-            "id": "a",
-            "metadata": {"text": "alpha", "url": "a-url"},
-            "vector": [1.0, 0.0],
-        },
-        {
-            "id": "b",
-            "metadata": {"text": "beta", "url": "b-url"},
-            "vector": [0.0, 1.0],
-        },
-    ]
+    assert [record["id"] for record in records] == ["a", "b"]
+    assert records[0]["metadata"]["text"] == "alpha"
+    assert records[0]["metadata"]["url"] == "a-url"
+    assert records[1]["metadata"]["text"] == "beta"
+    assert records[1]["metadata"]["url"] == "b-url"
+    for record in records:
+        assert set(record["metadata"]).issuperset(
+            {
+                "filter_bucket_2",
+                "filter_bucket_10",
+                "filter_bucket_100",
+                "filter_bucket_1000",
+            }
+        )
+    assert [record["vector"] for record in records] == [[1.0, 0.0], [0.0, 1.0]]
     with result.records_msgpack_path.open("rb") as file:
         msgpack_records = list(msgpack.Unpacker(file, raw=False))
     assert msgpack_records[0]["id"] == "a"

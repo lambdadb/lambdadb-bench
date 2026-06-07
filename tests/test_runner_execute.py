@@ -5,6 +5,7 @@ import time
 from threading import Lock
 from typing import Any
 
+import msgpack
 import pytest
 
 from ldbbench.adapters.base import (
@@ -36,6 +37,7 @@ class FakeAdapter:
     capabilities = AdapterCapabilities(
         supported_write_modes=frozenset({"upsert", "bulk_upsert"}),
         supported_query_consistency=frozenset({"eventual"}),
+        supports_query_filter=True,
         supports_query_partition_filter=True,
     )
 
@@ -51,6 +53,7 @@ class FakeAdapter:
         self.upserted: list[list[VectorRecord]] = []
         self.write_modes: list[str] = []
         self.queries: list[list[float]] = []
+        self.filter_queries: list[dict[str, Any] | None] = []
         self.partition_filters: list[dict[str, Any] | None] = []
         self.fail_load_batch = fail_load_batch
         self.fail_every = fail_every
@@ -112,17 +115,21 @@ class FakeAdapter:
             self.query_calls += 1
             call_number = self.query_calls
             self.queries.append(vector)
+            self.filter_queries.append(filter_query)
             self.partition_filters.append(partition_filter)
         if self.fail_every and call_number % self.fail_every == 0:
             raise RuntimeError("planned query failure")
-        scored = [
-            (
-                sum(q * r for q, r in zip(vector, record.vector, strict=True)),
-                record.id,
-            )
-            for batch in self.upserted
-            for record in batch
-        ]
+        scored = []
+        for batch in self.upserted:
+            for record in batch:
+                if not _matches_portable_filter(record, filter_query):
+                    continue
+                scored.append(
+                    (
+                        sum(q * r for q, r in zip(vector, record.vector, strict=True)),
+                        record.id,
+                    )
+                )
         if scored:
             return QueryResult(
                 matches=[
@@ -159,6 +166,8 @@ def make_scenario(
     load_concurrency: int | None = None,
     wait_until_query_visible: bool = False,
     partition_filter: bool = False,
+    query_filter: bool = False,
+    top_k: int = 2,
     write_mode: str = "upsert",
     sharded_records: bool = False,
     shard_count: int | None = None,
@@ -167,7 +176,7 @@ def make_scenario(
     search_under_ingest: dict[str, Any] | None = None,
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
-        "top_k": 2,
+        "top_k": top_k,
         "query_count": 1,
         "consistency": "eventual",
     }
@@ -177,6 +186,17 @@ def make_scenario(
         query["partition_filter"] = {
             "field": "url",
             "metadata_field": "url",
+        }
+    if query_filter:
+        query["filter"] = {
+            "name": "synthetic_bucket_50pct",
+            "field": "filter_bucket_2",
+            "operator": "eq",
+            "value_source": {
+                "type": "eligible_record_buckets",
+                "min_candidates": "top_k",
+            },
+            "expected_selectivity": 0.5,
         }
     mapping: dict[str, Any] = {
         "name": "runner-smoke",
@@ -211,6 +231,21 @@ def make_scenario(
     if shard_count is not None:
         mapping["load"]["shard_count"] = shard_count
     return ScenarioConfig.from_mapping(mapping)
+
+
+def _matches_portable_filter(
+    record: VectorRecord,
+    filter_query: dict[str, Any] | None,
+) -> bool:
+    if filter_query is None:
+        return True
+    if not {"field", "operator", "value"}.issubset(filter_query):
+        return True
+    if filter_query["operator"] != "eq":
+        return False
+    return str(record.metadata.get(str(filter_query["field"]))) == str(
+        filter_query["value"]
+    )
 
 
 def make_target() -> TargetConfig:
@@ -368,6 +403,46 @@ def test_execute_benchmark_forwards_bulk_write_mode(tmp_path) -> None:
     assert result.summary["load"]["write_mode"] == "bulk_upsert"
 
 
+def test_execute_benchmark_backfills_filter_buckets_for_legacy_load_cache(
+    tmp_path,
+) -> None:
+    scenario = make_scenario()
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario, query_count=1)
+    stripped_records = []
+    with dataset.records_msgpack_path.open("rb") as file:
+        for record in msgpack.Unpacker(file, raw=False):
+            record["metadata"] = {
+                key: value
+                for key, value in record["metadata"].items()
+                if not key.startswith("filter_bucket_")
+            }
+            stripped_records.append(record)
+    packer = msgpack.Packer(use_bin_type=True, use_single_float=True)
+    with dataset.records_msgpack_path.open("wb") as file:
+        for record in stripped_records:
+            file.write(packer.pack(record))
+    adapter = FakeAdapter()
+
+    execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+
+    metadata = adapter.upserted[0][0].metadata
+    assert metadata["filter_bucket_2"]
+    assert metadata["filter_bucket_10"]
+    assert metadata["filter_bucket_100"]
+    assert metadata["filter_bucket_1000"]
+
+
 def test_execute_benchmark_loads_sharded_records(tmp_path) -> None:
     scenario = make_scenario(
         batch_size=1,
@@ -479,6 +554,70 @@ def test_execute_benchmark_applies_partition_filter_and_skips_recall(tmp_path) -
     assert result.summary["query"]["recall_samples"] == 0
     assert result.summary["query"]["partition_filter_applied"] is True
     assert result.summary["query"]["recall_skip_reason"] == "partition_filtered"
+
+
+def test_execute_benchmark_applies_logical_filter_from_ground_truth(tmp_path) -> None:
+    scenario = make_scenario(query_filter=True, top_k=1)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    truth = prepare_ground_truth(
+        dataset_dir=dataset.output_dir,
+        top_k=1,
+        filter_name="synthetic_bucket_50pct",
+        filter_field="filter_bucket_2",
+        filter_value_source="eligible-record-buckets",
+    )
+    adapter = FakeAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        ground_truth_path=truth.ground_truth_path,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert adapter.filter_queries == [query_events[0]["filter"]]
+    assert query_events[0]["filter_name"] == "synthetic_bucket_50pct"
+    assert query_events[0]["filter_selectivity"] == 0.5
+    assert query_events[0]["candidate_count"] >= 1
+    assert query_events[0]["expected_count"] == 1
+    assert query_events[0]["returned_count"] == 1
+    assert query_events[0]["recall_at_k"] == 1.0
+    assert result.summary["query"]["filter_applied"] is True
+    assert result.summary["query"]["filter"]["field"] == "filter_bucket_2"
+    assert result.summary["query"]["candidate_count"]["min"] >= 1
+    assert result.summary["query"]["underfilled_result_rate"] == 0.0
+
+
+def test_execute_benchmark_fails_logical_filter_without_filtered_truth(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(query_filter=True, top_k=1)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    prepare_ground_truth(dataset_dir=dataset.output_dir, top_k=1)
+
+    with pytest.raises(ConfigError, match="filtered ground truth"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+        )
 
 
 def test_execute_benchmark_fails_partition_filter_when_query_metadata_missing(

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import random
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,6 +18,7 @@ from ldbbench.datasets.prepare import (
     DATASET_MANIFEST_FILENAME,
     QUERIES_FILENAME,
     RECORDS_FILENAME,
+    filter_bucket_metadata,
 )
 from ldbbench.manifest import sha256_file
 from ldbbench.progress import ProgressCallback, ProgressTicker
@@ -43,6 +46,26 @@ class VectorItem:
     norm: float
 
 
+@dataclass(frozen=True)
+class FilterSpec:
+    name: str
+    field: str
+    operator: str
+    value_source: str
+    seed: int
+    min_candidates: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "field": self.field,
+            "operator": self.operator,
+            "value_source": self.value_source,
+            "seed": self.seed,
+            "min_candidates": self.min_candidates,
+        }
+
+
 def prepare_ground_truth(
     *,
     dataset_dir: str | Path,
@@ -51,6 +74,12 @@ def prepare_ground_truth(
     backend: str = "exact",
     limit_queries: int | None = None,
     batch_size: int = DEFAULT_FAISS_BATCH_SIZE,
+    filter_name: str | None = None,
+    filter_field: str | None = None,
+    filter_operator: str = "eq",
+    filter_value_source: str | None = None,
+    filter_seed: int = 0,
+    filter_min_candidates: int | None = None,
     dry_run: bool = False,
     progress: ProgressCallback | None = None,
 ) -> GroundTruthResult:
@@ -65,6 +94,14 @@ def prepare_ground_truth(
             f"ground truth backend {backend!r} is not supported; "
             f"known: {sorted(SUPPORTED_BACKENDS)}"
         )
+    filter_spec = _filter_spec(
+        filter_name=filter_name,
+        filter_field=filter_field,
+        filter_operator=filter_operator,
+        filter_value_source=filter_value_source,
+        filter_seed=filter_seed,
+        filter_min_candidates=filter_min_candidates or top_k,
+    )
 
     out = Path(dataset_dir)
     dataset_manifest = load_dataset_manifest(out)
@@ -77,8 +114,8 @@ def prepare_ground_truth(
 
     records_path = artifact_path(out, dataset_manifest, "records", RECORDS_FILENAME)
     queries_path = artifact_path(out, dataset_manifest, "queries", QUERIES_FILENAME)
-    ground_truth_path = out / GROUND_TRUTH_FILENAME
-    manifest_path = out / GROUND_TRUTH_MANIFEST_FILENAME
+    ground_truth_path = _ground_truth_output_path(out, filter_spec=filter_spec)
+    manifest_path = _ground_truth_manifest_path(out, filter_spec=filter_spec)
 
     query_count = 0
     record_count = 0
@@ -100,30 +137,60 @@ def prepare_ground_truth(
         if backend == "exact":
             ticker.emit("ground_truth: loading records for exact search")
             records = list(read_vector_items(records_path))
+            if filter_spec is not None:
+                ensure_filter_bucket_metadata(records, dataset_manifest)
             ticker.emit(f"ground_truth: loaded records={len(records)}")
             queries = read_vector_items(queries_path)
-            query_count = write_exact_ground_truth(
-                records=records,
-                queries=queries,
-                output_path=ground_truth_path,
-                top_k=top_k,
-                metric=selected_metric,
-                limit_queries=limit_queries,
-                progress=progress,
-            )
+            if filter_spec is None:
+                query_count = write_exact_ground_truth(
+                    records=records,
+                    queries=queries,
+                    output_path=ground_truth_path,
+                    top_k=top_k,
+                    metric=selected_metric,
+                    limit_queries=limit_queries,
+                    progress=progress,
+                )
+            else:
+                result = write_filtered_exact_ground_truth(
+                    records=records,
+                    queries=queries,
+                    output_path=ground_truth_path,
+                    top_k=top_k,
+                    metric=selected_metric,
+                    filter_spec=filter_spec,
+                    limit_queries=limit_queries,
+                    progress=progress,
+                )
+                query_count = result["queries"]
+                backend_details.update(result["backend_details"])
             record_count = len(records)
         elif backend == "faiss":
-            result = write_faiss_ground_truth(
-                records_path=records_path,
-                queries_path=queries_path,
-                output_path=ground_truth_path,
-                top_k=top_k,
-                metric=selected_metric,
-                limit_queries=limit_queries,
-                batch_size=batch_size,
-                dataset_manifest=dataset_manifest,
-                progress=progress,
-            )
+            if filter_spec is None:
+                result = write_faiss_ground_truth(
+                    records_path=records_path,
+                    queries_path=queries_path,
+                    output_path=ground_truth_path,
+                    top_k=top_k,
+                    metric=selected_metric,
+                    limit_queries=limit_queries,
+                    batch_size=batch_size,
+                    dataset_manifest=dataset_manifest,
+                    progress=progress,
+                )
+            else:
+                result = write_filtered_faiss_ground_truth(
+                    records_path=records_path,
+                    queries_path=queries_path,
+                    output_path=ground_truth_path,
+                    top_k=top_k,
+                    metric=selected_metric,
+                    limit_queries=limit_queries,
+                    batch_size=batch_size,
+                    dataset_manifest=dataset_manifest,
+                    filter_spec=filter_spec,
+                    progress=progress,
+                )
             query_count = result["queries"]
             record_count = result["records"]
             backend_details.update(result["backend_details"])
@@ -146,6 +213,7 @@ def prepare_ground_truth(
         status=status,
         record_count=record_count,
         query_count=query_count,
+        filter_spec=filter_spec,
     )
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -197,6 +265,58 @@ def write_exact_ground_truth(
             count += 1
             ticker.maybe(f"ground_truth: exact queries={count}")
     return count
+
+
+def write_filtered_exact_ground_truth(
+    *,
+    records: list[VectorItem],
+    queries: Iterable[VectorItem],
+    output_path: str | Path,
+    top_k: int,
+    metric: str,
+    filter_spec: FilterSpec,
+    limit_queries: int | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    buckets, eligible_values = _eligible_record_buckets(
+        records,
+        filter_spec=filter_spec,
+    )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    ticker = ProgressTicker(progress)
+    with output.open("w", encoding="utf-8") as file:
+        for query in queries:
+            if limit_queries is not None and count >= limit_queries:
+                break
+            filter_value = _assigned_filter_value(eligible_values, count)
+            candidates = buckets[filter_value]
+            matches = exact_top_k(
+                query=query,
+                records=candidates,
+                top_k=top_k,
+                metric=metric,
+            )
+            write_filtered_ground_truth_row(
+                file,
+                query=query,
+                filter_spec=filter_spec,
+                filter_value=filter_value,
+                candidate_count=len(candidates),
+                matches=matches,
+            )
+            count += 1
+            ticker.maybe(f"ground_truth: exact filtered queries={count}")
+    return {
+        "queries": count,
+        "backend_details": {
+            "candidate_count": _candidate_count_summary(
+                buckets,
+                eligible_values,
+            ),
+        },
+    }
 
 
 def write_faiss_ground_truth(
@@ -258,6 +378,112 @@ def write_faiss_ground_truth(
             "batch_size": batch_size,
             "index_type": "IndexFlatIP",
             "normalize_vectors": normalize,
+        },
+    }
+
+
+def write_filtered_faiss_ground_truth(
+    *,
+    records_path: str | Path,
+    queries_path: str | Path,
+    output_path: str | Path,
+    top_k: int,
+    metric: str,
+    limit_queries: int | None,
+    batch_size: int,
+    dataset_manifest: Mapping[str, Any],
+    filter_spec: FilterSpec,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    faiss, np = import_faiss_dependencies()
+    dimensions = dataset_dimensions(dataset_manifest)
+    ticker = ProgressTicker(progress)
+    ticker.emit(
+        "ground_truth: loading records for filtered faiss "
+        f"dimensions={dimensions}"
+    )
+    records = list(read_vector_items(records_path))
+    ensure_filter_bucket_metadata(records, dataset_manifest)
+    for record in records:
+        if len(record.vector) != dimensions:
+            raise ConfigError(
+                f"vector dimension mismatch for record {record.id!r}: "
+                f"expected {dimensions}, got {len(record.vector)}"
+            )
+    buckets, eligible_values = _eligible_record_buckets(
+        records,
+        filter_spec=filter_spec,
+    )
+    normalize = metric == "cosine"
+    index_cache: dict[str, tuple[Any, list[str], int]] = {}
+
+    def bucket_index(filter_value: str) -> tuple[Any, list[str], int]:
+        cached = index_cache.get(filter_value)
+        if cached is not None:
+            return cached
+        candidates = buckets[filter_value]
+        record_ids = [record.id for record in candidates]
+        vectors = np.asarray([record.vector for record in candidates], dtype=np.float32)
+        if normalize:
+            faiss.normalize_L2(vectors)
+        index = faiss.IndexFlatIP(dimensions)
+        index.add(vectors)
+        cached = index, record_ids, len(candidates)
+        index_cache[filter_value] = cached
+        return cached
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    query_count = 0
+    with output.open("w", encoding="utf-8") as file:
+        for query in read_vector_items(queries_path):
+            if limit_queries is not None and query_count >= limit_queries:
+                break
+            if len(query.vector) != dimensions:
+                raise ConfigError(
+                    f"vector dimension mismatch for query {query.id!r}: "
+                    f"expected {dimensions}, got {len(query.vector)}"
+                )
+            filter_value = _assigned_filter_value(eligible_values, query_count)
+            index, record_ids, candidate_count = bucket_index(filter_value)
+            query_vectors = np.asarray([query.vector], dtype=np.float32)
+            if normalize:
+                faiss.normalize_L2(query_vectors)
+            scores, indices = index.search(
+                query_vectors,
+                min(candidate_count, top_k + 1),
+            )
+            matches = faiss_matches(
+                query=query,
+                scores=scores[0],
+                indices=indices[0],
+                record_ids=record_ids,
+                top_k=top_k,
+                metric=metric,
+            )
+            write_filtered_ground_truth_row(
+                file,
+                query=query,
+                filter_spec=filter_spec,
+                filter_value=filter_value,
+                candidate_count=candidate_count,
+                matches=matches,
+            )
+            query_count += 1
+            ticker.maybe(f"ground_truth: faiss filtered queries={query_count}")
+    return {
+        "records": len(records),
+        "queries": query_count,
+        "backend_details": {
+            "batch_size": batch_size,
+            "index_type": "IndexFlatIP",
+            "normalize_vectors": normalize,
+            "filtered_index_values": len(index_cache),
+            "eligible_filter_values": len(eligible_values),
+            "candidate_count": _candidate_count_summary(
+                buckets,
+                eligible_values,
+            ),
         },
     }
 
@@ -530,6 +756,117 @@ def exact_top_k(
     ]
 
 
+def write_filtered_ground_truth_row(
+    file: Any,
+    *,
+    query: VectorItem,
+    filter_spec: FilterSpec,
+    filter_value: str,
+    candidate_count: int,
+    matches: list[dict[str, Any]],
+) -> None:
+    file.write(
+        json.dumps(
+            {
+                "query_id": query.id,
+                "filter": {
+                    "field": filter_spec.field,
+                    "operator": filter_spec.operator,
+                    "value": filter_value,
+                },
+                "filter_name": filter_spec.name,
+                "candidate_count": candidate_count,
+                "expected_count": len(matches),
+                "matches": matches,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def _eligible_record_buckets(
+    records: list[VectorItem],
+    *,
+    filter_spec: FilterSpec,
+) -> tuple[dict[str, list[VectorItem]], list[str]]:
+    buckets: dict[str, list[VectorItem]] = {}
+    for record in records:
+        value = record.metadata.get(filter_spec.field)
+        if value is None:
+            continue
+        buckets.setdefault(str(value), []).append(record)
+    eligible_values = [
+        value
+        for value, candidates in buckets.items()
+        if len(candidates) >= filter_spec.min_candidates
+    ]
+    if not eligible_values:
+        raise ConfigError(
+            "filtered ground truth has no eligible record buckets for "
+            f"{filter_spec.field!r} with min_candidates={filter_spec.min_candidates}"
+        )
+    eligible_values = sorted(eligible_values)
+    random.Random(filter_spec.seed).shuffle(eligible_values)
+    return buckets, eligible_values
+
+
+def _candidate_count_summary(
+    buckets: Mapping[str, list[VectorItem]],
+    eligible_values: list[str],
+) -> dict[str, Any]:
+    counts = sorted(len(buckets[value]) for value in eligible_values)
+    return {
+        "eligible_values": len(eligible_values),
+        "min": counts[0],
+        "p50": _percentile(counts, 50),
+        "p95": _percentile(counts, 95),
+        "max": counts[-1],
+    }
+
+
+def _percentile(values: list[int], percentile_value: int) -> float:
+    if len(values) == 1:
+        return float(values[0])
+    rank = (percentile_value / 100) * (len(values) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(values) - 1)
+    weight = rank - lower
+    return values[lower] * (1 - weight) + values[upper] * weight
+
+
+def ensure_filter_bucket_metadata(
+    records: list[VectorItem],
+    dataset_manifest: Mapping[str, Any],
+) -> None:
+    query_offset = dataset_manifest.get("dataset", {}).get("written_query_rows", 0)
+    if not isinstance(query_offset, int) or query_offset < 0:
+        query_offset = 0
+    for index, record in enumerate(records):
+        missing = [
+            field
+            for field in (
+                "filter_bucket_2",
+                "filter_bucket_10",
+                "filter_bucket_100",
+                "filter_bucket_1000",
+            )
+            if field not in record.metadata
+        ]
+        if not missing:
+            continue
+        record.metadata.update(
+            filter_bucket_metadata(
+                record_id=record.id,
+                ordinal=query_offset + index,
+            )
+        )
+
+
+def _assigned_filter_value(eligible_values: list[str], query_index: int) -> str:
+    return eligible_values[query_index % len(eligible_values)]
+
+
 def score_vectors(*, query: VectorItem, record: VectorItem, metric: str) -> float:
     if len(query.vector) != len(record.vector):
         raise ConfigError(
@@ -632,6 +969,7 @@ def build_ground_truth_manifest(
     status: str,
     record_count: int,
     query_count: int,
+    filter_spec: FilterSpec | None = None,
 ) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "created_at": datetime.now(UTC).isoformat(),
@@ -663,6 +1001,8 @@ def build_ground_truth_manifest(
             "ground_truth_sha256": _sha256_if_exists(ground_truth_path),
         },
     }
+    if filter_spec is not None:
+        manifest["ground_truth"]["filter"] = filter_spec.as_dict()
     return manifest
 
 
@@ -670,3 +1010,64 @@ def _sha256_if_exists(path: Path) -> str | None:
     if path.exists():
         return sha256_file(path)
     return None
+
+
+def _filter_spec(
+    *,
+    filter_name: str | None,
+    filter_field: str | None,
+    filter_operator: str,
+    filter_value_source: str | None,
+    filter_seed: int,
+    filter_min_candidates: int,
+) -> FilterSpec | None:
+    if filter_name is None and filter_field is None and filter_value_source is None:
+        return None
+    if not isinstance(filter_name, str) or not filter_name:
+        raise ConfigError("filtered ground truth requires --filter-name")
+    if not isinstance(filter_field, str) or not filter_field:
+        raise ConfigError("filtered ground truth requires --filter-field")
+    if filter_operator != "eq":
+        raise ConfigError("filtered ground truth supports only --filter-operator eq")
+    if filter_value_source != "eligible-record-buckets":
+        raise ConfigError(
+            "filtered ground truth supports only "
+            "--filter-value-source eligible-record-buckets"
+        )
+    if filter_min_candidates <= 0:
+        raise ConfigError("--filter-min-candidates must be positive")
+    return FilterSpec(
+        name=filter_name,
+        field=filter_field,
+        operator=filter_operator,
+        value_source=filter_value_source,
+        seed=filter_seed,
+        min_candidates=filter_min_candidates,
+    )
+
+
+def _ground_truth_output_path(
+    dataset_dir: Path,
+    *,
+    filter_spec: FilterSpec | None,
+) -> Path:
+    if filter_spec is None:
+        return dataset_dir / GROUND_TRUTH_FILENAME
+    return dataset_dir / f"ground_truth.filtered.{_safe_name(filter_spec.name)}.jsonl"
+
+
+def _ground_truth_manifest_path(
+    dataset_dir: Path,
+    *,
+    filter_spec: FilterSpec | None,
+) -> Path:
+    if filter_spec is None:
+        return dataset_dir / GROUND_TRUTH_MANIFEST_FILENAME
+    return (
+        dataset_dir
+        / f"ground_truth.filtered.{_safe_name(filter_spec.name)}.manifest.json"
+    )
+
+
+def _safe_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "filter"

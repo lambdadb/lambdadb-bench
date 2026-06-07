@@ -157,6 +157,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Limit the number of query rows to process.",
     )
     ground_truth.add_argument(
+        "--filter-name",
+        help="Name for filtered ground truth output artifacts.",
+    )
+    ground_truth.add_argument(
+        "--filter-field",
+        help="Metadata field to use for filtered ground truth.",
+    )
+    ground_truth.add_argument(
+        "--filter-operator",
+        default="eq",
+        choices=["eq"],
+        help="Logical filter operator for filtered ground truth.",
+    )
+    ground_truth.add_argument(
+        "--filter-value-source",
+        choices=["eligible-record-buckets"],
+        help="How per-query filter values are assigned.",
+    )
+    ground_truth.add_argument(
+        "--filter-seed",
+        type=int,
+        default=0,
+        help="Seed used to assign eligible filter values to queries.",
+    )
+    ground_truth.add_argument(
+        "--filter-min-candidates",
+        type=int,
+        help="Minimum loaded-record candidates per assigned filter value.",
+    )
+    ground_truth.add_argument(
         "--dry-run",
         action="store_true",
         help="Write only the ground truth manifest without computing neighbors.",
@@ -361,6 +391,12 @@ def run_dataset_ground_truth(args: argparse.Namespace) -> int:
         backend=args.backend,
         limit_queries=args.limit_queries,
         batch_size=args.batch_size,
+        filter_name=args.filter_name,
+        filter_field=args.filter_field,
+        filter_operator=args.filter_operator,
+        filter_value_source=args.filter_value_source,
+        filter_seed=args.filter_seed,
+        filter_min_candidates=args.filter_min_candidates,
         dry_run=args.dry_run,
         progress=print_progress,
     )
@@ -368,6 +404,8 @@ def run_dataset_ground_truth(args: argparse.Namespace) -> int:
     print(f"backend: {result.manifest['ground_truth']['backend']}")
     print(f"metric: {result.manifest['ground_truth']['metric']}")
     print(f"top_k: {result.manifest['ground_truth']['top_k']}")
+    if "filter" in result.manifest["ground_truth"]:
+        print(f"filter: {result.manifest['ground_truth']['filter']['name']}")
     print(f"records: {result.manifest['dataset']['records']}")
     print(f"queries: {result.manifest['dataset']['queries']}")
     print(f"wrote {result.manifest_path}")

@@ -460,7 +460,8 @@ but mark the result as not meeting the quality target.
 - Idle-to-burst workload.
 - Search-under-ingest workload.
 - Write visibility workload.
-- Optional filtered search workload.
+- Optional filtered search workload. See
+  [FILTERED_SEARCH_WORKLOAD.md](FILTERED_SEARCH_WORKLOAD.md).
 
 ## Resolved Decisions
 

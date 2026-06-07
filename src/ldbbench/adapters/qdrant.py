@@ -18,12 +18,14 @@ from ldbbench.adapters.base import (
     UpsertResult,
     VectorRecord,
 )
+from ldbbench.adapters.filters import qdrant_filter
 from ldbbench.config import ConfigError, TargetConfig
 
 QDRANT_CAPABILITIES = AdapterCapabilities(
     supported_write_modes=frozenset({"upsert"}),
     supported_query_consistency=frozenset({"eventual"}),
     supports_read_after_write_strong=False,
+    supports_query_filter=True,
     supports_query_partition_filter=False,
     vendor_consistency_options={
         "read_consistency": ["all", "majority", "quorum"],
@@ -187,7 +189,7 @@ class QdrantAdapter:
             collection_name=settings.collection_name,
             query=_vector_values(vector),
             using=settings.vector_name,
-            query_filter=filter_query,
+            query_filter=qdrant_filter(filter_query) if filter_query else None,
             limit=top_k,
             with_payload=True,
             with_vectors=include_vectors,

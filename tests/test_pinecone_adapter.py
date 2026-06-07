@@ -337,6 +337,27 @@ def test_query_uses_eventual_consistency() -> None:
     ]
 
 
+def test_query_translates_portable_filter() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    adapter.query(
+        make_target(),
+        vector=[0.1, 0.2],
+        top_k=2,
+        consistency="eventual",
+        filter_query={
+            "field": "filter_bucket_100",
+            "operator": "eq",
+            "value": "42",
+        },
+    )
+
+    assert client.index.queries[0]["filter"] == {
+        "filter_bucket_100": {"$eq": "42"}
+    }
+
+
 def test_query_rejects_strong_consistency() -> None:
     adapter = make_adapter(FakeClient())
 
