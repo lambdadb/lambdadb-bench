@@ -1937,19 +1937,32 @@ def run_staged_query_stage(
         for stage_index, stage in enumerate(stages, start=1):
             concurrency = _stage_concurrency(stage, stage_index=stage_index)
             process_count = _effective_process_count(processes, concurrency)
-            duration_seconds = parse_duration_seconds(
-                _stage_duration(stage, stage_index=stage_index)
+            duration_seconds = _stage_duration_seconds(
+                stage,
+                stage_index=stage_index,
             )
-            deadline = time.perf_counter() + duration_seconds
+            max_requests = _stage_max_requests(stage, stage_index=stage_index)
+            if duration_seconds is None and max_requests is None:
+                raise ConfigError(
+                    f"scenario.query.stages[{stage_index}] must set duration "
+                    "or max_requests"
+                )
+            deadline = (
+                time.perf_counter() + duration_seconds
+                if duration_seconds is not None
+                else None
+            )
             stage_state = QueryRunState()
             stage_started = time.perf_counter()
+            stage_submitted = 0
             worker_threads = _split_concurrency(concurrency, process_count)
             ticker.emit(
                 "query: starting stage "
                 f"stage={stage_index}/{len(stages)} concurrency={concurrency} "
                 f"processes={process_count} "
                 f"worker_threads_per_process={worker_threads} "
-                f"duration_seconds={duration_seconds}"
+                f"duration_seconds={duration_seconds} "
+                f"max_requests={max_requests}"
             )
             if process_count > 1:
                 next_query_index = _run_staged_query_processes(
@@ -1967,6 +1980,7 @@ def run_staged_query_stage(
                     concurrency=concurrency,
                     process_count=process_count,
                     deadline=deadline,
+                    max_requests=max_requests,
                     state=state,
                     stage_state=stage_state,
                     next_query_index=next_query_index,
@@ -1981,6 +1995,7 @@ def run_staged_query_stage(
                         processes=process_count,
                         worker_threads_per_process=worker_threads,
                         configured_duration_seconds=duration_seconds,
+                        max_requests=max_requests,
                         elapsed_seconds=time.perf_counter() - stage_started,
                         state=stage_state,
                         partition_filter_spec=partition_filter_spec,
@@ -1999,15 +2014,25 @@ def run_staged_query_stage(
             )
 
             def next_query(
-                stage_deadline: float = deadline,
+                stage_deadline: float | None = deadline,
+                stage_max_requests: int | None = max_requests,
             ) -> tuple[int, VectorRecord] | None:
-                nonlocal next_query_index
+                nonlocal next_query_index, stage_submitted
                 with query_lock:
-                    if time.perf_counter() >= stage_deadline:
+                    if (
+                        stage_deadline is not None
+                        and time.perf_counter() >= stage_deadline
+                    ):
+                        return None
+                    if (
+                        stage_max_requests is not None
+                        and stage_submitted >= stage_max_requests
+                    ):
                         return None
                     query_index = next_query_index
                     query = queries[(query_index - 1) % len(queries)]
                     next_query_index += 1
+                    stage_submitted += 1
                     return query_index, query
 
             def worker(
@@ -2041,7 +2066,7 @@ def run_staged_query_stage(
                 current_stage_index: int = stage_index,
                 current_stage_state: QueryRunState = stage_state,
                 current_stage_started: float = stage_started,
-                current_duration_seconds: float = duration_seconds,
+                current_duration_seconds: float | None = duration_seconds,
             ) -> None:
                 pending_flushes = 0
                 while True:
@@ -2064,7 +2089,7 @@ def run_staged_query_stage(
                             "query: stage progress "
                             f"stage={current_stage_index} "
                             f"elapsed_seconds={elapsed:.1f}/"
-                            f"{current_duration_seconds:.1f} "
+                            f"{_stage_progress_limit(current_duration_seconds)} "
                             f"attempts={attempts} "
                             f"errors={current_stage_state.errors}"
                         )
@@ -2094,6 +2119,7 @@ def run_staged_query_stage(
                     processes=process_count,
                     worker_threads_per_process=worker_threads,
                     configured_duration_seconds=duration_seconds,
+                    max_requests=max_requests,
                     elapsed_seconds=time.perf_counter() - stage_started,
                     state=stage_state,
                     partition_filter_spec=partition_filter_spec,
@@ -2142,13 +2168,14 @@ def _run_staged_query_processes(
     stage_index: int,
     concurrency: int,
     process_count: int,
-    deadline: float,
+    deadline: float | None,
+    max_requests: int | None,
     state: QueryRunState,
     stage_state: QueryRunState,
     next_query_index: int,
     ticker: ProgressTicker,
     stage_started: float,
-    duration_seconds: float,
+    duration_seconds: float | None,
 ) -> int:
     worker_threads = _split_concurrency(concurrency, process_count)
     task_queue: Any = mp.Queue()
@@ -2183,14 +2210,18 @@ def _run_staged_query_processes(
 
     in_flight = 0
     pending_flushes = 0
+    stage_submitted = 0
 
     def submit_query() -> bool:
-        nonlocal in_flight, next_query_index
-        if time.perf_counter() >= deadline:
+        nonlocal in_flight, next_query_index, stage_submitted
+        if deadline is not None and time.perf_counter() >= deadline:
+            return False
+        if max_requests is not None and stage_submitted >= max_requests:
             return False
         query_index = next_query_index
         query = queries[(query_index - 1) % len(queries)]
         next_query_index += 1
+        stage_submitted += 1
         task_queue.put((query_index, query))
         in_flight += 1
         return True
@@ -2223,7 +2254,8 @@ def _run_staged_query_processes(
             ticker.maybe(
                 "query: stage progress "
                 f"stage={stage_index} "
-                f"elapsed_seconds={elapsed:.1f}/{duration_seconds:.1f} "
+                f"elapsed_seconds={elapsed:.1f}/"
+                f"{_stage_progress_limit(duration_seconds)} "
                 f"attempts={attempts} "
                 f"errors={stage_state.errors}"
             )
@@ -3616,6 +3648,7 @@ def run_parallel_search_under_ingest_stage(
                 processes=query_process_count,
                 worker_threads_per_process=query_worker_threads,
                 configured_duration_seconds=duration_seconds or duration,
+                max_requests=None,
                 elapsed_seconds=duration,
                 state=query_state,
                 partition_filter_spec=None,
@@ -3705,7 +3738,8 @@ def _query_stage_summary(
     concurrency: int,
     processes: int,
     worker_threads_per_process: list[int],
-    configured_duration_seconds: float,
+    configured_duration_seconds: float | None,
+    max_requests: int | None,
     elapsed_seconds: float,
     state: QueryRunState,
     partition_filter_spec: PartitionFilterSpec | None,
@@ -3718,6 +3752,7 @@ def _query_stage_summary(
         "processes": processes,
         "worker_threads_per_process": worker_threads_per_process,
         "configured_duration_seconds": configured_duration_seconds,
+        "max_requests": max_requests,
         "duration_seconds": elapsed_seconds,
         "queries": state.queries,
         "errors": state.errors,
@@ -4570,13 +4605,41 @@ def _stage_concurrency(stage: Mapping[str, Any], *, stage_index: int) -> int:
     return concurrency
 
 
-def _stage_duration(stage: Mapping[str, Any], *, stage_index: int) -> str:
+def _stage_duration_seconds(
+    stage: Mapping[str, Any],
+    *,
+    stage_index: int,
+) -> float | None:
     duration = stage.get("duration")
+    if duration is None:
+        return None
     if not isinstance(duration, str):
         raise ConfigError(
             f"scenario.query.stages[{stage_index}].duration must be a string"
         )
-    return duration
+    return parse_duration_seconds(duration)
+
+
+def _stage_max_requests(
+    stage: Mapping[str, Any],
+    *,
+    stage_index: int,
+) -> int | None:
+    value = stage.get("max_requests")
+    if value is None:
+        return None
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            f"scenario.query.stages[{stage_index}].max_requests "
+            "must be a positive integer"
+        )
+    return value
+
+
+def _stage_progress_limit(duration_seconds: float | None) -> str:
+    if duration_seconds is None:
+        return "unbounded"
+    return f"{duration_seconds:.1f}"
 
 
 def parse_duration_seconds(value: str) -> float:

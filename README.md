@@ -544,6 +544,10 @@ Useful load settings:
 For staged queries, `query.processes` works the same way: each
 `query.stages[].concurrency` value remains the total in-flight query count, and
 the runner splits that total across worker processes when `query.processes > 1`.
+Each query stage can stop by elapsed `duration`, by `max_requests`, or by
+whichever limit is reached first when both are set. `max_requests` counts query
+attempts for that stage, including failed requests, so it is useful when you
+want a fixed-size concurrent query run instead of a duration-based load test.
 The `parallel_upsert_query` search-under-ingest workload also uses
 `query.processes`, with `search_under_ingest.query_concurrency` as the total
 in-flight query count.

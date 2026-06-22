@@ -53,6 +53,79 @@ query:
     }
 
 
+def test_load_scenario_accepts_query_stage_max_requests_without_duration(
+    tmp_path,
+) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1000000
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  stages:
+    - concurrency: 8
+      max_requests: 100
+""",
+        encoding="utf-8",
+    )
+
+    scenario = load_scenario(scenario_path)
+
+    assert scenario.query["stages"][0]["max_requests"] == 100
+
+
+def test_load_scenario_requires_query_stage_duration_or_max_requests(
+    tmp_path,
+) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1000000
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  stages:
+    - concurrency: 8
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="duration or max_requests"):
+        load_scenario(scenario_path)
+
+
+def test_load_scenario_rejects_invalid_query_stage_max_requests(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1000000
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  stages:
+    - concurrency: 8
+      max_requests: 0
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="max_requests"):
+        load_scenario(scenario_path)
+
+
 def test_load_scenario_accepts_search_under_ingest_workload(tmp_path) -> None:
     scenario_path = tmp_path / "scenario.yaml"
     scenario_path.write_text(

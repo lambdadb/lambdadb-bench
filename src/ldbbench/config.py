@@ -97,10 +97,18 @@ class ScenarioConfig:
             for index, stage in enumerate(stages):
                 stage_dict = _as_dict(stage, f"scenario.query.stages[{index}]")
                 _validate_positive_int(stage_dict, "concurrency")
-                if not isinstance(stage_dict.get("duration"), str):
+                has_duration = "duration" in stage_dict
+                has_max_requests = "max_requests" in stage_dict
+                if not has_duration and not has_max_requests:
+                    raise ConfigError(
+                        f"scenario.query.stages[{index}] must set duration "
+                        "or max_requests"
+                    )
+                if has_duration and not isinstance(stage_dict.get("duration"), str):
                     raise ConfigError(
                         f"scenario.query.stages[{index}].duration must be a string"
                     )
+                _validate_optional_positive_int(stage_dict, "max_requests")
 
         return cls(
             name=name,

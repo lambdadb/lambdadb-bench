@@ -1044,6 +1044,40 @@ def test_execute_benchmark_runs_duration_query_stages(tmp_path) -> None:
     assert {event["worker_index"] for event in query_events} == {1, 2}
 
 
+def test_execute_benchmark_caps_staged_queries_by_max_requests(tmp_path) -> None:
+    scenario = make_scenario(stages=[{"concurrency": 2, "max_requests": 3}])
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario, limit=2, query_count=2)
+    adapter = FakeAdapter(query_delay_seconds=0.001)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    stage = result.summary["query"]["stages"][0]
+
+    assert result.summary["query"]["mode"] == "staged"
+    assert result.summary["query"]["attempts"] == 3
+    assert result.summary["query"]["queries"] == 3
+    assert len(query_events) == 3
+    assert stage["concurrency"] == 2
+    assert stage["max_requests"] == 3
+    assert stage["configured_duration_seconds"] is None
+    assert stage["attempts"] == 3
+    assert sorted(event["query_index"] for event in query_events) == [1, 2, 3]
+
+
 def test_process_concurrency_split_preserves_total_concurrency() -> None:
     assert _split_concurrency(64, 4) == [16, 16, 16, 16]
     assert _split_concurrency(10, 3) == [4, 3, 3]
