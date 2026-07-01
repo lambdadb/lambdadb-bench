@@ -66,6 +66,24 @@ class FilterSpec:
         }
 
 
+@dataclass(frozen=True)
+class FilteredFaissBucket:
+    filter_value: str
+    record_ids: list[str]
+    vectors: Any
+
+    @property
+    def candidate_count(self) -> int:
+        return len(self.record_ids)
+
+
+@dataclass(frozen=True)
+class FilteredFaissQuery:
+    ordinal: int
+    filter_value: str
+    query: VectorItem
+
+
 def prepare_ground_truth(
     *,
     dataset_dir: str | Path,
@@ -399,93 +417,316 @@ def write_filtered_faiss_ground_truth(
     dimensions = dataset_dimensions(dataset_manifest)
     ticker = ProgressTicker(progress)
     ticker.emit(
-        "ground_truth: loading records for filtered faiss "
-        f"dimensions={dimensions}"
+        f"ground_truth: counting records for filtered faiss dimensions={dimensions}"
     )
-    records = list(read_vector_items(records_path))
-    ensure_filter_bucket_metadata(records, dataset_manifest)
-    for record in records:
-        if len(record.vector) != dimensions:
-            raise ConfigError(
-                f"vector dimension mismatch for record {record.id!r}: "
-                f"expected {dimensions}, got {len(record.vector)}"
-            )
-    buckets, eligible_values = _eligible_record_buckets(
-        records,
+    bucket_counts, eligible_values, record_count = count_filtered_record_buckets(
+        records_path=records_path,
+        dataset_manifest=dataset_manifest,
+        dimensions=dimensions,
         filter_spec=filter_spec,
+        progress=progress,
     )
     normalize = metric == "cosine"
-    index_cache: dict[str, tuple[Any, list[str], int]] = {}
+    queries_by_value, ordered_query_count = read_filtered_faiss_queries(
+        queries_path=queries_path,
+        dimensions=dimensions,
+        eligible_values=eligible_values,
+        limit_queries=limit_queries,
+    )
+    needed_values = set(queries_by_value)
+    result_rows: list[str | None] = [None] * ordered_query_count
+    large_bucket_bytes = max(
+        (
+            bucket_counts[value] * dimensions * np.dtype(np.float32).itemsize
+            for value in needed_values
+        ),
+        default=0,
+    )
+    build_one_bucket_at_a_time = large_bucket_bytes >= 8 * 1024 * 1024 * 1024
 
-    def bucket_index(filter_value: str) -> tuple[Any, list[str], int]:
-        cached = index_cache.get(filter_value)
-        if cached is not None:
-            return cached
-        candidates = buckets[filter_value]
-        record_ids = [record.id for record in candidates]
-        vectors = np.asarray([record.vector for record in candidates], dtype=np.float32)
-        if normalize:
-            faiss.normalize_L2(vectors)
-        index = faiss.IndexFlatIP(dimensions)
-        index.add(vectors)
-        cached = index, record_ids, len(candidates)
-        index_cache[filter_value] = cached
-        return cached
+    if build_one_bucket_at_a_time:
+        ticker.emit(
+            "ground_truth: building filtered faiss indexes one bucket at a time "
+            f"values={len(needed_values)}"
+        )
+        for filter_value in sorted(needed_values):
+            bucket = read_filtered_faiss_buckets(
+                records_path=records_path,
+                dataset_manifest=dataset_manifest,
+                dimensions=dimensions,
+                filter_spec=filter_spec,
+                bucket_counts=bucket_counts,
+                needed_values={filter_value},
+                np=np,
+                progress=progress,
+            )[filter_value]
+            search_filtered_faiss_bucket(
+                faiss=faiss,
+                np=np,
+                bucket=bucket,
+                queries=queries_by_value[filter_value],
+                result_rows=result_rows,
+                top_k=top_k,
+                metric=metric,
+                normalize=normalize,
+                batch_size=batch_size,
+                filter_spec=filter_spec,
+            )
+            ticker.emit(
+                "ground_truth: searched filtered faiss bucket "
+                f"value={filter_value} candidates={bucket.candidate_count}"
+            )
+    else:
+        ticker.emit(
+            f"ground_truth: loading filtered faiss buckets values={len(needed_values)}"
+        )
+        buckets = read_filtered_faiss_buckets(
+            records_path=records_path,
+            dataset_manifest=dataset_manifest,
+            dimensions=dimensions,
+            filter_spec=filter_spec,
+            bucket_counts=bucket_counts,
+            needed_values=needed_values,
+            np=np,
+            progress=progress,
+        )
+        for filter_value in sorted(needed_values):
+            candidate_count = buckets[filter_value].candidate_count
+            search_filtered_faiss_bucket(
+                faiss=faiss,
+                np=np,
+                bucket=buckets[filter_value],
+                queries=queries_by_value[filter_value],
+                result_rows=result_rows,
+                top_k=top_k,
+                metric=metric,
+                normalize=normalize,
+                batch_size=batch_size,
+                filter_spec=filter_spec,
+            )
+            ticker.emit(
+                "ground_truth: searched filtered faiss bucket "
+                f"value={filter_value} candidates={candidate_count}"
+            )
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    query_count = 0
     with output.open("w", encoding="utf-8") as file:
-        for query in read_vector_items(queries_path):
-            if limit_queries is not None and query_count >= limit_queries:
-                break
-            if len(query.vector) != dimensions:
-                raise ConfigError(
-                    f"vector dimension mismatch for query {query.id!r}: "
-                    f"expected {dimensions}, got {len(query.vector)}"
-                )
-            filter_value = _assigned_filter_value(eligible_values, query_count)
-            index, record_ids, candidate_count = bucket_index(filter_value)
-            query_vectors = np.asarray([query.vector], dtype=np.float32)
-            if normalize:
-                faiss.normalize_L2(query_vectors)
-            scores, indices = index.search(
-                query_vectors,
-                min(candidate_count, top_k + 1),
-            )
-            matches = faiss_matches(
-                query=query,
-                scores=scores[0],
-                indices=indices[0],
-                record_ids=record_ids,
-                top_k=top_k,
-                metric=metric,
-            )
-            write_filtered_ground_truth_row(
-                file,
-                query=query,
-                filter_spec=filter_spec,
-                filter_value=filter_value,
-                candidate_count=candidate_count,
-                matches=matches,
-            )
-            query_count += 1
-            ticker.maybe(f"ground_truth: faiss filtered queries={query_count}")
+        for index, row in enumerate(result_rows, start=1):
+            if row is None:
+                raise ConfigError("filtered faiss ground truth query result missing")
+            file.write(row)
+            ticker.maybe(f"ground_truth: faiss filtered queries={index}")
     return {
-        "records": len(records),
-        "queries": query_count,
+        "records": record_count,
+        "queries": ordered_query_count,
         "backend_details": {
             "batch_size": batch_size,
             "index_type": "IndexFlatIP",
             "normalize_vectors": normalize,
-            "filtered_index_values": len(index_cache),
+            "filtered_index_values": len(needed_values),
             "eligible_filter_values": len(eligible_values),
-            "candidate_count": _candidate_count_summary(
-                buckets,
+            "candidate_count": _candidate_count_summary_from_counts(
+                bucket_counts,
                 eligible_values,
             ),
         },
     }
+
+
+def count_filtered_record_buckets(
+    *,
+    records_path: str | Path,
+    dataset_manifest: Mapping[str, Any],
+    dimensions: int,
+    filter_spec: FilterSpec,
+    progress: ProgressCallback | None = None,
+) -> tuple[dict[str, int], list[str], int]:
+    bucket_counts: dict[str, int] = {}
+    ticker = ProgressTicker(progress)
+    record_count = 0
+    with Path(records_path).open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            _validate_raw_vector_dimensions(
+                raw,
+                dimensions=dimensions,
+                path=Path(records_path),
+                line_number=line_number,
+            )
+            value = _raw_record_filter_value(
+                raw,
+                filter_spec=filter_spec,
+                dataset_manifest=dataset_manifest,
+                record_index=record_count,
+                path=Path(records_path),
+                line_number=line_number,
+            )
+            if value is not None:
+                bucket_counts[value] = bucket_counts.get(value, 0) + 1
+            record_count += 1
+            ticker.maybe(
+                f"ground_truth: counting filtered records records={record_count}"
+            )
+    eligible_values = [
+        value
+        for value, count in bucket_counts.items()
+        if count >= filter_spec.min_candidates
+    ]
+    if not eligible_values:
+        raise ConfigError(
+            "filtered ground truth has no eligible record buckets for "
+            f"{filter_spec.field!r} with min_candidates={filter_spec.min_candidates}"
+        )
+    eligible_values = sorted(eligible_values)
+    random.Random(filter_spec.seed).shuffle(eligible_values)
+    return bucket_counts, eligible_values, record_count
+
+
+def read_filtered_faiss_queries(
+    *,
+    queries_path: str | Path,
+    dimensions: int,
+    eligible_values: list[str],
+    limit_queries: int | None,
+) -> tuple[dict[str, list[FilteredFaissQuery]], int]:
+    queries_by_value: dict[str, list[FilteredFaissQuery]] = {}
+    query_count = 0
+    for query in read_vector_items(queries_path):
+        if limit_queries is not None and query_count >= limit_queries:
+            break
+        if len(query.vector) != dimensions:
+            raise ConfigError(
+                f"vector dimension mismatch for query {query.id!r}: "
+                f"expected {dimensions}, got {len(query.vector)}"
+            )
+        filter_value = _assigned_filter_value(eligible_values, query_count)
+        queries_by_value.setdefault(filter_value, []).append(
+            FilteredFaissQuery(
+                ordinal=query_count,
+                filter_value=filter_value,
+                query=query,
+            )
+        )
+        query_count += 1
+    return queries_by_value, query_count
+
+
+def read_filtered_faiss_buckets(
+    *,
+    records_path: str | Path,
+    dataset_manifest: Mapping[str, Any],
+    dimensions: int,
+    filter_spec: FilterSpec,
+    bucket_counts: Mapping[str, int],
+    needed_values: set[str],
+    np: Any,
+    progress: ProgressCallback | None = None,
+) -> dict[str, FilteredFaissBucket]:
+    buckets = {
+        value: FilteredFaissBucket(
+            filter_value=value,
+            record_ids=[],
+            vectors=np.empty((bucket_counts[value], dimensions), dtype=np.float32),
+        )
+        for value in needed_values
+    }
+    positions = {value: 0 for value in needed_values}
+    ticker = ProgressTicker(progress)
+    record_count = 0
+    with Path(records_path).open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            value = _raw_record_filter_value(
+                raw,
+                filter_spec=filter_spec,
+                dataset_manifest=dataset_manifest,
+                record_index=record_count,
+                path=Path(records_path),
+                line_number=line_number,
+            )
+            if value in buckets:
+                vector = _raw_vector(
+                    raw,
+                    dimensions=dimensions,
+                    path=Path(records_path),
+                    line_number=line_number,
+                )
+                bucket = buckets[value]
+                position = positions[value]
+                bucket.vectors[position] = vector
+                bucket.record_ids.append(
+                    _raw_record_id(raw, Path(records_path), line_number)
+                )
+                positions[value] = position + 1
+            record_count += 1
+            ticker.maybe(
+                "ground_truth: loading filtered faiss records "
+                f"records={record_count} values={len(needed_values)}"
+            )
+    for value, position in positions.items():
+        expected = bucket_counts[value]
+        if position != expected:
+            raise ConfigError(
+                f"filtered bucket {value!r} has {position} records but count pass "
+                f"found {expected}"
+            )
+    return buckets
+
+
+def search_filtered_faiss_bucket(
+    *,
+    faiss: Any,
+    np: Any,
+    bucket: FilteredFaissBucket,
+    queries: list[FilteredFaissQuery],
+    result_rows: list[str | None],
+    top_k: int,
+    metric: str,
+    normalize: bool,
+    batch_size: int,
+    filter_spec: FilterSpec,
+) -> None:
+    vectors = bucket.vectors
+    if normalize:
+        faiss.normalize_L2(vectors)
+    index = faiss.IndexFlatIP(vectors.shape[1])
+    index.add(vectors)
+    search_k = min(bucket.candidate_count, top_k + 1)
+    for start in range(0, len(queries), batch_size):
+        query_batch = queries[start : start + batch_size]
+        query_vectors = np.asarray(
+            [entry.query.vector for entry in query_batch],
+            dtype=np.float32,
+        )
+        if normalize:
+            faiss.normalize_L2(query_vectors)
+        scores, indices = index.search(query_vectors, search_k)
+        for entry, query_scores, query_indices in zip(
+            query_batch,
+            scores,
+            indices,
+            strict=True,
+        ):
+            matches = faiss_matches(
+                query=entry.query,
+                scores=query_scores,
+                indices=query_indices,
+                record_ids=bucket.record_ids,
+                top_k=top_k,
+                metric=metric,
+            )
+            result_rows[entry.ordinal] = filtered_ground_truth_json_line(
+                query=entry.query,
+                filter_spec=filter_spec,
+                filter_value=entry.filter_value,
+                candidate_count=bucket.candidate_count,
+                matches=matches,
+            )
 
 
 def write_faiss_query_results(
@@ -766,6 +1007,25 @@ def write_filtered_ground_truth_row(
     matches: list[dict[str, Any]],
 ) -> None:
     file.write(
+        filtered_ground_truth_json_line(
+            query=query,
+            filter_spec=filter_spec,
+            filter_value=filter_value,
+            candidate_count=candidate_count,
+            matches=matches,
+        )
+    )
+
+
+def filtered_ground_truth_json_line(
+    *,
+    query: VectorItem,
+    filter_spec: FilterSpec,
+    filter_value: str,
+    candidate_count: int,
+    matches: list[dict[str, Any]],
+) -> str:
+    return (
         json.dumps(
             {
                 "query_id": query.id,
@@ -815,7 +1075,17 @@ def _candidate_count_summary(
     buckets: Mapping[str, list[VectorItem]],
     eligible_values: list[str],
 ) -> dict[str, Any]:
-    counts = sorted(len(buckets[value]) for value in eligible_values)
+    return _candidate_count_summary_from_counts(
+        {value: len(candidates) for value, candidates in buckets.items()},
+        eligible_values,
+    )
+
+
+def _candidate_count_summary_from_counts(
+    bucket_counts: Mapping[str, int],
+    eligible_values: list[str],
+) -> dict[str, Any]:
+    counts = sorted(bucket_counts[value] for value in eligible_values)
     return {
         "eligible_values": len(eligible_values),
         "min": counts[0],
@@ -867,11 +1137,90 @@ def _assigned_filter_value(eligible_values: list[str], query_index: int) -> str:
     return eligible_values[query_index % len(eligible_values)]
 
 
+def _raw_record_filter_value(
+    raw: Mapping[str, Any],
+    *,
+    filter_spec: FilterSpec,
+    dataset_manifest: Mapping[str, Any],
+    record_index: int,
+    path: Path,
+    line_number: int,
+) -> str | None:
+    metadata = raw.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ConfigError(f"{path}:{line_number} metadata must be a mapping")
+    value = metadata.get(filter_spec.field)
+    if value is None and filter_spec.field.startswith("filter_bucket_"):
+        value = filter_bucket_metadata(
+            record_id=_raw_record_id(raw, path, line_number),
+            ordinal=_filter_bucket_ordinal(dataset_manifest, record_index),
+        ).get(filter_spec.field)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _filter_bucket_ordinal(
+    dataset_manifest: Mapping[str, Any],
+    record_index: int,
+) -> int:
+    query_offset = dataset_manifest.get("dataset", {}).get("written_query_rows", 0)
+    if not isinstance(query_offset, int) or query_offset < 0:
+        query_offset = 0
+    return query_offset + record_index
+
+
+def _raw_record_id(raw: Mapping[str, Any], path: Path, line_number: int) -> str:
+    record_id = raw.get("id")
+    if not isinstance(record_id, str) or not record_id:
+        raise ConfigError(f"{path}:{line_number} missing non-empty id")
+    return record_id
+
+
+def _validate_raw_vector_dimensions(
+    raw: Mapping[str, Any],
+    *,
+    dimensions: int,
+    path: Path,
+    line_number: int,
+) -> None:
+    vector = raw.get("vector")
+    if not isinstance(vector, list) or not vector:
+        raise ConfigError(f"{path}:{line_number} missing vector list")
+    if len(vector) != dimensions:
+        record_id = _raw_record_id(raw, path, line_number)
+        raise ConfigError(
+            f"vector dimension mismatch for record {record_id!r}: "
+            f"expected {dimensions}, got {len(vector)}"
+        )
+
+
+def _raw_vector(
+    raw: Mapping[str, Any],
+    *,
+    dimensions: int,
+    path: Path,
+    line_number: int,
+) -> list[float]:
+    _validate_raw_vector_dimensions(
+        raw,
+        dimensions=dimensions,
+        path=path,
+        line_number=line_number,
+    )
+    vector = raw["vector"]
+    values = []
+    for index, value in enumerate(vector):
+        if not isinstance(value, int | float):
+            raise ConfigError(f"{path}:{line_number} vector[{index}] must be numeric")
+        values.append(float(value))
+    return values
+
+
 def score_vectors(*, query: VectorItem, record: VectorItem, metric: str) -> float:
     if len(query.vector) != len(record.vector):
         raise ConfigError(
-            f"vector dimension mismatch for query {query.id!r} "
-            f"and record {record.id!r}"
+            f"vector dimension mismatch for query {query.id!r} and record {record.id!r}"
         )
     dot = sum(q * r for q, r in zip(query.vector, record.vector, strict=True))
     if metric == "dot":
@@ -943,9 +1292,7 @@ def artifact_path(
         raise ConfigError("dataset manifest artifacts must be a mapping")
     value = artifacts.get(key)
     path = (
-        Path(value)
-        if isinstance(value, str) and value
-        else dataset_dir / default_name
+        Path(value) if isinstance(value, str) and value else dataset_dir / default_name
     )
     if not path.is_absolute() and not path.exists():
         candidate = dataset_dir / path.name

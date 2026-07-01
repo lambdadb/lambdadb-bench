@@ -207,6 +207,59 @@ def test_prepare_ground_truth_writes_faiss_matches(tmp_path, monkeypatch) -> Non
     assert [match["id"] for match in truth["matches"]] == ["a", "c"]
 
 
+def test_prepare_ground_truth_writes_filtered_faiss_matches(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    np = pytest.importorskip("numpy")
+    fake_faiss = types.ModuleType("faiss")
+
+    class FakeIndexFlatIP:
+        def __init__(self, dimensions: int) -> None:
+            self.dimensions = dimensions
+            self.vectors = None
+
+        def add(self, vectors) -> None:
+            assert vectors.shape[1] == self.dimensions
+            self.vectors = vectors.copy()
+
+        def search(self, queries, top_k: int):
+            scores = queries @ self.vectors.T
+            order = np.argsort(-scores, axis=1)[:, :top_k]
+            sorted_scores = np.take_along_axis(scores, order, axis=1)
+            return sorted_scores, order
+
+    def normalize_l2(vectors) -> None:
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        vectors /= norms
+
+    fake_faiss.IndexFlatIP = FakeIndexFlatIP
+    fake_faiss.normalize_L2 = normalize_l2
+    monkeypatch.setitem(sys.modules, "faiss", fake_faiss)
+    prepare_fixture_dataset(tmp_path)
+
+    result = prepare_ground_truth(
+        dataset_dir=tmp_path,
+        top_k=1,
+        backend="faiss",
+        batch_size=2,
+        filter_name="synthetic_bucket_50pct",
+        filter_field="filter_bucket_2",
+        filter_value_source="eligible-record-buckets",
+    )
+
+    lines = result.ground_truth_path.read_text(encoding="utf-8").splitlines()
+    truth = json.loads(lines[0])
+    assert result.manifest["status"] == "prepared"
+    assert result.manifest["ground_truth"]["backend"] == "faiss"
+    assert result.manifest["ground_truth"]["filtered_index_values"] >= 1
+    assert result.manifest["ground_truth"]["candidate_count"]["eligible_values"] >= 1
+    assert truth["filter"]["field"] == "filter_bucket_2"
+    assert truth["candidate_count"] >= 1
+    assert [match["id"] for match in truth["matches"]]
+
+
 def test_prepare_ground_truth_rejects_invalid_top_k(tmp_path) -> None:
     with pytest.raises(ConfigError, match="top_k"):
         prepare_ground_truth(dataset_dir=tmp_path, top_k=0)
