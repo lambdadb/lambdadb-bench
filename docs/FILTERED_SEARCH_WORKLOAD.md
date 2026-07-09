@@ -132,6 +132,14 @@ query:
       duration: 5m
 ```
 
+`query.filter.field` is a portable metadata-relative field name. It should match
+the key stored under each record's `metadata`, such as
+`metadata["filter_bucket_100"]`, and should not include the LambdaDB dotted
+path prefix. Ground-truth generation and cross-engine adapters use this logical
+field directly, while the LambdaDB adapter translates indexed metadata fields
+to dotted query fields such as `metadata.filter_bucket_100` when sending the
+query.
+
 For a selectivity matrix, prefer separate scenario files at first:
 
 ```text
