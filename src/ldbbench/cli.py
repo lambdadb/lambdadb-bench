@@ -136,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ground_truth.add_argument(
         "--metric",
-        choices=["cosine", "dot"],
+        choices=["cosine", "dot", "l2"],
         help="Distance/similarity metric. Defaults to dataset manifest metric.",
     )
     ground_truth.add_argument(

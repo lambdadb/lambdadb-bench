@@ -75,8 +75,9 @@ uv run ldbbench dataset ground-truth \
 ```
 
 For larger datasets, use the FAISS backend. It builds an in-memory
-`IndexFlatIP`; cosine ground truth normalizes vectors before indexing and
-querying.
+`IndexFlatIP` for cosine/dot metrics and `IndexFlatL2` for `l2`. Cosine ground
+truth normalizes vectors before indexing and querying. `l2` scores are squared
+L2 distances, matching FAISS ranking semantics.
 
 ```bash
 uv run --extra groundtruth ldbbench dataset ground-truth \

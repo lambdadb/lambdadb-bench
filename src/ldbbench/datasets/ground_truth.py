@@ -26,7 +26,7 @@ from ldbbench.progress import ProgressCallback, ProgressTicker
 GROUND_TRUTH_FILENAME = "ground_truth.jsonl"
 GROUND_TRUTH_MANIFEST_FILENAME = "ground_truth_manifest.json"
 SUPPORTED_BACKENDS = {"exact", "faiss"}
-SUPPORTED_METRICS = {"cosine", "dot"}
+SUPPORTED_METRICS = {"cosine", "dot", "l2"}
 DEFAULT_FAISS_BATCH_SIZE = 100
 
 
@@ -370,7 +370,7 @@ def write_faiss_ground_truth(
         faiss.normalize_L2(record_vectors)
 
     ticker.emit(f"ground_truth: building faiss index records={len(record_ids)}")
-    index = faiss.IndexFlatIP(dimensions)
+    index = _faiss_index(faiss, dimensions=dimensions, metric=metric)
     index.add(record_vectors)
     ticker.emit("ground_truth: searching queries with faiss")
 
@@ -394,7 +394,7 @@ def write_faiss_ground_truth(
         "queries": query_count,
         "backend_details": {
             "batch_size": batch_size,
-            "index_type": "IndexFlatIP",
+            "index_type": _faiss_index_type(metric),
             "normalize_vectors": normalize,
         },
     }
@@ -522,7 +522,7 @@ def write_filtered_faiss_ground_truth(
         "queries": ordered_query_count,
         "backend_details": {
             "batch_size": batch_size,
-            "index_type": "IndexFlatIP",
+            "index_type": _faiss_index_type(metric),
             "normalize_vectors": normalize,
             "filtered_index_values": len(needed_values),
             "eligible_filter_values": len(eligible_values),
@@ -694,7 +694,7 @@ def search_filtered_faiss_bucket(
     vectors = bucket.vectors
     if normalize:
         faiss.normalize_L2(vectors)
-    index = faiss.IndexFlatIP(vectors.shape[1])
+    index = _faiss_index(faiss, dimensions=vectors.shape[1], metric=metric)
     index.add(vectors)
     search_k = min(bucket.candidate_count, top_k + 1)
     for start in range(0, len(queries), batch_size):
@@ -856,7 +856,7 @@ def faiss_matches(
         if record_id == query.id:
             continue
         candidates.append((faiss_score(score, metric=metric), record_id))
-    best = sorted(candidates, key=lambda item: (-item[0], item[1]))[:top_k]
+    best = sorted(candidates, key=lambda item: _score_sort_key(item, metric))[:top_k]
     return [
         {
             "id": record_id,
@@ -868,8 +868,24 @@ def faiss_matches(
 
 
 def faiss_score(score: float, *, metric: str) -> float:
-    if metric in {"cosine", "dot"}:
+    if metric in {"cosine", "dot", "l2"}:
         return float(score)
+    raise ConfigError(f"unsupported metric {metric!r}")
+
+
+def _faiss_index(faiss: Any, *, dimensions: int, metric: str) -> Any:
+    if metric in {"cosine", "dot"}:
+        return faiss.IndexFlatIP(dimensions)
+    if metric == "l2":
+        return faiss.IndexFlatL2(dimensions)
+    raise ConfigError(f"unsupported metric {metric!r}")
+
+
+def _faiss_index_type(metric: str) -> str:
+    if metric in {"cosine", "dot"}:
+        return "IndexFlatIP"
+    if metric == "l2":
+        return "IndexFlatL2"
     raise ConfigError(f"unsupported metric {metric!r}")
 
 
@@ -966,7 +982,7 @@ def backend_manifest_details(
     if backend == "faiss":
         return {
             "batch_size": batch_size,
-            "index_type": "IndexFlatIP",
+            "index_type": _faiss_index_type(metric),
             "normalize_vectors": metric == "cosine",
         }
     return {}
@@ -986,7 +1002,7 @@ def exact_top_k(
         score = score_vectors(query=query, record=record, metric=metric)
         scored.append((score, record.id))
 
-    best = sorted(scored, key=lambda item: (-item[0], item[1]))[:top_k]
+    best = sorted(scored, key=lambda item: _score_sort_key(item, metric))[:top_k]
     return [
         {
             "id": record_id,
@@ -1230,6 +1246,20 @@ def score_vectors(*, query: VectorItem, record: VectorItem, metric: str) -> floa
         if denominator == 0:
             return 0.0
         return dot / denominator
+    if metric == "l2":
+        return sum(
+            (q - r) ** 2
+            for q, r in zip(query.vector, record.vector, strict=True)
+        )
+    raise ConfigError(f"unsupported metric {metric!r}")
+
+
+def _score_sort_key(item: tuple[float, str], metric: str) -> tuple[float, str]:
+    score, record_id = item
+    if metric in {"cosine", "dot"}:
+        return -score, record_id
+    if metric == "l2":
+        return score, record_id
     raise ConfigError(f"unsupported metric {metric!r}")
 
 
