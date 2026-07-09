@@ -83,6 +83,8 @@ LAMBDADB_DRYRUN = StaticAdapter(
         supports_read_after_write_strong=True,
         supports_query_filter=True,
         supports_query_partition_filter=True,
+        supports_nested_object_index=True,
+        supports_full_text_search=True,
         vendor_consistency_options={"consistent_read": True},
     ),
 )

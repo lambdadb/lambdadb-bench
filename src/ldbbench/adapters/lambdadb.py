@@ -22,18 +22,21 @@ from ldbbench.adapters.filters import lambdadb_filter
 from ldbbench.config import ConfigError, TargetConfig
 
 DEFAULT_VECTOR_FIELD = "vector"
+DEFAULT_METADATA_FIELD = "metadata"
 DEFAULT_DELETE_WAIT_TIMEOUT_SECONDS = 60.0
 DEFAULT_DELETE_WAIT_POLL_SECONDS = 1.0
 DEFAULT_CREATE_WAIT_TIMEOUT_SECONDS = 300.0
 DEFAULT_CREATE_WAIT_POLL_SECONDS = 1.0
 ACTIVE_COLLECTION_STATUS = "ACTIVE"
-FILTER_BUCKET_FIELD_PREFIX = "filter_bucket_"
 FILTER_BUCKET_INDEX_FIELDS = (
     "filter_bucket_2",
     "filter_bucket_10",
     "filter_bucket_100",
     "filter_bucket_1000",
 )
+FILTER_BUCKET_OBJECT_INDEX_CONFIGS = {
+    field: {"type": "keyword"} for field in FILTER_BUCKET_INDEX_FIELDS
+}
 SUPPORTED_METRIC_MAP = {
     "cosine": "cosine",
     "dot": "dot_product",
@@ -48,6 +51,8 @@ LAMBDADB_CAPABILITIES = AdapterCapabilities(
     supports_read_after_write_strong=True,
     supports_query_filter=True,
     supports_query_partition_filter=True,
+    supports_nested_object_index=True,
+    supports_full_text_search=True,
     vendor_consistency_options={
         "consistent_read": True,
         "partition_filter": True,
@@ -172,7 +177,6 @@ class LambdaDBAdapter:
             _record_to_doc(
                 record,
                 vector_field=settings.vector_field,
-                partition_field=_partition_field(settings.partition_config),
             )
             for record in records
         ]
@@ -208,7 +212,10 @@ class LambdaDBAdapter:
             "k": top_k,
         }
         if filter_query is not None:
-            knn["filter"] = lambdadb_filter(filter_query)
+            knn["filter"] = lambdadb_filter(
+                filter_query,
+                field_mapper=_metadata_field,
+            )
 
         query_kwargs: dict[str, Any] = {
             "collection_name": settings.collection_name,
@@ -218,7 +225,10 @@ class LambdaDBAdapter:
             "include_vectors": include_vectors,
         }
         if partition_filter is not None:
-            query_kwargs["partition_filter"] = dict(partition_filter)
+            query_kwargs["partition_filter"] = _partition_filter(
+                partition_filter,
+                settings,
+            )
         response = self._client(settings).collections.query(**query_kwargs)
         return QueryResult(
             matches=_query_matches(response),
@@ -517,7 +527,7 @@ def _index_configs(
     metric: str | None,
 ) -> dict[str, Any]:
     if settings.index_configs:
-        return _with_filter_bucket_index_configs(settings.index_configs)
+        return _with_metadata_object_index_configs(settings.index_configs)
     if dimensions is None:
         raise ConfigError(
             "target.index_configs or dataset dimensions are required for create mode"
@@ -529,7 +539,7 @@ def _index_configs(
             "LambdaDB vector similarity must be one of "
             f"{sorted(SUPPORTED_METRIC_MAP)}"
         )
-    return _with_filter_bucket_index_configs({
+    return _with_metadata_object_index_configs({
         settings.vector_field: {
             "type": "vector",
             "dimensions": dimensions,
@@ -538,12 +548,36 @@ def _index_configs(
     })
 
 
-def _with_filter_bucket_index_configs(
+def _with_metadata_object_index_configs(
     index_configs: Mapping[str, Any],
 ) -> dict[str, Any]:
     configs = dict(index_configs)
-    for field in FILTER_BUCKET_INDEX_FIELDS:
-        configs.setdefault(field, {"type": "keyword"})
+    metadata_config = configs.get(DEFAULT_METADATA_FIELD)
+    if metadata_config is None:
+        configs[DEFAULT_METADATA_FIELD] = {
+            "type": "object",
+            "objectIndexConfigs": dict(FILTER_BUCKET_OBJECT_INDEX_CONFIGS),
+        }
+        return configs
+    if not isinstance(metadata_config, Mapping):
+        raise ConfigError("target.index_configs.metadata must be an object config")
+    if metadata_config.get("type") != "object":
+        raise ConfigError("target.index_configs.metadata.type must be 'object'")
+    object_index_configs = metadata_config.get("objectIndexConfigs")
+    if object_index_configs is None:
+        object_index_configs_dict: dict[str, Any] = {}
+    elif isinstance(object_index_configs, Mapping):
+        object_index_configs_dict = dict(object_index_configs)
+    else:
+        raise ConfigError(
+            "target.index_configs.metadata.objectIndexConfigs must be a mapping"
+        )
+    for field, field_config in FILTER_BUCKET_OBJECT_INDEX_CONFIGS.items():
+        object_index_configs_dict.setdefault(field, field_config)
+    configs[DEFAULT_METADATA_FIELD] = {
+        **dict(metadata_config),
+        "objectIndexConfigs": object_index_configs_dict,
+    }
     return configs
 
 
@@ -551,18 +585,14 @@ def _record_to_doc(
     record: Mapping[str, Any] | VectorRecord,
     *,
     vector_field: str,
-    partition_field: str | None = None,
 ) -> dict[str, Any]:
     if isinstance(record, VectorRecord):
         metadata = dict(record.metadata)
-        doc = {
+        return {
             "id": record.id,
             vector_field: _vector_values(record.vector),
             "metadata": metadata,
         }
-        _copy_partition_field(doc, metadata, partition_field=partition_field)
-        _copy_filter_bucket_fields(doc, metadata)
-        return doc
 
     record_id = record.get("id")
     vector = record.get("vector")
@@ -574,14 +604,11 @@ def _record_to_doc(
     if not isinstance(metadata, Mapping):
         raise ConfigError("record metadata must be a mapping")
     metadata_dict = dict(metadata)
-    doc = {
+    return {
         "id": record_id,
         vector_field: _vector_values(vector),
         "metadata": metadata_dict,
     }
-    _copy_partition_field(doc, metadata_dict, partition_field=partition_field)
-    _copy_filter_bucket_fields(doc, metadata_dict)
-    return doc
 
 
 def _partition_field(partition_config: Mapping[str, Any] | None) -> str | None:
@@ -591,26 +618,29 @@ def _partition_field(partition_config: Mapping[str, Any] | None) -> str | None:
     return field_name if isinstance(field_name, str) and field_name else None
 
 
-def _copy_partition_field(
-    doc: dict[str, Any],
-    metadata: Mapping[str, Any],
-    *,
-    partition_field: str | None,
-) -> None:
-    if partition_field is None or partition_field in doc:
-        return
-    value = metadata.get(partition_field)
-    if value is not None:
-        doc[partition_field] = value
+def _metadata_field(field: str) -> str:
+    if "." in field:
+        return field
+    return f"{DEFAULT_METADATA_FIELD}.{field}"
 
 
-def _copy_filter_bucket_fields(
-    doc: dict[str, Any],
-    metadata: Mapping[str, Any],
-) -> None:
-    for key, value in metadata.items():
-        if isinstance(key, str) and key.startswith(FILTER_BUCKET_FIELD_PREFIX):
-            doc.setdefault(key, value)
+def _partition_filter(
+    partition_filter: Mapping[str, Any],
+    settings: LambdaDBTargetSettings,
+) -> dict[str, Any]:
+    value = dict(partition_filter)
+    field = value.get("field")
+    partition_field = _partition_field(settings.partition_config)
+    if isinstance(field, str) and field and partition_field:
+        if field == partition_field or "." in field:
+            value["field"] = field
+        elif partition_field.endswith(f".{field}"):
+            value["field"] = partition_field
+        else:
+            value["field"] = _metadata_field(field)
+    elif isinstance(field, str) and field:
+        value["field"] = _metadata_field(field)
+    return value
 
 
 def _vector_values(vector: Sequence[float]) -> Sequence[float]:

@@ -11,11 +11,16 @@ import pytest
 from ldbbench.adapters.lambdadb import LambdaDBAdapter
 from ldbbench.config import ConfigError, TargetConfig
 
-FILTER_BUCKET_INDEX_CONFIGS = {
-    "filter_bucket_2": {"type": "keyword"},
-    "filter_bucket_10": {"type": "keyword"},
-    "filter_bucket_100": {"type": "keyword"},
-    "filter_bucket_1000": {"type": "keyword"},
+METADATA_INDEX_CONFIG = {
+    "metadata": {
+        "type": "object",
+        "objectIndexConfigs": {
+            "filter_bucket_2": {"type": "keyword"},
+            "filter_bucket_10": {"type": "keyword"},
+            "filter_bucket_100": {"type": "keyword"},
+            "filter_bucket_1000": {"type": "keyword"},
+        },
+    },
 }
 
 
@@ -202,7 +207,7 @@ def test_prepare_create_builds_vector_index_config() -> None:
                     "dimensions": 1024,
                     "similarity": "dot_product",
                 },
-                **FILTER_BUCKET_INDEX_CONFIGS,
+                **METADATA_INDEX_CONFIG,
             },
         }
     ]
@@ -215,7 +220,7 @@ def test_prepare_create_passes_partition_config() -> None:
     target = make_target(
         prepare={"mode": "create"},
         partition_config={
-            "field_name": "url",
+            "field_name": "metadata.url",
             "data_type": "keyword",
             "num_partitions": 16,
         },
@@ -233,10 +238,10 @@ def test_prepare_create_passes_partition_config() -> None:
                     "dimensions": 1024,
                     "similarity": "cosine",
                 },
-                **FILTER_BUCKET_INDEX_CONFIGS,
+                **METADATA_INDEX_CONFIG,
             },
             "partition_config": {
-                "field_name": "url",
+                "field_name": "metadata.url",
                 "data_type": "keyword",
                 "num_partitions": 16,
             },
@@ -254,6 +259,62 @@ def test_prepare_create_rejects_invalid_partition_config() -> None:
 
     with pytest.raises(ConfigError, match="partition_config"):
         adapter.prepare(target, dimensions=1024, metric="cosine")
+
+
+def test_prepare_create_preserves_metadata_object_text_index_config() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(
+        prepare={"mode": "create"},
+        index_configs={
+            "dense": {"type": "vector", "dimensions": 3},
+            "metadata": {
+                "type": "object",
+                "objectIndexConfigs": {
+                    "text": {"type": "text", "analyzers": ["english"]},
+                    "url": {"type": "keyword"},
+                },
+            },
+        },
+    )
+
+    result = adapter.prepare(target)
+
+    assert result.ok
+    assert client.collections.creates == [
+        {
+            "collection_name": "smoke",
+            "index_configs": {
+                "dense": {"type": "vector", "dimensions": 3},
+                "metadata": {
+                    "type": "object",
+                    "objectIndexConfigs": {
+                        "text": {"type": "text", "analyzers": ["english"]},
+                        "url": {"type": "keyword"},
+                        "filter_bucket_2": {"type": "keyword"},
+                        "filter_bucket_10": {"type": "keyword"},
+                        "filter_bucket_100": {"type": "keyword"},
+                        "filter_bucket_1000": {"type": "keyword"},
+                    },
+                },
+            },
+        }
+    ]
+
+
+def test_prepare_create_rejects_non_object_metadata_index_config() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(
+        prepare={"mode": "create"},
+        index_configs={
+            "dense": {"type": "vector", "dimensions": 3},
+            "metadata": {"type": "keyword"},
+        },
+    )
+
+    with pytest.raises(ConfigError, match="metadata.type"):
+        adapter.prepare(target)
 
 
 def test_prepare_create_waits_until_collection_is_active() -> None:
@@ -424,7 +485,7 @@ def test_prepare_recreate_waits_for_delete_then_active_collection() -> None:
             "collection_name": "smoke",
             "index_configs": {
                 "dense": {"type": "vector", "dimensions": 3},
-                **FILTER_BUCKET_INDEX_CONFIGS,
+                **METADATA_INDEX_CONFIG,
             },
         }
     ]
@@ -498,12 +559,12 @@ def test_upsert_batch_uses_bulk_upsert_docs_for_bulk_write_mode() -> None:
     ]
 
 
-def test_upsert_batch_copies_partition_field_from_metadata() -> None:
+def test_upsert_batch_keeps_partition_field_inside_metadata() -> None:
     client = FakeClient()
     adapter = make_adapter(client)
     target = make_target(
         partition_config={
-            "field_name": "url",
+            "field_name": "metadata.url",
             "data_type": "keyword",
             "num_partitions": 16,
         },
@@ -530,14 +591,13 @@ def test_upsert_batch_copies_partition_field_from_metadata() -> None:
                         "text": "alpha",
                         "url": "https://example.test/a",
                     },
-                    "url": "https://example.test/a",
                 }
             ],
         }
     ]
 
 
-def test_upsert_batch_copies_filter_bucket_fields_from_metadata() -> None:
+def test_upsert_batch_keeps_filter_bucket_fields_inside_metadata() -> None:
     client = FakeClient()
     adapter = make_adapter(client)
 
@@ -555,7 +615,9 @@ def test_upsert_batch_copies_filter_bucket_fields_from_metadata() -> None:
         ],
     )
 
-    assert client.collections.docs.upserts[0]["docs"][0]["filter_bucket_100"] == "42"
+    doc = client.collections.docs.upserts[0]["docs"][0]
+    assert "filter_bucket_100" not in doc
+    assert doc["metadata"]["filter_bucket_100"] == "42"
 
 
 def test_query_maps_strong_consistency_to_consistent_read() -> None:
@@ -607,7 +669,7 @@ def test_query_translates_portable_filter() -> None:
     )
 
     assert client.collections.queries[0]["query"]["knn"]["filter"] == {
-        "queryString": {"query": "filter_bucket_100:42"}
+        "queryString": {"query": "metadata.filter_bucket_100:42"}
     }
 
 
@@ -637,7 +699,7 @@ def test_query_passes_partition_filter() -> None:
             "consistent_read": False,
             "include_vectors": False,
             "partition_filter": {
-                "field": "url",
+                "field": "metadata.url",
                 "in_": ["https://example.test/doc"],
             },
         }

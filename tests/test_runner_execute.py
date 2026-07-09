@@ -184,7 +184,7 @@ def make_scenario(
         query["stages"] = stages
     if partition_filter:
         query["partition_filter"] = {
-            "field": "url",
+            "field": "metadata.url",
             "metadata_field": "url",
         }
     if query_filter:
@@ -546,8 +546,11 @@ def test_execute_benchmark_applies_partition_filter_and_skips_recall(tmp_path) -
         for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
     ]
 
-    assert adapter.partition_filters == [{"field": "url", "in_": ["q-url"]}]
-    assert query_events[0]["partition_filter"] == {"field": "url", "in_": ["q-url"]}
+    assert adapter.partition_filters == [{"field": "metadata.url", "in_": ["q-url"]}]
+    assert query_events[0]["partition_filter"] == {
+        "field": "metadata.url",
+        "in_": ["q-url"],
+    }
     assert query_events[0]["recall_at_k"] is None
     assert query_events[0]["recall_skip_reason"] == "partition_filtered"
     assert result.summary["query"]["recall_at_k"] is None

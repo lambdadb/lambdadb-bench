@@ -47,7 +47,7 @@ records loaded into LambdaDB include `metadata.url`.
 
 The first workload should use:
 
-- Partition field: `url`
+- Partition field: `metadata.url`
 - Partition field type: `keyword`
 - Query partition value source: held-out query metadata field `url`
 
@@ -60,7 +60,7 @@ Add optional LambdaDB target configuration:
 
 ```yaml
 partition_config:
-  field_name: url
+  field_name: metadata.url
   data_type: keyword
   num_partitions: 16
 ```
@@ -72,7 +72,7 @@ client.collections.create(
     collection_name=...,
     index_configs=...,
     partition_config={
-        "field_name": "url",
+        "field_name": "metadata.url",
         "data_type": "keyword",
         "num_partitions": 16,
     },
@@ -92,7 +92,7 @@ Add optional query configuration:
 ```yaml
 query:
   partition_filter:
-    field: url
+    field: metadata.url
     metadata_field: url
 ```
 
@@ -101,7 +101,7 @@ record. For LambdaDB, it should pass:
 
 ```python
 partition_filter={
-    "field": "url",
+    "field": "metadata.url",
     "in_": [query.metadata["url"]],
 }
 ```
@@ -179,9 +179,9 @@ Initial LambdaDB support is implemented:
 - `TargetConfig` preserves optional `partition_config`.
 - The LambdaDB adapter validates and passes `partition_config` during
   create/recreate.
-- When `partition_config.field_name` is present, LambdaDB load copies the
-  matching metadata value to a top-level document field so the partition key is
-  present in loaded documents.
+- LambdaDB partition fields can target nested metadata with dotted paths such as
+  `metadata.url`; the loaded document keeps the value inside the `metadata`
+  object.
 - The runner parses `query.partition_filter`, validates query metadata before a
   measured query stage starts, and sends per-query partition filters to the
   adapter.

@@ -368,9 +368,10 @@ Initial `eq` filtered-search support is implemented:
   fields in query events and summaries.
 - LambdaDB, Qdrant, and Pinecone adapters translate the portable `eq` filter
   into their native filter shape.
-- LambdaDB create/recreate preparation includes `filter_bucket_*` keyword index
-  configs, and the LambdaDB adapter copies those bucket metadata fields to
-  top-level document fields so `queryString` filters can match them.
+- LambdaDB create/recreate preparation includes `metadata` object index configs
+  for `filter_bucket_*` keyword fields, and the LambdaDB adapter translates
+  portable filter fields such as `filter_bucket_100` to dotted query fields such
+  as `metadata.filter_bucket_100`.
 - The report includes filter fields, candidate/expected/returned count
   summaries, and `underfilled_result_rate`.
 - `scenarios/cohere-wikipedia-1m-filtered-1pct.yaml` is available as the first

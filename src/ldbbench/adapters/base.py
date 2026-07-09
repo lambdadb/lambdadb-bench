@@ -16,6 +16,8 @@ class AdapterCapabilities:
     supports_read_after_write_strong: bool = False
     supports_query_filter: bool = False
     supports_query_partition_filter: bool = False
+    supports_nested_object_index: bool = False
+    supports_full_text_search: bool = False
     supported_prepare_modes: frozenset[str] = frozenset(
         {"existing", "create", "recreate"}
     )
@@ -28,6 +30,8 @@ class AdapterCapabilities:
             "supports_read_after_write_strong": self.supports_read_after_write_strong,
             "supports_query_filter": self.supports_query_filter,
             "supports_query_partition_filter": self.supports_query_partition_filter,
+            "supports_nested_object_index": self.supports_nested_object_index,
+            "supports_full_text_search": self.supports_full_text_search,
             "supported_prepare_modes": sorted(self.supported_prepare_modes),
             "vendor_consistency_options": self.vendor_consistency_options,
         }

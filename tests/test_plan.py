@@ -15,7 +15,7 @@ def make_scenario(
     query = {"consistency": consistency}
     if partition_filter:
         query["partition_filter"] = {
-            "field": "url",
+            "field": "metadata.url",
             "metadata_field": "url",
         }
     mapping = {

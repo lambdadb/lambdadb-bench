@@ -500,9 +500,13 @@ LambdaDB targets with:
 - `timeout_ms`: per-request SDK timeout in milliseconds. The example targets
   use `30000` to keep long-tail concurrent ingest/query calls bounded.
 - `index_configs`: LambdaDB collection index config used by create/recreate
-  preparation modes.
+  preparation modes. Metadata fields that need indexing should be declared
+  under a `metadata` object field with `objectIndexConfigs`; the example targets
+  index `metadata.text` for text search and `metadata.filter_bucket_*` for
+  filtered-vector workloads.
 - `partition_config`: optional LambdaDB hash partition config for create/recreate
-  preparation modes. See `configs/lambdadb-partitioned.example.yaml`.
+  preparation modes. Nested metadata partition fields use dotted paths such as
+  `metadata.url`. See `configs/lambdadb-partitioned.example.yaml`.
 - `delete_wait_timeout_seconds`: recreate-mode deletion wait timeout. Defaults
   to `60`.
 - `delete_wait_poll_seconds`: recreate-mode deletion polling interval. Defaults
@@ -553,9 +557,9 @@ The `parallel_upsert_query` search-under-ingest workload also uses
 in-flight query count.
 
 Partition-pruned query workloads can set `query.partition_filter` with a target
-field and query metadata source field. These runs intentionally skip global
-recall reporting because the query searches a restricted partition subset. See
-`docs/PARTITIONING_WORKLOAD.md` and
+field such as `metadata.url` and query metadata source field such as `url`.
+These runs intentionally skip global recall reporting because the query searches
+a restricted partition subset. See `docs/PARTITIONING_WORKLOAD.md` and
 `scenarios/cohere-wikipedia-1m-partitioned.yaml`.
 
 Optional integration coverage is gated behind:

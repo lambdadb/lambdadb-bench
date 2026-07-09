@@ -30,7 +30,7 @@ query:
   consistency: eventual
   processes: 2
   partition_filter:
-    field: url
+    field: metadata.url
     metadata_field: url
   stages:
     - concurrency: 8
@@ -48,7 +48,7 @@ query:
     assert scenario.load["shard_count"] == 16
     assert scenario.query["processes"] == 2
     assert scenario.query["partition_filter"] == {
-        "field": "url",
+        "field": "metadata.url",
         "metadata_field": "url",
     }
 
@@ -248,7 +248,7 @@ index_configs:
     dimensions: 3
     similarity: cosine
 partition_config:
-  field_name: url
+  field_name: metadata.url
   data_type: keyword
   num_partitions: 16
 """,
@@ -264,7 +264,7 @@ partition_config:
     assert target.vector_field == "dense"
     assert target.index_configs["dense"]["dimensions"] == 3
     assert target.partition_config == {
-        "field_name": "url",
+        "field_name": "metadata.url",
         "data_type": "keyword",
         "num_partitions": 16,
     }

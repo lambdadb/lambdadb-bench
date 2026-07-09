@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from ldbbench.config import ConfigError
@@ -14,10 +14,16 @@ def is_portable_filter(value: Mapping[str, Any]) -> bool:
     return PORTABLE_FILTER_KEYS.issubset(value.keys())
 
 
-def lambdadb_filter(value: Mapping[str, Any]) -> dict[str, Any]:
+def lambdadb_filter(
+    value: Mapping[str, Any],
+    *,
+    field_mapper: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
     if not is_portable_filter(value):
         return dict(value)
     field, operator, filter_value = _portable_parts(value)
+    if field_mapper is not None:
+        field = field_mapper(field)
     if operator == "eq":
         query = f"{field}:{_format_lambdadb_scalar(filter_value)}"
         return {"queryString": {"query": query}}

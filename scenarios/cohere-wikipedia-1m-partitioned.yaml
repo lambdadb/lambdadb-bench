@@ -28,7 +28,7 @@ query:
   consistency: eventual
   include_vectors: false
   partition_filter:
-    field: url
+    field: metadata.url
     metadata_field: url
   # processes: 4
   warmup:
