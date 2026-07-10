@@ -423,6 +423,56 @@ query:
         load_scenario(scenario_path)
 
 
+def test_load_scenario_accepts_full_text_workload(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: text-only
+workload: full_text_search
+dataset:
+  rows: 1000000
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  top_k: 10
+  consistency: eventual
+  full_text:
+    field: metadata.text
+    metadata_field: text
+    max_terms: 8
+""",
+        encoding="utf-8",
+    )
+
+    scenario = load_scenario(scenario_path)
+
+    assert scenario.workload == "full_text_search"
+    assert scenario.query["full_text"]["field"] == "metadata.text"
+    assert scenario.query["full_text"]["metadata_field"] == "text"
+
+
+def test_full_text_workload_requires_full_text_config(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: text-only
+workload: full_text_search
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="query.full_text"):
+        load_scenario(scenario_path)
+
+
 def test_invalid_process_counts_fail(tmp_path) -> None:
     scenario_path = tmp_path / "scenario.yaml"
     scenario_path.write_text(

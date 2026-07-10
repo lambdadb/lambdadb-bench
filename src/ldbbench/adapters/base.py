@@ -116,6 +116,18 @@ class VectorDBAdapter(Protocol):
     ) -> QueryResult:
         """Run one vector query against the target."""
 
+    def full_text_query(
+        self,
+        target: TargetConfig,
+        *,
+        query_text: str,
+        field: str,
+        top_k: int,
+        consistency: str,
+        include_vectors: bool = False,
+    ) -> QueryResult:
+        """Run one full-text query against the target."""
+
     def fetch(
         self,
         target: TargetConfig,

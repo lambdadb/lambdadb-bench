@@ -64,6 +64,18 @@ class StaticAdapter:
     ) -> QueryResult:
         raise NotImplementedError("dry-run adapters do not query real targets")
 
+    def full_text_query(
+        self,
+        target: TargetConfig,
+        *,
+        query_text: str,
+        field: str,
+        top_k: int,
+        consistency: str,
+        include_vectors: bool = False,
+    ) -> QueryResult:
+        raise NotImplementedError("dry-run adapters do not query real targets")
+
     def fetch(
         self,
         target: TargetConfig,

@@ -39,6 +39,7 @@ class FakeAdapter:
         supported_query_consistency=frozenset({"eventual"}),
         supports_query_filter=True,
         supports_query_partition_filter=True,
+        supports_full_text_search=True,
     )
 
     def __init__(
@@ -55,6 +56,7 @@ class FakeAdapter:
         self.queries: list[list[float]] = []
         self.filter_queries: list[dict[str, Any] | None] = []
         self.partition_filters: list[dict[str, Any] | None] = []
+        self.full_text_queries: list[dict[str, Any]] = []
         self.fail_load_batch = fail_load_batch
         self.fail_every = fail_every
         self.load_delay_seconds = load_delay_seconds
@@ -147,6 +149,49 @@ class FakeAdapter:
             ][:top_k]
         )
 
+    def full_text_query(
+        self,
+        target: TargetConfig,
+        *,
+        query_text: str,
+        field: str,
+        top_k: int,
+        consistency: str,
+        include_vectors: bool = False,
+    ) -> QueryResult:
+        if self.query_delay_seconds:
+            time.sleep(self.query_delay_seconds)
+        with self._lock:
+            self.query_calls += 1
+            call_number = self.query_calls
+            self.full_text_queries.append(
+                {
+                    "query_text": query_text,
+                    "field": field,
+                    "top_k": top_k,
+                    "consistency": consistency,
+                    "include_vectors": include_vectors,
+                }
+            )
+        if self.fail_every and call_number % self.fail_every == 0:
+            raise RuntimeError("planned query failure")
+        terms = {term.lower() for term in query_text.split()}
+        matches: list[QueryMatch] = []
+        for batch in self.upserted:
+            for record in batch:
+                text = record.metadata.get("text")
+                if not isinstance(text, str):
+                    continue
+                if terms.intersection(text.lower().split()):
+                    matches.append(
+                        QueryMatch(
+                            id=record.id,
+                            score=1.0,
+                            document={"id": record.id},
+                        )
+                    )
+        return QueryResult(matches=matches[:top_k])
+
     def fetch(
         self,
         target: TargetConfig,
@@ -174,6 +219,7 @@ def make_scenario(
     max_batch_bytes: str | None = "1MB",
     workload: str = "standard",
     search_under_ingest: dict[str, Any] | None = None,
+    full_text: bool = False,
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": top_k,
@@ -197,6 +243,13 @@ def make_scenario(
                 "min_candidates": "top_k",
             },
             "expected_selectivity": 0.5,
+        }
+    if full_text:
+        workload = "full_text_search"
+        query["full_text"] = {
+            "field": "metadata.text",
+            "metadata_field": "text",
+            "max_terms": 3,
         }
     mapping: dict[str, Any] = {
         "name": "runner-smoke",
@@ -557,6 +610,69 @@ def test_execute_benchmark_applies_partition_filter_and_skips_recall(tmp_path) -
     assert result.summary["query"]["recall_samples"] == 0
     assert result.summary["query"]["partition_filter_applied"] is True
     assert result.summary["query"]["recall_skip_reason"] == "partition_filtered"
+
+
+def test_execute_benchmark_runs_full_text_query_without_ground_truth(tmp_path) -> None:
+    scenario = make_scenario(full_text=True, top_k=2)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_dataset(
+        scenario=scenario,
+        output_dir=tmp_path / "dataset",
+        limit=3,
+        query_count=1,
+        source_rows=[
+            {
+                "_id": "query",
+                "emb": [1.0, 0.0],
+                "text": "Alpha beta gamma delta",
+            },
+            {"_id": "a", "emb": [1.0, 0.0], "text": "alpha reference"},
+            {"_id": "b", "emb": [0.0, 1.0], "text": "unrelated text"},
+            {"_id": "c", "emb": [0.8, 0.2], "text": "beta reference"},
+        ],
+    )
+    adapter = FakeAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert adapter.full_text_queries == [
+        {
+            "query_text": "Alpha beta gamma",
+            "field": "metadata.text",
+            "top_k": 2,
+            "consistency": "eventual",
+            "include_vectors": False,
+        }
+    ]
+    assert adapter.queries == []
+    assert query_events[0]["full_text"] == {
+        "field": "metadata.text",
+        "metadata_field": "text",
+        "query": "Alpha beta gamma",
+    }
+    assert query_events[0]["recall_at_k"] is None
+    assert query_events[0]["recall_skip_reason"] == "full_text_no_ground_truth"
+    assert query_events[0]["returned_count"] == 2
+    assert result.summary["query"]["full_text_applied"] is True
+    assert result.summary["query"]["recall_at_k"] is None
+    assert result.summary["query"]["recall_samples"] == 0
+    assert result.summary["query"]["recall_skip_reason"] == "full_text_no_ground_truth"
+    assert result.summary["query"]["returned_count"]["p50"] == 2.0
+    assert result.summary["query"]["empty_result_rate"] == 0.0
 
 
 def test_execute_benchmark_applies_logical_filter_from_ground_truth(tmp_path) -> None:

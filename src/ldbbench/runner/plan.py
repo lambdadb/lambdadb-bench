@@ -62,6 +62,7 @@ def build_run_plan(
         scenario.workload != "search_under_ingest"
         and scenario.query.get("filter") is not None
     )
+    full_text_requested = scenario.workload == "full_text_search"
     unsupported: list[str] = []
     not_applicable: list[str] = []
     warnings: list[str] = []
@@ -101,6 +102,12 @@ def build_run_plan(
         not_applicable.append(
             f"query filter is N/A for {target.vendor}: "
             "no logical metadata filter support is declared"
+        )
+
+    if full_text_requested and not capabilities.supports_full_text_search:
+        not_applicable.append(
+            f"full-text search is N/A for {target.vendor}: "
+            "no comparable full-text search support is declared"
         )
 
     if not target.endpoint:

@@ -235,6 +235,34 @@ class LambdaDBAdapter:
             raw_response=response,
         )
 
+    def full_text_query(
+        self,
+        target: TargetConfig,
+        *,
+        query_text: str,
+        field: str,
+        top_k: int,
+        consistency: str,
+        include_vectors: bool = False,
+    ) -> QueryResult:
+        settings = _settings_from_target(target)
+        response = self._client(settings).collections.query(
+            collection_name=settings.collection_name,
+            query={
+                "queryString": {
+                    "query": query_text,
+                    "defaultField": field,
+                }
+            },
+            size=top_k,
+            consistent_read=_consistent_read(consistency),
+            include_vectors=include_vectors,
+        )
+        return QueryResult(
+            matches=_query_matches(response),
+            raw_response=response,
+        )
+
     def fetch(
         self,
         target: TargetConfig,

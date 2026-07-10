@@ -202,6 +202,18 @@ class PineconeAdapter:
         response = self._index(settings).query(**kwargs)
         return QueryResult(matches=_query_matches(response), raw_response=response)
 
+    def full_text_query(
+        self,
+        target: TargetConfig,
+        *,
+        query_text: str,
+        field: str,
+        top_k: int,
+        consistency: str,
+        include_vectors: bool = False,
+    ) -> QueryResult:
+        raise ConfigError("Pinecone adapter does not support full-text search")
+
     def fetch(
         self,
         target: TargetConfig,

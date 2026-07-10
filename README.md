@@ -563,6 +563,43 @@ These runs intentionally skip global recall reporting because the query searches
 a restricted partition subset. See `docs/PARTITIONING_WORKLOAD.md` and
 `scenarios/cohere-wikipedia-1m-partitioned.yaml`.
 
+Full-text-only workloads set `workload: full_text_search` and
+`query.full_text`. The runner builds deterministic query strings from the held
+out query rows' metadata text and sends them to adapters that declare
+`supports_full_text_search`. These runs do not use vector ground truth; summary
+and report output focus on latency, QPS, error rate, returned-count
+distribution, and empty-result rate. LambdaDB uses `queryString` with
+`defaultField: metadata.text`, matching the example target's nested metadata
+text index.
+
+The full-text scenario can reuse the same prepared dataset directory as the
+dense-vector scenario because `dataset prepare` already stores each source
+row's text under record/query `metadata.text`. It does not require running
+`dataset ground-truth`; `recall_at_k` is reported as `null` with
+`recall_skip_reason: full_text_no_ground_truth`.
+
+`query.full_text` fields have separate source and target meanings:
+
+- `field`: database query field, such as `metadata.text` for LambdaDB's nested
+  metadata text index.
+- `metadata_field`: metadata key to read from each held-out query row, such as
+  `text`.
+- `max_terms`: maximum number of leading tokens used to build the deterministic
+  query string from the query row's metadata text.
+
+At the moment, LambdaDB declares `supports_full_text_search`. Qdrant and
+Pinecone full-text support is intentionally reported as N/A until their exact
+equivalent behavior is verified.
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m-text-only.yaml \
+  --target configs/lambdadb.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --allow-large-run \
+  --out results/example-lambdadb-text-only
+```
+
 Optional integration coverage is gated behind:
 
 ```bash

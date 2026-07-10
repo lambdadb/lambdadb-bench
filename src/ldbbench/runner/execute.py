@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import multiprocessing as mp
+import re
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -48,6 +49,7 @@ LOAD_CHECKPOINT_FILENAME = "load_checkpoint.json"
 LARGE_RUN_ROW_THRESHOLD = 1_000_000
 LOAD_CHECKPOINT_SCHEMA_VERSION = 1
 QUERY_EVENT_FLUSH_INTERVAL = 1000
+TEXT_QUERY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,20 @@ class LogicalFilterSpec:
         if self.expected_selectivity is not None:
             data["expected_selectivity"] = self.expected_selectivity
         return data
+
+
+@dataclass(frozen=True)
+class FullTextQuerySpec:
+    field: str
+    metadata_field: str
+    max_terms: int = 8
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "field": self.field,
+            "metadata_field": self.metadata_field,
+            "max_terms": self.max_terms,
+        }
 
 
 @dataclass(frozen=True)
@@ -450,6 +466,7 @@ def execute_benchmark(
             ground_truth=ground_truth,
             partition_filter_spec=_partition_filter_spec(scenario),
             query_filter_spec=_query_filter_spec(scenario),
+            full_text_query_spec=_full_text_query_spec(scenario),
             events_path=query_events_path,
             stages=None if max_queries is not None else _query_stages(scenario),
             processes=_query_processes(scenario),
@@ -1815,6 +1832,7 @@ def run_query_stage(
     events_path: str | Path,
     partition_filter_spec: PartitionFilterSpec | None = None,
     query_filter_spec: LogicalFilterSpec | None = None,
+    full_text_query_spec: FullTextQuerySpec | None = None,
     stages: list[dict[str, Any]] | None = None,
     processes: int = 1,
     progress: ProgressCallback | None = None,
@@ -1825,6 +1843,7 @@ def run_query_stage(
     ticker = ProgressTicker(progress)
     _validate_partition_filter_query_records(query_list, partition_filter_spec)
     _validate_query_filter_ground_truth(query_list, query_filter_spec, ground_truth)
+    _validate_full_text_query_records(query_list, full_text_query_spec)
     if not query_list:
         events_output.write_text("", encoding="utf-8")
         return _query_summary(
@@ -1842,6 +1861,7 @@ def run_query_stage(
             stage_summaries=[],
             partition_filter_spec=partition_filter_spec,
             query_filter_spec=query_filter_spec,
+            full_text_query_spec=full_text_query_spec,
         )
 
     if stages:
@@ -1855,6 +1875,7 @@ def run_query_stage(
             ground_truth=ground_truth,
             partition_filter_spec=partition_filter_spec,
             query_filter_spec=query_filter_spec,
+            full_text_query_spec=full_text_query_spec,
             events_path=events_output,
             stages=stages,
             processes=processes,
@@ -1879,6 +1900,7 @@ def run_query_stage(
                 ground_truth=ground_truth,
                 partition_filter_spec=partition_filter_spec,
                 query_filter_spec=query_filter_spec,
+                full_text_query_spec=full_text_query_spec,
             )
             state.record(event)
             _write_event(file, event, flush=False, sort_keys=False)
@@ -1907,6 +1929,7 @@ def run_query_stage(
         stage_summaries=[],
         partition_filter_spec=partition_filter_spec,
         query_filter_spec=query_filter_spec,
+        full_text_query_spec=full_text_query_spec,
     )
 
 
@@ -1921,6 +1944,7 @@ def run_staged_query_stage(
     ground_truth: Mapping[str, GroundTruthEntry],
     partition_filter_spec: PartitionFilterSpec | None,
     query_filter_spec: LogicalFilterSpec | None,
+    full_text_query_spec: FullTextQuerySpec | None,
     events_path: Path,
     stages: list[dict[str, Any]],
     processes: int = 1,
@@ -1975,6 +1999,7 @@ def run_staged_query_stage(
                     ground_truth=ground_truth,
                     partition_filter_spec=partition_filter_spec,
                     query_filter_spec=query_filter_spec,
+                    full_text_query_spec=full_text_query_spec,
                     file=file,
                     stage_index=stage_index,
                     concurrency=concurrency,
@@ -2000,6 +2025,7 @@ def run_staged_query_stage(
                         state=stage_state,
                         partition_filter_spec=partition_filter_spec,
                         query_filter_spec=query_filter_spec,
+                        full_text_query_spec=full_text_query_spec,
                     )
                 )
                 ticker.emit(
@@ -2058,6 +2084,7 @@ def run_staged_query_stage(
                         ground_truth=ground_truth,
                         partition_filter_spec=partition_filter_spec,
                         query_filter_spec=query_filter_spec,
+                        full_text_query_spec=full_text_query_spec,
                     )
                     current_event_queue.put(event)
 
@@ -2124,6 +2151,7 @@ def run_staged_query_stage(
                     state=stage_state,
                     partition_filter_spec=partition_filter_spec,
                     query_filter_spec=query_filter_spec,
+                    full_text_query_spec=full_text_query_spec,
                 )
             )
             ticker.emit(
@@ -2150,6 +2178,7 @@ def run_staged_query_stage(
         stage_summaries=stage_summaries,
         partition_filter_spec=partition_filter_spec,
         query_filter_spec=query_filter_spec,
+        full_text_query_spec=full_text_query_spec,
     )
 
 
@@ -2164,6 +2193,7 @@ def _run_staged_query_processes(
     ground_truth: Mapping[str, GroundTruthEntry],
     partition_filter_spec: PartitionFilterSpec | None,
     query_filter_spec: LogicalFilterSpec | None,
+    full_text_query_spec: FullTextQuerySpec | None,
     file: Any,
     stage_index: int,
     concurrency: int,
@@ -2197,6 +2227,7 @@ def _run_staged_query_processes(
                 dict(ground_truth),
                 partition_filter_spec,
                 query_filter_spec,
+                full_text_query_spec,
             ),
             name=f"ldbbench-query-{stage_index}-{index}",
         )
@@ -2284,6 +2315,7 @@ def _query_process_worker(
     ground_truth: Mapping[str, GroundTruthEntry],
     partition_filter_spec: PartitionFilterSpec | None,
     query_filter_spec: LogicalFilterSpec | None,
+    full_text_query_spec: FullTextQuerySpec | None,
 ) -> None:
     def worker(local_index: int) -> None:
         adapter = _worker_adapter(vendor)
@@ -2307,6 +2339,7 @@ def _query_process_worker(
                     ground_truth=ground_truth,
                     partition_filter_spec=partition_filter_spec,
                     query_filter_spec=query_filter_spec,
+                    full_text_query_spec=full_text_query_spec,
                 )
             )
 
@@ -2371,6 +2404,7 @@ class QueryRunState:
     expected_counts: list[int] = field(default_factory=list)
     returned_counts: list[int] = field(default_factory=list)
     underfilled_results: int = 0
+    empty_results: int = 0
 
     def record(self, event: Mapping[str, Any]) -> None:
         if event["status"] == "ok":
@@ -2390,6 +2424,8 @@ class QueryRunState:
             returned_count = event.get("returned_count")
             if isinstance(returned_count, int):
                 self.returned_counts.append(returned_count)
+                if returned_count == 0:
+                    self.empty_results += 1
                 if isinstance(expected_count, int) and returned_count < expected_count:
                     self.underfilled_results += 1
         else:
@@ -2422,6 +2458,35 @@ def _validate_partition_filter_query_records(
         return
     for query in queries:
         _query_partition_filter(query, partition_filter_spec)
+
+
+def _validate_full_text_query_records(
+    queries: Sequence[VectorRecord],
+    full_text_query_spec: FullTextQuerySpec | None,
+) -> None:
+    if full_text_query_spec is None:
+        return
+    for query in queries:
+        _full_text_query_text(query, full_text_query_spec)
+
+
+def _full_text_query_text(
+    query: VectorRecord,
+    full_text_query_spec: FullTextQuerySpec,
+) -> str:
+    value = query.metadata.get(full_text_query_spec.metadata_field)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(
+            "query full_text metadata field "
+            f"{full_text_query_spec.metadata_field!r} must be a non-empty string"
+        )
+    tokens = TEXT_QUERY_TOKEN_PATTERN.findall(value)
+    if not tokens:
+        raise ConfigError(
+            "query full_text metadata field "
+            f"{full_text_query_spec.metadata_field!r} did not contain query tokens"
+        )
+    return " ".join(tokens[: full_text_query_spec.max_terms])
 
 
 def _validate_query_filter_ground_truth(
@@ -2477,6 +2542,7 @@ def execute_query_once(
     ground_truth: Mapping[str, GroundTruthEntry],
     partition_filter_spec: PartitionFilterSpec | None = None,
     query_filter_spec: LogicalFilterSpec | None = None,
+    full_text_query_spec: FullTextQuerySpec | None = None,
 ) -> dict[str, Any]:
     query_started = time.perf_counter()
     base_event: dict[str, Any] = {
@@ -2503,15 +2569,31 @@ def execute_query_once(
                 )
 
     try:
-        result = adapter.query(
-            target,
-            vector=query.vector,
-            top_k=top_k,
-            consistency=consistency,
-            include_vectors=include_vectors,
-            filter_query=filter_query,
-            partition_filter=partition_filter,
-        )
+        if full_text_query_spec is not None:
+            query_text = _full_text_query_text(query, full_text_query_spec)
+            base_event["full_text"] = {
+                "field": full_text_query_spec.field,
+                "metadata_field": full_text_query_spec.metadata_field,
+                "query": query_text,
+            }
+            result = adapter.full_text_query(
+                target,
+                query_text=query_text,
+                field=full_text_query_spec.field,
+                top_k=top_k,
+                consistency=consistency,
+                include_vectors=include_vectors,
+            )
+        else:
+            result = adapter.query(
+                target,
+                vector=query.vector,
+                top_k=top_k,
+                consistency=consistency,
+                include_vectors=include_vectors,
+                filter_query=filter_query,
+                partition_filter=partition_filter,
+            )
     except Exception as exc:  # noqa: BLE001
         base_event.update(
             {
@@ -2526,7 +2608,9 @@ def execute_query_once(
     match_ids = [match.id for match in result.matches]
     recall = None
     recall_skip_reason = None
-    if partition_filter_spec is not None:
+    if full_text_query_spec is not None:
+        recall_skip_reason = "full_text_no_ground_truth"
+    elif partition_filter_spec is not None:
         recall_skip_reason = "partition_filtered"
     else:
         recall = recall_at_k(
@@ -2996,6 +3080,7 @@ def _query_summary(
     stage_summaries: list[dict[str, Any]],
     partition_filter_spec: PartitionFilterSpec | None = None,
     query_filter_spec: LogicalFilterSpec | None = None,
+    full_text_query_spec: FullTextQuerySpec | None = None,
 ) -> dict[str, Any]:
     duration_seconds = time.perf_counter() - started
     attempts = query_count + error_count
@@ -3017,6 +3102,15 @@ def _query_summary(
         summary["partition_filter"] = partition_filter_spec.as_dict()
         summary["partition_filter_applied"] = True
         summary["recall_skip_reason"] = "partition_filtered"
+    if full_text_query_spec is not None:
+        summary["full_text"] = full_text_query_spec.as_dict()
+        summary["full_text_applied"] = True
+        summary["recall_skip_reason"] = "full_text_no_ground_truth"
+        summary["returned_count"] = count_summary_from_values(returned_counts)
+        summary["empty_result_rate"] = _error_rate(
+            sum(1 for count in returned_counts if count == 0),
+            len(returned_counts),
+        )
     if query_filter_spec is not None:
         summary["filter"] = query_filter_spec.as_dict()
         summary["filter_applied"] = True
@@ -3653,6 +3747,7 @@ def run_parallel_search_under_ingest_stage(
                 state=query_state,
                 partition_filter_spec=None,
                 query_filter_spec=None,
+                full_text_query_spec=None,
             ),
         ],
         query_filter_spec=None,
@@ -3744,6 +3839,7 @@ def _query_stage_summary(
     state: QueryRunState,
     partition_filter_spec: PartitionFilterSpec | None,
     query_filter_spec: LogicalFilterSpec | None,
+    full_text_query_spec: FullTextQuerySpec | None,
 ) -> dict[str, Any]:
     attempts = state.queries + state.errors
     summary: dict[str, Any] = {
@@ -3768,6 +3864,15 @@ def _query_stage_summary(
         summary["partition_filter"] = partition_filter_spec.as_dict()
         summary["partition_filter_applied"] = True
         summary["recall_skip_reason"] = "partition_filtered"
+    if full_text_query_spec is not None:
+        summary["full_text"] = full_text_query_spec.as_dict()
+        summary["full_text_applied"] = True
+        summary["recall_skip_reason"] = "full_text_no_ground_truth"
+        summary["returned_count"] = count_summary_from_values(state.returned_counts)
+        summary["empty_result_rate"] = _error_rate(
+            state.empty_results,
+            len(state.returned_counts),
+        )
     if query_filter_spec is not None:
         summary["filter"] = query_filter_spec.as_dict()
         summary["filter_applied"] = True
@@ -4586,6 +4691,30 @@ def _query_filter_spec(scenario: ScenarioConfig) -> LogicalFilterSpec | None:
         field=field,
         operator=str(operator),
         expected_selectivity=expected_selectivity,
+    )
+
+
+def _full_text_query_spec(scenario: ScenarioConfig) -> FullTextQuerySpec | None:
+    if scenario.workload != "full_text_search":
+        return None
+    value = scenario.query.get("full_text")
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            "scenario.query.full_text must be set for workload 'full_text_search'"
+        )
+    field = value.get("field")
+    metadata_field = value.get("metadata_field")
+    if not isinstance(field, str) or not field:
+        raise ConfigError("scenario.query.full_text.field must be a string")
+    if not isinstance(metadata_field, str) or not metadata_field:
+        raise ConfigError("scenario.query.full_text.metadata_field must be a string")
+    max_terms = value.get("max_terms", 8)
+    if not isinstance(max_terms, int) or max_terms <= 0:
+        raise ConfigError("scenario.query.full_text.max_terms must be positive")
+    return FullTextQuerySpec(
+        field=field,
+        metadata_field=metadata_field,
+        max_terms=max_terms,
     )
 
 

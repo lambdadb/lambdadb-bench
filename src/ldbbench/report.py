@@ -44,6 +44,8 @@ QUERY_CSV_HEADERS = [
     "filter_applied",
     "filter_name",
     "filter_selectivity",
+    "full_text_applied",
+    "full_text_field",
     "recall_skip_reason",
     "queries",
     "max_requests",
@@ -56,6 +58,7 @@ QUERY_CSV_HEADERS = [
     "candidate_count_p50",
     "expected_count_p50",
     "returned_count_p50",
+    "empty_result_rate",
     "underfilled_result_rate",
     "errors",
     "error_rate",
@@ -347,6 +350,7 @@ def _query_stage_rows(runs: list[RunReport]) -> list[dict[str, str]]:
 def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
     latency = _mapping(stage.get("latency_ms"))
     filter_config = _mapping(stage.get("filter"))
+    full_text_config = _mapping(stage.get("full_text"))
     candidate_count = _mapping(stage.get("candidate_count"))
     expected_count = _mapping(stage.get("expected_count"))
     returned_count = _mapping(stage.get("returned_count"))
@@ -363,6 +367,8 @@ def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
         "filter_applied": _fmt(stage.get("filter_applied")),
         "filter_name": _fmt(filter_config.get("name")),
         "filter_selectivity": _fmt_float(filter_config.get("expected_selectivity")),
+        "full_text_applied": _fmt(stage.get("full_text_applied")),
+        "full_text_field": _fmt(full_text_config.get("field")),
         "recall_skip_reason": _fmt(stage.get("recall_skip_reason")),
         "queries": _fmt(stage.get("queries")),
         "max_requests": _fmt(stage.get("max_requests")),
@@ -375,6 +381,7 @@ def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
         "candidate_count_p50": _fmt_float(candidate_count.get("p50")),
         "expected_count_p50": _fmt_float(expected_count.get("p50")),
         "returned_count_p50": _fmt_float(returned_count.get("p50")),
+        "empty_result_rate": _fmt_float(stage.get("empty_result_rate")),
         "underfilled_result_rate": _fmt_float(stage.get("underfilled_result_rate")),
         "errors": _fmt(stage.get("errors")),
         "error_rate": _fmt_float(stage.get("error_rate")),

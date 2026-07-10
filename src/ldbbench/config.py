@@ -17,7 +17,7 @@ SECRET_KEY_PARTS = ("api_key", "apikey", "secret", "token", "password", "credent
 VALID_WRITE_MODES = {"upsert", "bulk_upsert"}
 VALID_QUERY_CONSISTENCY = {"eventual", "strong"}
 VALID_PREPARE_MODES = {"existing", "create", "recreate"}
-VALID_WORKLOADS = {"standard", "search_under_ingest"}
+VALID_WORKLOADS = {"standard", "search_under_ingest", "full_text_search"}
 VALID_SEARCH_UNDER_INGEST_PATTERNS = {"upload_and_ask", "parallel_upsert_query"}
 VALID_SEARCH_UNDER_INGEST_PROBE_SOURCES = {"queries"}
 
@@ -84,6 +84,7 @@ class ScenarioConfig:
         _validate_optional_positive_int(query, "processes")
         _validate_partition_filter(query)
         _validate_query_filter(query)
+        _validate_full_text_query(query, workload=str(workload))
         _validate_search_under_ingest(
             search_under_ingest,
             workload=str(workload),
@@ -393,6 +394,34 @@ def _validate_query_filter(query: Mapping[str, Any]) -> None:
         not isinstance(selectivity, int | float) or selectivity <= 0
     ):
         raise ConfigError("scenario.query.filter.expected_selectivity must be positive")
+
+
+def _validate_full_text_query(query: Mapping[str, Any], *, workload: str) -> None:
+    value = query.get("full_text")
+    if workload != "full_text_search":
+        if value is not None and not isinstance(value, dict):
+            raise ConfigError("scenario.query.full_text must be a mapping")
+        return
+    if query.get("filter") is not None:
+        raise ConfigError(
+            "scenario.query.filter is not supported for workload 'full_text_search'"
+        )
+    if query.get("partition_filter") is not None:
+        raise ConfigError(
+            "scenario.query.partition_filter is not supported for "
+            "workload 'full_text_search'"
+        )
+    if not isinstance(value, dict):
+        raise ConfigError(
+            "scenario.query.full_text must be set for workload 'full_text_search'"
+        )
+    field = value.get("field")
+    metadata_field = value.get("metadata_field")
+    if not isinstance(field, str) or not field:
+        raise ConfigError("scenario.query.full_text.field must be a string")
+    if not isinstance(metadata_field, str) or not metadata_field:
+        raise ConfigError("scenario.query.full_text.metadata_field must be a string")
+    _validate_optional_positive_int(value, "max_terms")
 
 
 def _validate_search_under_ingest(

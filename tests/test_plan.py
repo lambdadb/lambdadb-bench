@@ -11,12 +11,19 @@ def make_scenario(
     consistency: str = "eventual",
     partition_filter: bool = False,
     workload: str = "standard",
+    full_text: bool = False,
 ) -> ScenarioConfig:
     query = {"consistency": consistency}
     if partition_filter:
         query["partition_filter"] = {
             "field": "metadata.url",
             "metadata_field": "url",
+        }
+    if full_text:
+        workload = "full_text_search"
+        query["full_text"] = {
+            "field": "metadata.text",
+            "metadata_field": "text",
         }
     mapping = {
         "name": "smoke",
@@ -98,6 +105,29 @@ def test_qdrant_partition_filter_is_partial_na() -> None:
 def test_lambdadb_partition_filter_is_supported() -> None:
     plan = build_run_plan(
         scenario=make_scenario(partition_filter=True),
+        target=make_target(vendor="lambdadb"),
+        capabilities=LAMBDADB_DRYRUN.capabilities,
+    )
+
+    assert plan.status == "supported"
+    assert not plan.not_applicable
+
+
+def test_qdrant_full_text_search_is_partial_na() -> None:
+    plan = build_run_plan(
+        scenario=make_scenario(full_text=True),
+        target=make_target(vendor="qdrant"),
+        capabilities=QDRANT_DRYRUN.capabilities,
+    )
+
+    assert plan.status == "partial"
+    assert plan.can_run
+    assert "full-text search" in plan.not_applicable[0]
+
+
+def test_lambdadb_full_text_search_is_supported() -> None:
+    plan = build_run_plan(
+        scenario=make_scenario(full_text=True),
         target=make_target(vendor="lambdadb"),
         capabilities=LAMBDADB_DRYRUN.capabilities,
     )
