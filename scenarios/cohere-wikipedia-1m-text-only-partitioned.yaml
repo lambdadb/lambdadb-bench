@@ -1,0 +1,64 @@
+name: cohere-wikipedia-1m-text-only-partitioned
+description: Cohere Wikipedia 1M metadata full-text search workload with query-time partition pruning.
+workload: full_text_search
+
+dataset:
+  provider: huggingface
+  source: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+  subset: en
+  rows: 1000000
+  id_field: _id
+  vector_field: emb
+  text_field: text
+  dimensions: 1024
+  metric: cosine
+  seed: 20260511
+
+load:
+  write_mode: upsert
+  batch_size: 500
+  concurrency: 16
+  processes: 4
+  max_batch_bytes: 5MB
+  wait_until_query_visible: false
+
+query:
+  top_k: 10
+  query_count: 1000
+  query_source: heldout_dataset_vectors
+  consistency: eventual
+  include_vectors: false
+  partition_filter:
+    field: metadata.url
+    metadata_field: url
+  full_text:
+    field: metadata.text
+    metadata_field: text
+    max_terms: 8
+  warmup:
+    enabled: true
+    query_count: 100
+  stages:
+    - concurrency: 1
+      duration: 5m
+    - concurrency: 8
+      duration: 5m
+    # - concurrency: 32
+    #   duration: 5m
+    # - concurrency: 64
+    #   duration: 5m
+    # - concurrency: 128
+    #   duration: 5m
+
+quality:
+  ground_truth: skipped
+  recall_skip_reason: full_text_no_ground_truth
+
+metrics:
+  latency_percentiles: [50, 95, 99]
+  include_qps: true
+  include_error_rate: true
+  include_recall: false
+  include_cost_estimates: true
+  include_returned_count: true
+  include_empty_result_rate: true

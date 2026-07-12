@@ -2583,6 +2583,7 @@ def execute_query_once(
                 top_k=top_k,
                 consistency=consistency,
                 include_vectors=include_vectors,
+                partition_filter=partition_filter,
             )
         else:
             result = adapter.query(

@@ -125,6 +125,7 @@ class VectorDBAdapter(Protocol):
         top_k: int,
         consistency: str,
         include_vectors: bool = False,
+        partition_filter: Mapping[str, Any] | None = None,
     ) -> QueryResult:
         """Run one full-text query against the target."""
 

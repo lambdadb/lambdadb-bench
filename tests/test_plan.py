@@ -136,6 +136,17 @@ def test_lambdadb_full_text_search_is_supported() -> None:
     assert not plan.not_applicable
 
 
+def test_lambdadb_full_text_search_with_partition_filter_is_supported() -> None:
+    plan = build_run_plan(
+        scenario=make_scenario(full_text=True, partition_filter=True),
+        target=make_target(vendor="lambdadb"),
+        capabilities=LAMBDADB_DRYRUN.capabilities,
+    )
+
+    assert plan.status == "supported"
+    assert not plan.not_applicable
+
+
 def test_recreate_requires_destructive_flag() -> None:
     plan = build_run_plan(
         scenario=make_scenario(),

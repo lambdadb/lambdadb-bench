@@ -244,20 +244,27 @@ class LambdaDBAdapter:
         top_k: int,
         consistency: str,
         include_vectors: bool = False,
+        partition_filter: Mapping[str, Any] | None = None,
     ) -> QueryResult:
         settings = _settings_from_target(target)
-        response = self._client(settings).collections.query(
-            collection_name=settings.collection_name,
-            query={
+        query_kwargs: dict[str, Any] = {
+            "collection_name": settings.collection_name,
+            "query": {
                 "queryString": {
                     "query": query_text,
                     "defaultField": field,
                 }
             },
-            size=top_k,
-            consistent_read=_consistent_read(consistency),
-            include_vectors=include_vectors,
-        )
+            "size": top_k,
+            "consistent_read": _consistent_read(consistency),
+            "include_vectors": include_vectors,
+        }
+        if partition_filter is not None:
+            query_kwargs["partition_filter"] = _partition_filter(
+                partition_filter,
+                settings,
+            )
+        response = self._client(settings).collections.query(**query_kwargs)
         return QueryResult(
             matches=_query_matches(response),
             raw_response=response,

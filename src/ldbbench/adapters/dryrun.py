@@ -73,6 +73,7 @@ class StaticAdapter:
         top_k: int,
         consistency: str,
         include_vectors: bool = False,
+        partition_filter: dict[str, Any] | None = None,
     ) -> QueryResult:
         raise NotImplementedError("dry-run adapters do not query real targets")
 

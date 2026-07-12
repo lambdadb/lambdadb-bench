@@ -406,11 +406,6 @@ def _validate_full_text_query(query: Mapping[str, Any], *, workload: str) -> Non
         raise ConfigError(
             "scenario.query.filter is not supported for workload 'full_text_search'"
         )
-    if query.get("partition_filter") is not None:
-        raise ConfigError(
-            "scenario.query.partition_filter is not supported for "
-            "workload 'full_text_search'"
-        )
     if not isinstance(value, dict):
         raise ConfigError(
             "scenario.query.full_text must be set for workload 'full_text_search'"

@@ -158,6 +158,7 @@ class FakeAdapter:
         top_k: int,
         consistency: str,
         include_vectors: bool = False,
+        partition_filter: dict[str, Any] | None = None,
     ) -> QueryResult:
         if self.query_delay_seconds:
             time.sleep(self.query_delay_seconds)
@@ -171,6 +172,7 @@ class FakeAdapter:
                     "top_k": top_k,
                     "consistency": consistency,
                     "include_vectors": include_vectors,
+                    "partition_filter": partition_filter,
                 }
             )
         if self.fail_every and call_number % self.fail_every == 0:
@@ -656,6 +658,7 @@ def test_execute_benchmark_runs_full_text_query_without_ground_truth(tmp_path) -
             "top_k": 2,
             "consistency": "eventual",
             "include_vectors": False,
+            "partition_filter": None,
         }
     ]
     assert adapter.queries == []
@@ -673,6 +676,77 @@ def test_execute_benchmark_runs_full_text_query_without_ground_truth(tmp_path) -
     assert result.summary["query"]["recall_skip_reason"] == "full_text_no_ground_truth"
     assert result.summary["query"]["returned_count"]["p50"] == 2.0
     assert result.summary["query"]["empty_result_rate"] == 0.0
+
+
+def test_execute_benchmark_runs_full_text_query_with_partition_filter(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(full_text=True, partition_filter=True, top_k=2)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_dataset(
+        scenario=scenario,
+        output_dir=tmp_path / "dataset",
+        limit=3,
+        query_count=1,
+        source_rows=[
+            {
+                "_id": "query",
+                "emb": [1.0, 0.0],
+                "text": "Alpha beta gamma delta",
+                "url": "q-url",
+            },
+            {
+                "_id": "a",
+                "emb": [1.0, 0.0],
+                "text": "alpha reference",
+                "url": "a-url",
+            },
+            {
+                "_id": "b",
+                "emb": [0.0, 1.0],
+                "text": "unrelated text",
+                "url": "b-url",
+            },
+            {
+                "_id": "c",
+                "emb": [0.8, 0.2],
+                "text": "beta reference",
+                "url": "c-url",
+            },
+        ],
+    )
+    adapter = FakeAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert adapter.full_text_queries[0]["partition_filter"] == {
+        "field": "metadata.url",
+        "in_": ["q-url"],
+    }
+    assert query_events[0]["partition_filter"] == {
+        "field": "metadata.url",
+        "in_": ["q-url"],
+    }
+    assert query_events[0]["recall_skip_reason"] == "full_text_no_ground_truth"
+    assert result.summary["query"]["partition_filter_applied"] is True
+    assert result.summary["query"]["full_text_applied"] is True
+    assert result.summary["query"]["recall_skip_reason"] == (
+        "full_text_no_ground_truth"
+    )
 
 
 def test_execute_benchmark_applies_logical_filter_from_ground_truth(tmp_path) -> None:

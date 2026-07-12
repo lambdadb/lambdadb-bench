@@ -205,6 +205,7 @@ class QdrantAdapter:
         top_k: int,
         consistency: str,
         include_vectors: bool = False,
+        partition_filter: Mapping[str, Any] | None = None,
     ) -> QueryResult:
         raise ConfigError("Qdrant adapter does not support full-text search")
 

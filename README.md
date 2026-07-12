@@ -587,9 +587,15 @@ row's text under record/query `metadata.text`. It does not require running
 - `max_terms`: maximum number of leading tokens used to build the deterministic
   query string from the query row's metadata text.
 
-At the moment, LambdaDB declares `supports_full_text_search`. Qdrant and
-Pinecone full-text support is intentionally reported as N/A until their exact
-equivalent behavior is verified.
+Full-text-only workloads may also set `query.partition_filter`, using the same
+`field` and `metadata_field` semantics as partition-pruned vector workloads.
+For LambdaDB this sends the text `queryString` and the `partition_filter` in the
+same query request, so the collection can be hash-partitioned on a field such as
+`metadata.url` while searching `metadata.text`.
+
+At the moment, LambdaDB declares both `supports_full_text_search` and
+`supports_query_partition_filter`. Qdrant and Pinecone full-text support is
+intentionally reported as N/A until their exact equivalent behavior is verified.
 
 ```bash
 uv run ldbbench run \
@@ -598,6 +604,18 @@ uv run ldbbench run \
   --dataset-dir data/datasets/cohere-wikipedia-1m \
   --allow-large-run \
   --out results/example-lambdadb-text-only
+```
+
+For query-time partition pruning on `metadata.url`, use the partitioned target
+and scenario:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m-text-only-partitioned.yaml \
+  --target configs/lambdadb-partitioned.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --allow-large-run \
+  --out results/example-lambdadb-text-only-partitioned
 ```
 
 Optional integration coverage is gated behind:

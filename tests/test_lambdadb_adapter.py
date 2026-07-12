@@ -702,6 +702,39 @@ def test_full_text_query_uses_query_string_default_field() -> None:
     ]
 
 
+def test_full_text_query_passes_partition_filter() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    adapter.full_text_query(
+        make_target(),
+        query_text="alpha beta",
+        field="metadata.text",
+        top_k=2,
+        consistency="eventual",
+        partition_filter={"field": "url", "in_": ["https://example.test/doc"]},
+    )
+
+    assert client.collections.queries == [
+        {
+            "collection_name": "smoke",
+            "query": {
+                "queryString": {
+                    "query": "alpha beta",
+                    "defaultField": "metadata.text",
+                }
+            },
+            "size": 2,
+            "consistent_read": False,
+            "include_vectors": False,
+            "partition_filter": {
+                "field": "metadata.url",
+                "in_": ["https://example.test/doc"],
+            },
+        }
+    ]
+
+
 def test_query_passes_partition_filter() -> None:
     client = FakeClient()
     adapter = make_adapter(client)
