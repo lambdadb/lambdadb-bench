@@ -224,8 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--ground-truth",
         help=(
-            "Optional ground_truth.jsonl path. Defaults to "
-            "<dataset-dir>/ground_truth.jsonl."
+            "Optional ground truth JSONL path. Defaults to the metric-specific "
+            "artifact under <dataset-dir>. Pass legacy artifacts explicitly."
         ),
     )
     run.add_argument(

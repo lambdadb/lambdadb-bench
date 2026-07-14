@@ -208,6 +208,7 @@ Suggested command shape:
 uv run --extra groundtruth ldbbench dataset ground-truth \
   --dataset-dir data/datasets/cohere-wikipedia-1m \
   --top-k 10 \
+  --metric cosine \
   --backend faiss \
   --filter-name synthetic_bucket_1pct \
   --filter-field filter_bucket_100 \
@@ -218,8 +219,8 @@ uv run --extra groundtruth ldbbench dataset ground-truth \
 Suggested artifact names:
 
 ```text
-ground_truth.filtered.synthetic_bucket_1pct.jsonl
-ground_truth.filtered.synthetic_bucket_1pct.manifest.json
+ground_truth.cosine.filtered.synthetic_bucket_1pct.jsonl
+ground_truth.cosine.filtered.synthetic_bucket_1pct.manifest.json
 ```
 
 Each line should include filter metadata in addition to matches:
@@ -366,7 +367,7 @@ Initial `eq` filtered-search support is implemented:
 - Scenario validation accepts `query.filter` with
   `value_source.type: eligible_record_buckets`.
 - `dataset ground-truth` accepts filter options and writes distinct
-  `ground_truth.filtered.<name>.jsonl` artifacts.
+  `ground_truth.<metric>.filtered.<name>.jsonl` artifacts.
 - Filtered ground-truth rows store per-query filter values, candidate counts,
   expected counts, and exact expected matches.
 - Filtered ground-truth manifests include eligible bucket candidate-count

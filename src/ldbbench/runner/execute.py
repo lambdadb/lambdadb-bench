@@ -21,8 +21,8 @@ import msgpack
 from ldbbench.adapters.base import VectorDBAdapter, VectorRecord
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
 from ldbbench.datasets.ground_truth import (
-    GROUND_TRUTH_FILENAME,
     artifact_path,
+    ground_truth_filename,
     load_dataset_manifest,
 )
 from ldbbench.datasets.prepare import (
@@ -233,7 +233,12 @@ def execute_benchmark(
         fallback_key="queries",
         fallback_filename=QUERIES_FILENAME,
     )
-    truth_path = _ground_truth_path(dataset_path, ground_truth_path)
+    dataset_metric = _dataset_metric(scenario, dataset_manifest)
+    truth_path = _ground_truth_path(
+        dataset_path,
+        ground_truth_path,
+        metric=dataset_metric,
+    )
     if ground_truth_path is not None and not truth_path.exists():
         raise ConfigError(f"ground truth file {truth_path} does not exist")
     ground_truth = load_ground_truth(truth_path) if truth_path.exists() else {}
@@ -262,7 +267,7 @@ def execute_benchmark(
     adapter.prepare(
         target,
         dimensions=_dataset_dimensions(scenario, dataset_manifest),
-        metric=_dataset_metric(scenario, dataset_manifest),
+        metric=dataset_metric,
     )
     ticker.emit("run: target prepared")
 
@@ -4812,11 +4817,11 @@ def _dataset_metric(
     scenario: ScenarioConfig,
     dataset_manifest: Mapping[str, Any],
 ) -> str | None:
-    value = dataset_manifest.get("dataset", {}).get("metric")
-    if isinstance(value, str):
-        return value
     configured = scenario.dataset.get("metric")
-    return configured if isinstance(configured, str) else None
+    if isinstance(configured, str):
+        return configured
+    value = dataset_manifest.get("dataset", {}).get("metric")
+    return value if isinstance(value, str) else None
 
 
 def _dataset_query_offset(dataset_manifest: Mapping[str, Any]) -> int:
@@ -4824,10 +4829,15 @@ def _dataset_query_offset(dataset_manifest: Mapping[str, Any]) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
 
 
-def _ground_truth_path(dataset_dir: Path, ground_truth_path: str | Path | None) -> Path:
+def _ground_truth_path(
+    dataset_dir: Path,
+    ground_truth_path: str | Path | None,
+    *,
+    metric: str | None,
+) -> Path:
     if ground_truth_path is not None:
         return Path(ground_truth_path)
-    return dataset_dir / GROUND_TRUTH_FILENAME
+    return dataset_dir / ground_truth_filename(metric or "cosine")
 
 
 def _preferred_artifact_path(

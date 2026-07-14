@@ -23,8 +23,6 @@ from ldbbench.datasets.prepare import (
 from ldbbench.manifest import sha256_file
 from ldbbench.progress import ProgressCallback, ProgressTicker
 
-GROUND_TRUTH_FILENAME = "ground_truth.jsonl"
-GROUND_TRUTH_MANIFEST_FILENAME = "ground_truth_manifest.json"
 SUPPORTED_BACKENDS = {"exact", "faiss"}
 SUPPORTED_METRICS = VALID_DATASET_METRICS
 DEFAULT_FAISS_BATCH_SIZE = 100
@@ -132,8 +130,16 @@ def prepare_ground_truth(
 
     records_path = artifact_path(out, dataset_manifest, "records", RECORDS_FILENAME)
     queries_path = artifact_path(out, dataset_manifest, "queries", QUERIES_FILENAME)
-    ground_truth_path = _ground_truth_output_path(out, filter_spec=filter_spec)
-    manifest_path = _ground_truth_manifest_path(out, filter_spec=filter_spec)
+    ground_truth_path = _ground_truth_output_path(
+        out,
+        metric=selected_metric,
+        filter_spec=filter_spec,
+    )
+    manifest_path = _ground_truth_manifest_path(
+        out,
+        metric=selected_metric,
+        filter_spec=filter_spec,
+    )
 
     query_count = 0
     record_count = 0
@@ -1426,24 +1432,32 @@ def _filter_spec(
 def _ground_truth_output_path(
     dataset_dir: Path,
     *,
+    metric: str,
     filter_spec: FilterSpec | None,
 ) -> Path:
-    if filter_spec is None:
-        return dataset_dir / GROUND_TRUTH_FILENAME
-    return dataset_dir / f"ground_truth.filtered.{_safe_name(filter_spec.name)}.jsonl"
+    return dataset_dir / f"{_ground_truth_stem(metric, filter_spec=filter_spec)}.jsonl"
 
 
 def _ground_truth_manifest_path(
     dataset_dir: Path,
     *,
+    metric: str,
     filter_spec: FilterSpec | None,
 ) -> Path:
-    if filter_spec is None:
-        return dataset_dir / GROUND_TRUTH_MANIFEST_FILENAME
-    return (
-        dataset_dir
-        / f"ground_truth.filtered.{_safe_name(filter_spec.name)}.manifest.json"
+    return dataset_dir / (
+        f"{_ground_truth_stem(metric, filter_spec=filter_spec)}.manifest.json"
     )
+
+
+def ground_truth_filename(metric: str) -> str:
+    return f"{_ground_truth_stem(metric, filter_spec=None)}.jsonl"
+
+
+def _ground_truth_stem(metric: str, *, filter_spec: FilterSpec | None) -> str:
+    stem = f"ground_truth.{_safe_name(metric)}"
+    if filter_spec is not None:
+        stem += f".filtered.{_safe_name(filter_spec.name)}"
+    return stem
 
 
 def _safe_name(value: str) -> str:

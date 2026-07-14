@@ -22,6 +22,8 @@ from ldbbench.datasets.ground_truth import prepare_ground_truth
 from ldbbench.datasets.prepare import optimize_dataset, prepare_dataset
 from ldbbench.runner.execute import (
     _batches,
+    _dataset_metric,
+    _ground_truth_path,
     _record_size_bytes,
     _split_concurrency,
     execute_benchmark,
@@ -222,6 +224,7 @@ def make_scenario(
     workload: str = "standard",
     search_under_ingest: dict[str, Any] | None = None,
     full_text: bool = False,
+    metric: str = "cosine",
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": top_k,
@@ -264,7 +267,7 @@ def make_scenario(
             "id_field": "_id",
             "vector_field": "emb",
             "text_field": "text",
-            "metric": "cosine",
+            "metric": metric,
         },
         "load": {
             "write_mode": write_mode,
@@ -1609,6 +1612,28 @@ def test_execute_benchmark_rejects_missing_explicit_ground_truth(tmp_path) -> No
             dataset_dir=dataset.output_dir,
             ground_truth_path=tmp_path / "missing-ground-truth.jsonl",
         )
+
+
+def test_ground_truth_path_uses_metric_specific_artifact(tmp_path) -> None:
+    legacy = tmp_path / "ground_truth.jsonl"
+    preferred = tmp_path / "ground_truth.euclidean.jsonl"
+    legacy.touch()
+
+    assert _ground_truth_path(tmp_path, None, metric="euclidean") == preferred
+
+
+def test_ground_truth_path_uses_explicit_legacy_artifact(tmp_path) -> None:
+    legacy = tmp_path / "ground_truth.jsonl"
+    legacy.touch()
+
+    assert _ground_truth_path(tmp_path, legacy, metric="euclidean") == legacy
+
+
+def test_dataset_metric_prefers_scenario_over_manifest() -> None:
+    assert _dataset_metric(
+        make_scenario(metric="euclidean"),
+        {"dataset": {"metric": "cosine"}},
+    ) == "euclidean"
 
 
 def test_recall_at_k() -> None:

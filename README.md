@@ -88,6 +88,13 @@ uv run --extra groundtruth ldbbench dataset ground-truth \
   --batch-size 100
 ```
 
+Ground-truth filenames include the metric so multiple variants can coexist,
+for example `ground_truth.cosine.jsonl`, `ground_truth.euclidean.jsonl`, and
+`ground_truth.euclidean.filtered.synthetic_bucket_1pct.jsonl`. Manifest files
+use the same stem with `.manifest.json`. `ldbbench run` selects the unfiltered
+artifact for the scenario metric by default; pass `--ground-truth` explicitly
+for filtered or legacy artifacts.
+
 ### 2. Configure a target
 
 Use one target config per database. The checked-in files are examples:
@@ -275,7 +282,7 @@ Real runs write:
   `query_events.jsonl`.
 - `summary.json`: load/query counts, latency percentiles, QPS, per-stage query
   summaries, load batching/upsert timing, error rates, recall when
-  `ground_truth.jsonl` is present, and search-under-ingest metrics when
+  a ground-truth artifact is present, and search-under-ingest metrics when
   applicable.
 
 ### Search-under-ingest read-after-write runs

@@ -150,7 +150,7 @@ def write_result(
     result_dir.mkdir()
     summary = {
         "dataset_dir": "data/datasets/cohere-wikipedia-1m",
-        "ground_truth": "data/datasets/cohere-wikipedia-1m/ground_truth.jsonl",
+        "ground_truth": "data/datasets/cohere-wikipedia-1m/ground_truth.cosine.jsonl",
         "load": {
             "attempt_latency_ms": {
                 "p50": 1307.9,

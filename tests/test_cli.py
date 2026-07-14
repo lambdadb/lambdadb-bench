@@ -200,7 +200,7 @@ query:
     assert exit_code == 0
     assert "progress: ground_truth: starting backend=exact" in captured.out
     assert "status: prepared" in captured.out
-    assert (dataset_dir / "ground_truth.jsonl").exists()
+    assert (dataset_dir / "ground_truth.cosine.jsonl").exists()
 
 
 def test_dataset_ground_truth_command_with_filter(
@@ -262,7 +262,7 @@ query:
     assert exit_code == 0
     assert "filter: synthetic_bucket_50pct" in captured.out
     assert (
-        dataset_dir / "ground_truth.filtered.synthetic_bucket_50pct.jsonl"
+        dataset_dir / "ground_truth.cosine.filtered.synthetic_bucket_50pct.jsonl"
     ).exists()
 
 

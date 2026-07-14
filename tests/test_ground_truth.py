@@ -61,6 +61,8 @@ def test_prepare_ground_truth_writes_exact_matches(tmp_path) -> None:
 
     lines = result.ground_truth_path.read_text(encoding="utf-8").splitlines()
     truth = json.loads(lines[0])
+    assert result.ground_truth_path.name == "ground_truth.cosine.jsonl"
+    assert result.manifest_path.name == "ground_truth.cosine.manifest.json"
     assert result.manifest["status"] == "prepared"
     assert result.manifest["dataset"]["records"] == 3
     assert result.manifest["dataset"]["queries"] == 1
@@ -95,6 +97,22 @@ def test_prepare_ground_truth_rejects_l2_metric(tmp_path) -> None:
 
     with pytest.raises(ConfigError, match="metric 'l2' is not supported"):
         prepare_ground_truth(dataset_dir=tmp_path, top_k=2, metric="l2")
+
+
+def test_prepare_ground_truth_keeps_metric_artifacts_separate(tmp_path) -> None:
+    prepare_fixture_dataset(tmp_path)
+
+    cosine = prepare_ground_truth(dataset_dir=tmp_path, top_k=2, metric="cosine")
+    euclidean = prepare_ground_truth(
+        dataset_dir=tmp_path,
+        top_k=2,
+        metric="euclidean",
+    )
+
+    assert cosine.ground_truth_path.name == "ground_truth.cosine.jsonl"
+    assert euclidean.ground_truth_path.name == "ground_truth.euclidean.jsonl"
+    assert cosine.ground_truth_path.exists()
+    assert euclidean.ground_truth_path.exists()
 
 
 def test_prepare_ground_truth_dry_run_writes_manifest_only(tmp_path) -> None:
@@ -142,10 +160,10 @@ def test_prepare_ground_truth_writes_filtered_exact_matches(tmp_path) -> None:
     lines = result.ground_truth_path.read_text(encoding="utf-8").splitlines()
     truth = json.loads(lines[0])
     assert result.ground_truth_path.name == (
-        "ground_truth.filtered.synthetic_bucket_50pct.jsonl"
+        "ground_truth.cosine.filtered.synthetic_bucket_50pct.jsonl"
     )
     assert result.manifest_path.name == (
-        "ground_truth.filtered.synthetic_bucket_50pct.manifest.json"
+        "ground_truth.cosine.filtered.synthetic_bucket_50pct.manifest.json"
     )
     assert result.manifest["ground_truth"]["filter"]["field"] == "filter_bucket_2"
     assert result.manifest["ground_truth"]["candidate_count"]["eligible_values"] >= 1
@@ -157,6 +175,29 @@ def test_prepare_ground_truth_writes_filtered_exact_matches(tmp_path) -> None:
     assert truth["candidate_count"] >= 1
     assert truth["expected_count"] == 1
     assert [match["id"] for match in truth["matches"]]
+
+
+def test_filtered_ground_truth_keeps_metric_artifacts_separate(tmp_path) -> None:
+    prepare_fixture_dataset(tmp_path)
+    options = {
+        "dataset_dir": tmp_path,
+        "top_k": 1,
+        "filter_name": "synthetic_bucket_50pct",
+        "filter_field": "filter_bucket_2",
+        "filter_value_source": "eligible-record-buckets",
+    }
+
+    cosine = prepare_ground_truth(metric="cosine", **options)
+    euclidean = prepare_ground_truth(metric="euclidean", **options)
+
+    assert cosine.ground_truth_path.name == (
+        "ground_truth.cosine.filtered.synthetic_bucket_50pct.jsonl"
+    )
+    assert euclidean.ground_truth_path.name == (
+        "ground_truth.euclidean.filtered.synthetic_bucket_50pct.jsonl"
+    )
+    assert cosine.ground_truth_path.exists()
+    assert euclidean.ground_truth_path.exists()
 
 
 def test_prepare_ground_truth_backfills_missing_filter_buckets(tmp_path) -> None:
