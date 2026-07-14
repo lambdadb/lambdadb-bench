@@ -59,6 +59,25 @@ def test_prepare_dataset_dry_run_writes_manifest_only(tmp_path) -> None:
     assert result.manifest["dataset"]["written_rows"] == 0
 
 
+def test_prepare_dataset_preserves_euclidean_metric(tmp_path) -> None:
+    base = make_scenario()
+    scenario = ScenarioConfig.from_mapping(
+        {
+            **base.raw,
+            "dataset": {**base.dataset, "metric": "euclidean"},
+        }
+    )
+
+    result = prepare_dataset(
+        scenario=scenario,
+        output_dir=tmp_path,
+        limit=3,
+        dry_run=True,
+    )
+
+    assert result.manifest["dataset"]["metric"] == "euclidean"
+
+
 def test_prepare_dataset_writes_normalized_records_and_queries(tmp_path) -> None:
     rows = [
         {"_id": "q", "emb": [9.0, 9.0], "text": "query", "url": "q-url"},

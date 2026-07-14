@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ldbbench.__about__ import __version__
-from ldbbench.config import ConfigError
+from ldbbench.config import VALID_DATASET_METRICS, ConfigError
 from ldbbench.datasets.prepare import (
     DATASET_MANIFEST_FILENAME,
     QUERIES_FILENAME,
@@ -26,7 +26,7 @@ from ldbbench.progress import ProgressCallback, ProgressTicker
 GROUND_TRUTH_FILENAME = "ground_truth.jsonl"
 GROUND_TRUTH_MANIFEST_FILENAME = "ground_truth_manifest.json"
 SUPPORTED_BACKENDS = {"exact", "faiss"}
-SUPPORTED_METRICS = {"cosine", "dot", "l2"}
+SUPPORTED_METRICS = VALID_DATASET_METRICS
 DEFAULT_FAISS_BATCH_SIZE = 100
 
 
@@ -868,7 +868,7 @@ def faiss_matches(
 
 
 def faiss_score(score: float, *, metric: str) -> float:
-    if metric in {"cosine", "dot", "l2"}:
+    if metric in SUPPORTED_METRICS:
         return float(score)
     raise ConfigError(f"unsupported metric {metric!r}")
 
@@ -876,7 +876,7 @@ def faiss_score(score: float, *, metric: str) -> float:
 def _faiss_index(faiss: Any, *, dimensions: int, metric: str) -> Any:
     if metric in {"cosine", "dot"}:
         return faiss.IndexFlatIP(dimensions)
-    if metric == "l2":
+    if metric == "euclidean":
         return faiss.IndexFlatL2(dimensions)
     raise ConfigError(f"unsupported metric {metric!r}")
 
@@ -884,7 +884,7 @@ def _faiss_index(faiss: Any, *, dimensions: int, metric: str) -> Any:
 def _faiss_index_type(metric: str) -> str:
     if metric in {"cosine", "dot"}:
         return "IndexFlatIP"
-    if metric == "l2":
+    if metric == "euclidean":
         return "IndexFlatL2"
     raise ConfigError(f"unsupported metric {metric!r}")
 
@@ -1246,7 +1246,7 @@ def score_vectors(*, query: VectorItem, record: VectorItem, metric: str) -> floa
         if denominator == 0:
             return 0.0
         return dot / denominator
-    if metric == "l2":
+    if metric == "euclidean":
         return sum(
             (q - r) ** 2
             for q, r in zip(query.vector, record.vector, strict=True)
@@ -1258,7 +1258,7 @@ def _score_sort_key(item: tuple[float, str], metric: str) -> tuple[float, str]:
     score, record_id = item
     if metric in {"cosine", "dot"}:
         return -score, record_id
-    if metric == "l2":
+    if metric == "euclidean":
         return score, record_id
     raise ConfigError(f"unsupported metric {metric!r}")
 

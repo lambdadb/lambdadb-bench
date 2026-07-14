@@ -15,6 +15,7 @@ import yaml
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 SECRET_KEY_PARTS = ("api_key", "apikey", "secret", "token", "password", "credential")
 VALID_WRITE_MODES = {"upsert", "bulk_upsert"}
+VALID_DATASET_METRICS = {"cosine", "dot", "euclidean"}
 VALID_QUERY_CONSISTENCY = {"eventual", "strong"}
 VALID_PREPARE_MODES = {"existing", "create", "recreate"}
 VALID_WORKLOADS = {"standard", "search_under_ingest", "full_text_search"}
@@ -58,6 +59,12 @@ class ScenarioConfig:
 
         _validate_positive_int(dataset, "rows")
         _validate_positive_int(dataset, "dimensions")
+        metric = dataset.get("metric", "cosine")
+        if not isinstance(metric, str) or metric not in VALID_DATASET_METRICS:
+            raise ConfigError(
+                "scenario.dataset.metric must be one of "
+                f"{sorted(VALID_DATASET_METRICS)}"
+            )
 
         write_mode = load.get("write_mode")
         if write_mode not in VALID_WRITE_MODES:

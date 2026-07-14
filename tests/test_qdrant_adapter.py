@@ -198,6 +198,17 @@ def test_prepare_create_uses_unnamed_vector_by_default() -> None:
     assert call["vectors_config"].distance.value == "Cosine"
 
 
+def test_prepare_create_uses_euclidean_metric() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(prepare={"mode": "create"})
+
+    adapter.prepare(target, dimensions=1024, metric="euclidean")
+
+    call = client.create_collection_calls[0]
+    assert call["vectors_config"].distance.value == "Euclid"
+
+
 def test_prepare_recreate_uses_named_vector_when_configured() -> None:
     client = FakeClient()
     adapter = make_adapter(client)

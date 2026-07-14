@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from ldbbench.cli import main
+from ldbbench.cli import build_parser, main
 
 
 def test_help_prints_usage(capsys: pytest.CaptureFixture[str]) -> None:
@@ -30,6 +30,35 @@ def test_version_option(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert exc.value.code == 0
     assert captured.out.startswith("ldbbench ")
+
+
+def test_ground_truth_cli_accepts_euclidean_metric() -> None:
+    args = build_parser().parse_args(
+        [
+            "dataset",
+            "ground-truth",
+            "--dataset-dir",
+            "dataset",
+            "--metric",
+            "euclidean",
+        ]
+    )
+
+    assert args.metric == "euclidean"
+
+
+def test_ground_truth_cli_rejects_l2_metric() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "dataset",
+                "ground-truth",
+                "--dataset-dir",
+                "dataset",
+                "--metric",
+                "l2",
+            ]
+        )
 
 
 def test_config_validate_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:

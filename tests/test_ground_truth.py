@@ -71,17 +71,30 @@ def test_prepare_ground_truth_writes_exact_matches(tmp_path) -> None:
     assert truth["matches"][0]["score"] == pytest.approx(1.0)
 
 
-def test_prepare_ground_truth_writes_exact_l2_matches(tmp_path) -> None:
+def test_prepare_ground_truth_writes_exact_euclidean_matches(
+    tmp_path,
+) -> None:
     prepare_fixture_dataset(tmp_path)
 
-    result = prepare_ground_truth(dataset_dir=tmp_path, top_k=2, metric="l2")
+    result = prepare_ground_truth(
+        dataset_dir=tmp_path,
+        top_k=2,
+        metric="euclidean",
+    )
 
     lines = result.ground_truth_path.read_text(encoding="utf-8").splitlines()
     truth = json.loads(lines[0])
-    assert result.manifest["ground_truth"]["metric"] == "l2"
+    assert result.manifest["ground_truth"]["metric"] == "euclidean"
     assert [match["id"] for match in truth["matches"]] == ["a", "c"]
     assert truth["matches"][0]["score"] == pytest.approx(0.0)
     assert truth["matches"][1]["score"] == pytest.approx(0.08)
+
+
+def test_prepare_ground_truth_rejects_l2_metric(tmp_path) -> None:
+    prepare_fixture_dataset(tmp_path)
+
+    with pytest.raises(ConfigError, match="metric 'l2' is not supported"):
+        prepare_ground_truth(dataset_dir=tmp_path, top_k=2, metric="l2")
 
 
 def test_prepare_ground_truth_dry_run_writes_manifest_only(tmp_path) -> None:
@@ -220,7 +233,10 @@ def test_prepare_ground_truth_writes_faiss_matches(tmp_path, monkeypatch) -> Non
     assert [match["id"] for match in truth["matches"]] == ["a", "c"]
 
 
-def test_prepare_ground_truth_writes_faiss_l2_matches(tmp_path, monkeypatch) -> None:
+def test_prepare_ground_truth_writes_faiss_euclidean_matches(
+    tmp_path,
+    monkeypatch,
+) -> None:
     np = pytest.importorskip("numpy")
     fake_faiss = types.ModuleType("faiss")
 
@@ -247,7 +263,7 @@ def test_prepare_ground_truth_writes_faiss_l2_matches(tmp_path, monkeypatch) -> 
     result = prepare_ground_truth(
         dataset_dir=tmp_path,
         top_k=2,
-        metric="l2",
+        metric="euclidean",
         backend="faiss",
         batch_size=2,
     )
@@ -255,7 +271,7 @@ def test_prepare_ground_truth_writes_faiss_l2_matches(tmp_path, monkeypatch) -> 
     lines = result.ground_truth_path.read_text(encoding="utf-8").splitlines()
     truth = json.loads(lines[0])
     assert result.manifest["ground_truth"]["backend"] == "faiss"
-    assert result.manifest["ground_truth"]["metric"] == "l2"
+    assert result.manifest["ground_truth"]["metric"] == "euclidean"
     assert result.manifest["ground_truth"]["index_type"] == "IndexFlatL2"
     assert result.manifest["ground_truth"]["normalize_vectors"] is False
     assert [match["id"] for match in truth["matches"]] == ["a", "c"]

@@ -9,7 +9,12 @@ import sys
 
 from ldbbench.__about__ import __version__
 from ldbbench.adapters import get_adapter
-from ldbbench.config import ConfigError, load_scenario, load_target
+from ldbbench.config import (
+    VALID_DATASET_METRICS,
+    ConfigError,
+    load_scenario,
+    load_target,
+)
 from ldbbench.datasets import (
     default_dataset_output_dir,
     optimize_dataset,
@@ -136,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ground_truth.add_argument(
         "--metric",
-        choices=["cosine", "dot", "l2"],
+        choices=sorted(VALID_DATASET_METRICS),
         help="Distance/similarity metric. Defaults to dataset manifest metric.",
     )
     ground_truth.add_argument(

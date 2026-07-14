@@ -79,6 +79,70 @@ query:
     assert scenario.query["stages"][0]["max_requests"] == 100
 
 
+def test_load_scenario_accepts_euclidean_metric(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: euclidean
+dataset:
+  rows: 100
+  dimensions: 2
+  metric: euclidean
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+
+    scenario = load_scenario(scenario_path)
+
+    assert scenario.dataset["metric"] == "euclidean"
+
+
+def test_load_scenario_rejects_l2_metric(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: l2
+dataset:
+  rows: 100
+  dimensions: 2
+  metric: l2
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="scenario.dataset.metric"):
+        load_scenario(scenario_path)
+
+
+def test_load_scenario_rejects_non_string_metric(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: invalid-metric
+dataset:
+  rows: 100
+  dimensions: 2
+  metric: [euclidean]
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="scenario.dataset.metric"):
+        load_scenario(scenario_path)
+
+
 def test_load_scenario_requires_query_stage_duration_or_max_requests(
     tmp_path,
 ) -> None:

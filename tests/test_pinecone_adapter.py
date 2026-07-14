@@ -263,6 +263,16 @@ def test_prepare_create_uses_serverless_spec() -> None:
     assert call["tags"] == {"env": "test"}
 
 
+def test_prepare_create_uses_euclidean_metric() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(prepare={"mode": "create"})
+
+    adapter.prepare(target, dimensions=1024, metric="euclidean")
+
+    assert client.create_index_calls[0]["metric"] == "euclidean"
+
+
 def test_prepare_recreate_deletes_before_create() -> None:
     client = FakeClient()
     adapter = make_adapter(client)

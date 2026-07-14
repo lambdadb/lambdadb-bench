@@ -214,6 +214,18 @@ def test_prepare_create_builds_vector_index_config() -> None:
     assert client.collections.gets == [{"collection_name": "smoke"}]
 
 
+def test_prepare_create_builds_euclidean_vector_index_config() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    target = make_target(prepare={"mode": "create"})
+
+    adapter.prepare(target, dimensions=1024, metric="euclidean")
+
+    assert client.collections.creates[0]["index_configs"]["dense"]["similarity"] == (
+        "euclidean"
+    )
+
+
 def test_prepare_create_passes_partition_config() -> None:
     client = FakeClient()
     adapter = make_adapter(client)
