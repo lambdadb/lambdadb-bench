@@ -1453,6 +1453,13 @@ def ground_truth_filename(metric: str) -> str:
     return f"{_ground_truth_stem(metric, filter_spec=None)}.jsonl"
 
 
+def ground_truth_manifest_path(ground_truth_path: str | Path) -> Path:
+    path = Path(ground_truth_path)
+    if path.name == "ground_truth.jsonl":
+        return path.with_name("ground_truth_manifest.json")
+    return path.with_suffix(".manifest.json")
+
+
 def _ground_truth_stem(metric: str, *, filter_spec: FilterSpec | None) -> str:
     stem = f"ground_truth.{_safe_name(metric)}"
     if filter_spec is not None:

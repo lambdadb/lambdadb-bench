@@ -95,6 +95,10 @@ use the same stem with `.manifest.json`. `ldbbench run` selects the unfiltered
 artifact for the scenario metric by default; pass `--ground-truth` explicitly
 for filtered or legacy artifacts.
 
+When a ground-truth JSONL file is selected, its matching manifest is required.
+Before querying, the runner verifies the scenario metric and `top_k`, the JSONL
+filename and SHA-256, and any filtered name/field/operator configuration.
+
 ### 2. Configure a target
 
 Use one target config per database. The checked-in files are examples:

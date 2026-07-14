@@ -23,6 +23,7 @@ from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
 from ldbbench.datasets.ground_truth import (
     artifact_path,
     ground_truth_filename,
+    ground_truth_manifest_path,
     load_dataset_manifest,
 )
 from ldbbench.datasets.prepare import (
@@ -32,7 +33,7 @@ from ldbbench.datasets.prepare import (
     RECORDS_MSGPACK_FILENAME,
     filter_bucket_metadata,
 )
-from ldbbench.manifest import initialize_run_artifacts
+from ldbbench.manifest import initialize_run_artifacts, sha256_file
 from ldbbench.progress import ProgressCallback, ProgressTicker
 from ldbbench.runner.plan import build_run_plan
 
@@ -234,6 +235,7 @@ def execute_benchmark(
         fallback_filename=QUERIES_FILENAME,
     )
     dataset_metric = _dataset_metric(scenario, dataset_manifest)
+    query_filter_spec = _query_filter_spec(scenario)
     truth_path = _ground_truth_path(
         dataset_path,
         ground_truth_path,
@@ -241,7 +243,19 @@ def execute_benchmark(
     )
     if ground_truth_path is not None and not truth_path.exists():
         raise ConfigError(f"ground truth file {truth_path} does not exist")
-    ground_truth = load_ground_truth(truth_path) if truth_path.exists() else {}
+    uses_ground_truth = not load_only and (
+        scenario.workload != "full_text_search" or ground_truth_path is not None
+    )
+    if uses_ground_truth and truth_path.exists():
+        validate_ground_truth_manifest(
+            truth_path,
+            metric=dataset_metric or "cosine",
+            top_k=_top_k(scenario),
+            query_filter_spec=query_filter_spec,
+        )
+        ground_truth = load_ground_truth(truth_path)
+    else:
+        ground_truth = {}
     record_shards = None
     if not query_only:
         record_shards = _record_shards_for_load(
@@ -470,7 +484,7 @@ def execute_benchmark(
             include_vectors=bool(scenario.query.get("include_vectors", False)),
             ground_truth=ground_truth,
             partition_filter_spec=_partition_filter_spec(scenario),
-            query_filter_spec=_query_filter_spec(scenario),
+            query_filter_spec=query_filter_spec,
             full_text_query_spec=_full_text_query_spec(scenario),
             events_path=query_events_path,
             stages=None if max_queries is not None else _query_stages(scenario),
@@ -3975,6 +3989,106 @@ def _read_msgpack_records(
             if limit is not None and index > limit:
                 break
             yield _parse_msgpack_record(raw, path=path, record_number=index)
+
+
+def validate_ground_truth_manifest(
+    ground_truth_path: str | Path,
+    *,
+    metric: str,
+    top_k: int,
+    query_filter_spec: LogicalFilterSpec | None,
+) -> None:
+    truth_path = Path(ground_truth_path)
+    manifest_path = ground_truth_manifest_path(truth_path)
+    if not manifest_path.exists():
+        raise ConfigError(
+            f"ground truth manifest {manifest_path} does not exist for {truth_path}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(
+            f"could not read ground truth manifest {manifest_path}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ConfigError(f"{manifest_path} must contain a JSON object")
+
+    ground_truth = manifest.get("ground_truth")
+    if not isinstance(ground_truth, dict):
+        raise ConfigError(f"{manifest_path} ground_truth must be a mapping")
+    manifest_metric = ground_truth.get("metric")
+    if manifest_metric != metric:
+        raise ConfigError(
+            f"ground truth manifest metric {manifest_metric!r} does not match "
+            f"scenario metric {metric!r}"
+        )
+    manifest_top_k = ground_truth.get("top_k")
+    if type(manifest_top_k) is not int or manifest_top_k < top_k:
+        raise ConfigError(
+            f"ground truth manifest top_k {manifest_top_k!r} is smaller than "
+            f"scenario top_k {top_k}"
+        )
+    _validate_ground_truth_manifest_filter(
+        manifest_path,
+        ground_truth.get("filter"),
+        query_filter_spec=query_filter_spec,
+    )
+
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ConfigError(f"{manifest_path} artifacts must be a mapping")
+    declared_path = artifacts.get("ground_truth")
+    if not isinstance(declared_path, str) or not declared_path:
+        raise ConfigError(
+            f"{manifest_path} artifacts.ground_truth must be a non-empty string"
+        )
+    if Path(declared_path).name != truth_path.name:
+        raise ConfigError(
+            f"ground truth manifest artifact {declared_path!r} does not match "
+            f"selected file {truth_path}"
+        )
+    expected_sha256 = artifacts.get("ground_truth_sha256")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        raise ConfigError(
+            f"{manifest_path} artifacts.ground_truth_sha256 must be a non-empty string"
+        )
+    actual_sha256 = sha256_file(truth_path)
+    if actual_sha256 != expected_sha256:
+        raise ConfigError(
+            f"ground truth checksum mismatch for {truth_path}: "
+            f"manifest={expected_sha256} actual={actual_sha256}"
+        )
+
+
+def _validate_ground_truth_manifest_filter(
+    manifest_path: Path,
+    raw_filter: Any,
+    *,
+    query_filter_spec: LogicalFilterSpec | None,
+) -> None:
+    if query_filter_spec is None:
+        if raw_filter is not None:
+            raise ConfigError(
+                f"filtered ground truth manifest {manifest_path} does not match "
+                "an unfiltered scenario"
+            )
+        return
+    if not isinstance(raw_filter, dict):
+        raise ConfigError(
+            f"filtered ground truth manifest {manifest_path} is missing "
+            "filter configuration"
+        )
+    expected = {
+        "name": query_filter_spec.name,
+        "field": query_filter_spec.field,
+        "operator": query_filter_spec.operator,
+    }
+    actual = {key: raw_filter.get(key) for key in expected}
+    if actual != expected:
+        raise ConfigError(
+            f"ground truth manifest filter {actual!r} does not match "
+            f"scenario filter {expected!r}"
+        )
 
 
 def load_ground_truth(path: str | Path) -> dict[str, GroundTruthEntry]:

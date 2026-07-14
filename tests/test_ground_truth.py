@@ -10,6 +10,7 @@ from ldbbench.config import ConfigError, ScenarioConfig
 from ldbbench.datasets.ground_truth import (
     VectorItem,
     exact_top_k,
+    ground_truth_manifest_path,
     prepare_ground_truth,
     score_vectors,
 )
@@ -113,6 +114,15 @@ def test_prepare_ground_truth_keeps_metric_artifacts_separate(tmp_path) -> None:
     assert euclidean.ground_truth_path.name == "ground_truth.euclidean.jsonl"
     assert cosine.ground_truth_path.exists()
     assert euclidean.ground_truth_path.exists()
+
+
+def test_ground_truth_manifest_path_supports_current_and_legacy_names(tmp_path) -> None:
+    assert ground_truth_manifest_path(
+        tmp_path / "ground_truth.euclidean.jsonl"
+    ).name == "ground_truth.euclidean.manifest.json"
+    assert ground_truth_manifest_path(
+        tmp_path / "ground_truth.jsonl"
+    ).name == "ground_truth_manifest.json"
 
 
 def test_prepare_ground_truth_dry_run_writes_manifest_only(tmp_path) -> None:

@@ -617,7 +617,9 @@ def test_execute_benchmark_applies_partition_filter_and_skips_recall(tmp_path) -
     assert result.summary["query"]["recall_skip_reason"] == "partition_filtered"
 
 
-def test_execute_benchmark_runs_full_text_query_without_ground_truth(tmp_path) -> None:
+def test_execute_benchmark_ignores_default_vector_ground_truth_for_full_text(
+    tmp_path,
+) -> None:
     scenario = make_scenario(full_text=True, top_k=2)
     target = make_target()
     scenario_path, target_path = write_configs(tmp_path, scenario, target)
@@ -637,6 +639,7 @@ def test_execute_benchmark_runs_full_text_query_without_ground_truth(tmp_path) -
             {"_id": "c", "emb": [0.8, 0.2], "text": "beta reference"},
         ],
     )
+    prepare_ground_truth(dataset_dir=dataset.output_dir, top_k=1)
     adapter = FakeAdapter()
 
     result = execute_benchmark(
@@ -1340,6 +1343,8 @@ def test_execute_benchmark_load_only_skips_queries(tmp_path) -> None:
     target = make_target()
     scenario_path, target_path = write_configs(tmp_path, scenario, target)
     dataset = prepare_fixture_dataset(tmp_path, scenario)
+    truth = prepare_ground_truth(dataset_dir=dataset.output_dir, top_k=2)
+    truth.manifest_path.unlink()
     adapter = FakeAdapter()
 
     result = execute_benchmark(
@@ -1611,6 +1616,122 @@ def test_execute_benchmark_rejects_missing_explicit_ground_truth(tmp_path) -> No
             output_dir=tmp_path / "result",
             dataset_dir=dataset.output_dir,
             ground_truth_path=tmp_path / "missing-ground-truth.jsonl",
+        )
+
+
+def test_execute_benchmark_rejects_missing_ground_truth_manifest(tmp_path) -> None:
+    scenario = make_scenario()
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    truth = prepare_ground_truth(dataset_dir=dataset.output_dir, top_k=2)
+    truth.manifest_path.unlink()
+
+    with pytest.raises(ConfigError, match="ground truth manifest .* does not exist"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+        )
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "error"),
+    [
+        (
+            "ground_truth",
+            "metric",
+            "euclidean",
+            "manifest metric 'euclidean'.*'cosine'",
+        ),
+        ("ground_truth", "top_k", 1, "manifest top_k 1.*scenario top_k 2"),
+        (
+            "artifacts",
+            "ground_truth",
+            "wrong-ground-truth.jsonl",
+            "manifest artifact .* does not match",
+        ),
+    ],
+)
+def test_execute_benchmark_rejects_ground_truth_manifest_mismatch(
+    tmp_path,
+    section: str,
+    key: str,
+    value: Any,
+    error: str,
+) -> None:
+    scenario = make_scenario()
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    truth = prepare_ground_truth(dataset_dir=dataset.output_dir, top_k=2)
+    manifest = json.loads(truth.manifest_path.read_text(encoding="utf-8"))
+    manifest[section][key] = value
+    truth.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=error):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+        )
+
+
+def test_execute_benchmark_rejects_ground_truth_checksum_mismatch(tmp_path) -> None:
+    scenario = make_scenario()
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    truth = prepare_ground_truth(dataset_dir=dataset.output_dir, top_k=2)
+    with truth.ground_truth_path.open("a", encoding="utf-8") as file:
+        file.write("\n")
+
+    with pytest.raises(ConfigError, match="ground truth checksum mismatch"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+        )
+
+
+def test_execute_benchmark_rejects_filtered_manifest_mismatch(tmp_path) -> None:
+    scenario = make_scenario(query_filter=True, top_k=1)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    truth = prepare_ground_truth(
+        dataset_dir=dataset.output_dir,
+        top_k=1,
+        filter_name="synthetic_bucket_50pct",
+        filter_field="filter_bucket_2",
+        filter_value_source="eligible-record-buckets",
+    )
+    manifest = json.loads(truth.manifest_path.read_text(encoding="utf-8"))
+    manifest["ground_truth"]["filter"]["name"] = "wrong-filter"
+    truth.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="manifest filter .* does not match"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+            ground_truth_path=truth.ground_truth_path,
         )
 
 

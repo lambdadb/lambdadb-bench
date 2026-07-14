@@ -225,7 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--ground-truth",
         help=(
             "Optional ground truth JSONL path. Defaults to the metric-specific "
-            "artifact under <dataset-dir>. Pass legacy artifacts explicitly."
+            "artifact under <dataset-dir>. A matching manifest is required. "
+            "Pass legacy artifacts explicitly."
         ),
     )
     run.add_argument(

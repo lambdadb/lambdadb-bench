@@ -372,6 +372,9 @@ Initial `eq` filtered-search support is implemented:
   expected counts, and exact expected matches.
 - Filtered ground-truth manifests include eligible bucket candidate-count
   summaries.
+- The runner requires the matching ground-truth manifest and validates its
+  metric, `top_k`, JSONL filename and SHA-256, and filter name/field/operator
+  before querying.
 - The runner reads filtered ground-truth rows, forwards portable logical filters
   through `adapter.query(..., filter_query=...)`, and records filter/count
   fields in query events and summaries.
