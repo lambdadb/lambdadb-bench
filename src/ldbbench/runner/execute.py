@@ -117,6 +117,9 @@ class FullTextQuerySpec:
 @dataclass(frozen=True)
 class GroundTruthEntry:
     ids: list[str]
+    recall_k: int | None = None
+    strict_ids: list[str] | None = None
+    boundary_ids: list[str] | None = None
     filter_query: dict[str, Any] | None = None
     filter_name: str | None = None
     candidate_count: int | None = None
@@ -2637,6 +2640,19 @@ def execute_query_once(
             actual=match_ids,
             expected=_ground_truth_ids(ground_truth_entry),
             k=top_k,
+            recall_k=(
+                ground_truth_entry.recall_k if ground_truth_entry is not None else None
+            ),
+            strict=(
+                ground_truth_entry.strict_ids
+                if ground_truth_entry is not None
+                else None
+            ),
+            boundary=(
+                ground_truth_entry.boundary_ids
+                if ground_truth_entry is not None
+                else None
+            ),
         )
     base_event.update(
         {
@@ -4123,8 +4139,51 @@ def load_ground_truth(path: str | Path) -> dict[str, GroundTruthEntry]:
                 raise ConfigError(
                     f"{path}:{line_number} expected_count must be an integer"
                 )
+            recall_k = None
+            strict_ids = None
+            boundary_ids = None
+            recall_groups = raw.get("recall_groups")
+            if recall_groups is not None:
+                if not isinstance(recall_groups, dict):
+                    raise ConfigError(
+                        f"{path}:{line_number} recall_groups must be a mapping"
+                    )
+                recall_k = recall_groups.get("k")
+                strict_ids = recall_groups.get("strict_ids")
+                boundary_ids = recall_groups.get("boundary_ids")
+                if type(recall_k) is not int or recall_k <= 0:
+                    raise ConfigError(
+                        f"{path}:{line_number} recall_groups.k must be positive"
+                    )
+                for name, values in (
+                    ("strict_ids", strict_ids),
+                    ("boundary_ids", boundary_ids),
+                ):
+                    if not isinstance(values, list) or any(
+                        not isinstance(value, str) for value in values
+                    ):
+                        raise ConfigError(
+                            f"{path}:{line_number} recall_groups.{name} "
+                            "must be a list of strings"
+                        )
+                    if len(set(values)) != len(values):
+                        raise ConfigError(
+                            f"{path}:{line_number} recall_groups.{name} "
+                            "must not contain duplicates"
+                        )
+                if set(strict_ids).intersection(boundary_ids):
+                    raise ConfigError(
+                        f"{path}:{line_number} recall_groups IDs must be disjoint"
+                    )
+                if not set(ids).issubset(set(strict_ids).union(boundary_ids)):
+                    raise ConfigError(
+                        f"{path}:{line_number} matches must belong to recall_groups"
+                    )
             truth[query_id] = GroundTruthEntry(
                 ids=ids,
+                recall_k=recall_k,
+                strict_ids=strict_ids,
+                boundary_ids=boundary_ids,
                 filter_query=dict(filter_query) if filter_query is not None else None,
                 filter_name=filter_name,
                 candidate_count=candidate_count,
@@ -4233,6 +4292,9 @@ def recall_at_k(
     actual: list[str],
     expected: list[str] | None,
     k: int,
+    recall_k: int | None = None,
+    strict: list[str] | None = None,
+    boundary: list[str] | None = None,
 ) -> float | None:
     if not expected:
         return None
@@ -4240,6 +4302,16 @@ def recall_at_k(
     if not expected_k:
         return None
     actual_k = set(actual[:k])
+    if recall_k == k and strict is not None and boundary is not None:
+        strict_set = set(strict)
+        boundary_slots = len(expected_k) - len(strict_set)
+        if boundary_slots >= 0:
+            strict_matches = len(actual_k.intersection(strict_set))
+            boundary_matches = min(
+                boundary_slots,
+                len(actual_k.intersection(boundary)),
+            )
+            return (strict_matches + boundary_matches) / len(expected_k)
     return len(actual_k.intersection(expected_k)) / len(expected_k)
 
 

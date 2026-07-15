@@ -26,6 +26,8 @@ from ldbbench.progress import ProgressCallback, ProgressTicker
 SUPPORTED_BACKENDS = {"exact", "faiss"}
 SUPPORTED_METRICS = VALID_DATASET_METRICS
 DEFAULT_FAISS_BATCH_SIZE = 100
+TIE_AWARE_RECALL_SEMANTICS = "k-boundary-tie-aware-v1"
+TIE_SCORE_POLICY = "exact"
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,18 @@ class VectorItem:
     vector: list[float]
     metadata: dict[str, Any]
     norm: float
+
+
+@dataclass(frozen=True)
+class TopKResult:
+    matches: list[dict[str, Any]]
+    recall_groups: dict[str, Any] | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"matches": self.matches}
+        if self.recall_groups is not None:
+            result["recall_groups"] = self.recall_groups
+        return result
 
 
 @dataclass(frozen=True)
@@ -270,7 +284,7 @@ def write_exact_ground_truth(
         for query in queries:
             if limit_queries is not None and count >= limit_queries:
                 break
-            matches = exact_top_k(
+            result = _exact_top_k_result(
                 query=query,
                 records=records,
                 top_k=top_k,
@@ -280,7 +294,7 @@ def write_exact_ground_truth(
                 json.dumps(
                     {
                         "query_id": query.id,
-                        "matches": matches,
+                        **result.as_dict(),
                     },
                     sort_keys=True,
                 )
@@ -316,7 +330,7 @@ def write_filtered_exact_ground_truth(
                 break
             filter_value = _assigned_filter_value(eligible_values, count)
             candidates = buckets[filter_value]
-            matches = exact_top_k(
+            result = _exact_top_k_result(
                 query=query,
                 records=candidates,
                 top_k=top_k,
@@ -328,7 +342,7 @@ def write_filtered_exact_ground_truth(
                 filter_spec=filter_spec,
                 filter_value=filter_value,
                 candidate_count=len(candidates),
-                matches=matches,
+                result=result,
             )
             count += 1
             ticker.maybe(f"ground_truth: exact filtered queries={count}")
@@ -702,7 +716,8 @@ def search_filtered_faiss_bucket(
         faiss.normalize_L2(vectors)
     index = _faiss_index(faiss, dimensions=vectors.shape[1], metric=metric)
     index.add(vectors)
-    search_k = min(bucket.candidate_count, top_k + 1)
+    # One slot may be the query itself; the other is a sentinel past kth place.
+    search_k = min(bucket.candidate_count, top_k + 2)
     for start in range(0, len(queries), batch_size):
         query_batch = queries[start : start + batch_size]
         query_vectors = np.asarray(
@@ -712,26 +727,30 @@ def search_filtered_faiss_bucket(
         if normalize:
             faiss.normalize_L2(query_vectors)
         scores, indices = index.search(query_vectors, search_k)
-        for entry, query_scores, query_indices in zip(
+        for entry, query_vector, query_scores, query_indices in zip(
             query_batch,
+            query_vectors,
             scores,
             indices,
             strict=True,
         ):
-            matches = faiss_matches(
+            result = _complete_faiss_top_k(
+                index=index,
                 query=entry.query,
+                query_vector=query_vector,
                 scores=query_scores,
                 indices=query_indices,
                 record_ids=bucket.record_ids,
                 top_k=top_k,
                 metric=metric,
+                search_k=search_k,
             )
             result_rows[entry.ordinal] = filtered_ground_truth_json_line(
                 query=entry.query,
                 filter_spec=filter_spec,
                 filter_value=entry.filter_value,
                 candidate_count=bucket.candidate_count,
-                matches=matches,
+                result=result,
             )
 
 
@@ -754,7 +773,8 @@ def write_faiss_query_results(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     query_count = 0
-    search_k = min(len(record_ids), top_k + 1)
+    # One slot may be the query itself; the other is a sentinel past kth place.
+    search_k = min(len(record_ids), top_k + 2)
     ticker = ProgressTicker(progress)
     with output.open("w", encoding="utf-8") as file:
         query_batch: list[VectorItem] = []
@@ -818,25 +838,29 @@ def write_faiss_batch(
     if normalize:
         faiss.normalize_L2(query_vectors)
     scores, indices = index.search(query_vectors, search_k)
-    for query, query_scores, query_indices in zip(
+    for query, query_vector, query_scores, query_indices in zip(
         queries,
+        query_vectors,
         scores,
         indices,
         strict=True,
     ):
-        matches = faiss_matches(
+        result = _complete_faiss_top_k(
+            index=index,
             query=query,
+            query_vector=query_vector,
             scores=query_scores,
             indices=query_indices,
             record_ids=record_ids,
             top_k=top_k,
             metric=metric,
+            search_k=search_k,
         )
         file.write(
             json.dumps(
                 {
                     "query_id": query.id,
-                    "matches": matches,
+                    **result.as_dict(),
                 },
                 sort_keys=True,
             )
@@ -854,6 +878,81 @@ def faiss_matches(
     top_k: int,
     metric: str,
 ) -> list[dict[str, Any]]:
+    candidates = _faiss_candidates(
+        query=query,
+        scores=scores,
+        indices=indices,
+        record_ids=record_ids,
+        metric=metric,
+    )
+    return _top_k_result(candidates, top_k=top_k, metric=metric).matches
+
+
+def _complete_faiss_top_k(
+    *,
+    index: Any,
+    query: VectorItem,
+    query_vector: Any,
+    scores: Any,
+    indices: Any,
+    record_ids: list[str],
+    top_k: int,
+    metric: str,
+    search_k: int,
+) -> TopKResult:
+    candidates = _faiss_candidates(
+        query=query,
+        scores=scores,
+        indices=indices,
+        record_ids=record_ids,
+        metric=metric,
+    )
+    while _faiss_boundary_may_be_truncated(
+        candidates,
+        top_k=top_k,
+        metric=metric,
+        search_k=search_k,
+        record_count=len(record_ids),
+    ):
+        search_k = min(len(record_ids), max(search_k + 1, search_k * 2))
+        expanded_scores, expanded_indices = index.search(
+            query_vector.reshape(1, -1),
+            search_k,
+        )
+        candidates = _faiss_candidates(
+            query=query,
+            scores=expanded_scores[0],
+            indices=expanded_indices[0],
+            record_ids=record_ids,
+            metric=metric,
+        )
+    return _top_k_result(candidates, top_k=top_k, metric=metric)
+
+
+def _faiss_boundary_may_be_truncated(
+    candidates: list[tuple[float, str]],
+    *,
+    top_k: int,
+    metric: str,
+    search_k: int,
+    record_count: int,
+) -> bool:
+    if search_k >= record_count:
+        return False
+    ordered = sorted(candidates, key=lambda item: _score_sort_key(item, metric))
+    if len(ordered) <= top_k:
+        return True
+    return ordered[-1][0] == ordered[top_k - 1][0]
+
+
+def _faiss_candidates(
+    *,
+    query: VectorItem,
+    scores: Any,
+    indices: Any,
+    record_ids: list[str],
+    metric: str,
+) -> list[tuple[float, str]]:
     candidates: list[tuple[float, str]] = []
     for score, index in zip(scores.tolist(), indices.tolist(), strict=True):
         if index < 0:
@@ -862,15 +961,7 @@ def faiss_matches(
         if record_id == query.id:
             continue
         candidates.append((faiss_score(score, metric=metric), record_id))
-    best = sorted(candidates, key=lambda item: _score_sort_key(item, metric))[:top_k]
-    return [
-        {
-            "id": record_id,
-            "rank": rank,
-            "score": score,
-        }
-        for rank, (score, record_id) in enumerate(best, start=1)
-    ]
+    return candidates
 
 
 def faiss_score(score: float, *, metric: str) -> float:
@@ -1001,6 +1092,21 @@ def exact_top_k(
     top_k: int,
     metric: str,
 ) -> list[dict[str, Any]]:
+    return _exact_top_k_result(
+        query=query,
+        records=records,
+        top_k=top_k,
+        metric=metric,
+    ).matches
+
+
+def _exact_top_k_result(
+    *,
+    query: VectorItem,
+    records: list[VectorItem],
+    top_k: int,
+    metric: str,
+) -> TopKResult:
     scored = []
     for record in records:
         if record.id == query.id:
@@ -1008,8 +1114,18 @@ def exact_top_k(
         score = score_vectors(query=query, record=record, metric=metric)
         scored.append((score, record.id))
 
-    best = sorted(scored, key=lambda item: _score_sort_key(item, metric))[:top_k]
-    return [
+    return _top_k_result(scored, top_k=top_k, metric=metric)
+
+
+def _top_k_result(
+    scored: list[tuple[float, str]],
+    *,
+    top_k: int,
+    metric: str,
+) -> TopKResult:
+    ordered = sorted(scored, key=lambda item: _score_sort_key(item, metric))
+    best = ordered[:top_k]
+    matches = [
         {
             "id": record_id,
             "rank": rank,
@@ -1017,6 +1133,25 @@ def exact_top_k(
         }
         for rank, (score, record_id) in enumerate(best, start=1)
     ]
+    if not best or len(ordered) <= len(best):
+        return TopKResult(matches=matches)
+
+    boundary_score = best[-1][0]
+    strict_ids = [record_id for score, record_id in best if score != boundary_score]
+    boundary_ids = [
+        record_id for score, record_id in ordered if score == boundary_score
+    ]
+    boundary_slots = len(best) - len(strict_ids)
+    if len(boundary_ids) <= boundary_slots:
+        return TopKResult(matches=matches)
+    return TopKResult(
+        matches=matches,
+        recall_groups={
+            "k": top_k,
+            "strict_ids": strict_ids,
+            "boundary_ids": boundary_ids,
+        },
+    )
 
 
 def write_filtered_ground_truth_row(
@@ -1026,7 +1161,7 @@ def write_filtered_ground_truth_row(
     filter_spec: FilterSpec,
     filter_value: str,
     candidate_count: int,
-    matches: list[dict[str, Any]],
+    result: TopKResult,
 ) -> None:
     file.write(
         filtered_ground_truth_json_line(
@@ -1034,7 +1169,7 @@ def write_filtered_ground_truth_row(
             filter_spec=filter_spec,
             filter_value=filter_value,
             candidate_count=candidate_count,
-            matches=matches,
+            result=result,
         )
     )
 
@@ -1045,7 +1180,7 @@ def filtered_ground_truth_json_line(
     filter_spec: FilterSpec,
     filter_value: str,
     candidate_count: int,
-    matches: list[dict[str, Any]],
+    result: TopKResult,
 ) -> str:
     return (
         json.dumps(
@@ -1058,8 +1193,8 @@ def filtered_ground_truth_json_line(
                 },
                 "filter_name": filter_spec.name,
                 "candidate_count": candidate_count,
-                "expected_count": len(matches),
-                "matches": matches,
+                "expected_count": len(result.matches),
+                **result.as_dict(),
             },
             sort_keys=True,
         )
@@ -1373,6 +1508,8 @@ def build_ground_truth_manifest(
             "metric": metric,
             "top_k": top_k,
             "limit_queries": limit_queries,
+            "recall_semantics": TIE_AWARE_RECALL_SEMANTICS,
+            "tie_score_policy": TIE_SCORE_POLICY,
             **dict(backend_details),
         },
         "artifacts": {

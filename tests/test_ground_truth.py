@@ -8,16 +8,21 @@ import pytest
 
 from ldbbench.config import ConfigError, ScenarioConfig
 from ldbbench.datasets.ground_truth import (
+    FilteredFaissBucket,
+    FilteredFaissQuery,
+    FilterSpec,
     VectorItem,
+    _top_k_result,
     exact_top_k,
     ground_truth_manifest_path,
     prepare_ground_truth,
     score_vectors,
+    search_filtered_faiss_bucket,
 )
 from ldbbench.datasets.prepare import prepare_dataset
 
 
-def make_scenario() -> ScenarioConfig:
+def make_scenario(metric: str = "cosine") -> ScenarioConfig:
     return ScenarioConfig.from_mapping(
         {
             "name": "ground-truth-smoke",
@@ -30,7 +35,7 @@ def make_scenario() -> ScenarioConfig:
                 "id_field": "_id",
                 "vector_field": "emb",
                 "text_field": "text",
-                "metric": "cosine",
+                "metric": metric,
                 "seed": 123,
             },
             "load": {"write_mode": "upsert"},
@@ -55,6 +60,47 @@ def prepare_fixture_dataset(tmp_path):
     )
 
 
+def prepare_boundary_tie_dataset(tmp_path):
+    rows = [
+        {"_id": "query", "emb": [0.0, 0.0], "text": "query"},
+        {"_id": "query", "emb": [0.0, 0.0], "text": "self"},
+        {"_id": "strict", "emb": [0.5, 0.0], "text": "strict"},
+        {"_id": "boundary-a", "emb": [1.0, 0.0], "text": "boundary"},
+        {"_id": "boundary-b", "emb": [1.0, 0.0], "text": "boundary"},
+        {"_id": "boundary-c", "emb": [1.0, 0.0], "text": "boundary"},
+        {"_id": "outside", "emb": [2.0, 0.0], "text": "outside"},
+    ]
+    return prepare_dataset(
+        scenario=make_scenario(metric="euclidean"),
+        output_dir=tmp_path,
+        limit=6,
+        query_count=1,
+        source_rows=rows,
+    )
+
+
+def fake_l2_index(np, search_sizes: list[int] | None = None):
+    class FakeIndexFlatL2:
+        def __init__(self, dimensions: int) -> None:
+            self.dimensions = dimensions
+            self.vectors = None
+
+        def add(self, vectors) -> None:
+            assert vectors.shape[1] == self.dimensions
+            self.vectors = vectors.copy()
+
+        def search(self, queries, top_k: int):
+            if search_sizes is not None:
+                search_sizes.append(top_k)
+            diff = queries[:, None, :] - self.vectors[None, :, :]
+            scores = np.sum(diff * diff, axis=2)
+            order = np.argsort(scores, axis=1)[:, :top_k]
+            sorted_scores = np.take_along_axis(scores, order, axis=1)
+            return sorted_scores, order
+
+    return FakeIndexFlatL2
+
+
 def test_prepare_ground_truth_writes_exact_matches(tmp_path) -> None:
     prepare_fixture_dataset(tmp_path)
 
@@ -70,6 +116,7 @@ def test_prepare_ground_truth_writes_exact_matches(tmp_path) -> None:
     assert result.manifest["artifacts"]["ground_truth_sha256"]
     assert truth["query_id"] == "query"
     assert [match["id"] for match in truth["matches"]] == ["a", "c"]
+    assert "recall_groups" not in truth
     assert truth["matches"][0]["rank"] == 1
     assert truth["matches"][0]["score"] == pytest.approx(1.0)
 
@@ -91,6 +138,23 @@ def test_prepare_ground_truth_writes_exact_euclidean_matches(
     assert [match["id"] for match in truth["matches"]] == ["a", "c"]
     assert truth["matches"][0]["score"] == pytest.approx(0.0)
     assert truth["matches"][1]["score"] == pytest.approx(0.08)
+
+
+def test_exact_ground_truth_preserves_k_boundary_candidates(tmp_path) -> None:
+    prepare_boundary_tie_dataset(tmp_path)
+
+    result = prepare_ground_truth(
+        dataset_dir=tmp_path,
+        top_k=2,
+        metric="euclidean",
+    )
+
+    truth = json.loads(result.ground_truth_path.read_text(encoding="utf-8"))
+    assert truth["recall_groups"] == {
+        "k": 2,
+        "strict_ids": ["strict"],
+        "boundary_ids": ["boundary-a", "boundary-b", "boundary-c"],
+    }
 
 
 def test_prepare_ground_truth_rejects_l2_metric(tmp_path) -> None:
@@ -327,6 +391,121 @@ def test_prepare_ground_truth_writes_faiss_euclidean_matches(
     assert result.manifest["ground_truth"]["normalize_vectors"] is False
     assert [match["id"] for match in truth["matches"]] == ["a", "c"]
     assert truth["matches"][0]["score"] == pytest.approx(0.0)
+
+
+def test_faiss_ground_truth_preserves_complete_k_boundary_after_self_match(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    np = pytest.importorskip("numpy")
+    search_sizes: list[int] = []
+    fake_faiss = types.ModuleType("faiss")
+    fake_faiss.IndexFlatL2 = fake_l2_index(np, search_sizes)
+    monkeypatch.setitem(sys.modules, "faiss", fake_faiss)
+    prepare_boundary_tie_dataset(tmp_path)
+
+    result = prepare_ground_truth(
+        dataset_dir=tmp_path,
+        top_k=2,
+        metric="euclidean",
+        backend="faiss",
+    )
+
+    truth = json.loads(result.ground_truth_path.read_text(encoding="utf-8"))
+    assert [match["id"] for match in truth["matches"]] == [
+        "strict",
+        "boundary-a",
+    ]
+    assert truth["recall_groups"] == {
+        "k": 2,
+        "strict_ids": ["strict"],
+        "boundary_ids": ["boundary-a", "boundary-b", "boundary-c"],
+    }
+    assert search_sizes == [4, 6]
+    assert result.manifest["ground_truth"]["recall_semantics"] == (
+        "k-boundary-tie-aware-v1"
+    )
+    assert result.manifest["ground_truth"]["tie_score_policy"] == "exact"
+
+
+def test_filtered_faiss_uses_complete_k_boundary_logic() -> None:
+    np = pytest.importorskip("numpy")
+    fake_faiss = types.SimpleNamespace(IndexFlatL2=fake_l2_index(np))
+    query = VectorItem(id="query", vector=[0.0, 0.0], metadata={}, norm=0.0)
+    bucket = FilteredFaissBucket(
+        filter_value="value",
+        record_ids=[
+            "query",
+            "strict",
+            "boundary-a",
+            "boundary-b",
+            "boundary-c",
+            "outside",
+        ],
+        vectors=np.asarray(
+            [
+                [0.0, 0.0],
+                [0.5, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [2.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    rows: list[str | None] = [None]
+
+    search_filtered_faiss_bucket(
+        faiss=fake_faiss,
+        np=np,
+        bucket=bucket,
+        queries=[FilteredFaissQuery(ordinal=0, filter_value="value", query=query)],
+        result_rows=rows,
+        top_k=2,
+        metric="euclidean",
+        normalize=False,
+        batch_size=1,
+        filter_spec=FilterSpec(
+            name="filter",
+            field="bucket",
+            operator="eq",
+            value_source="eligible-record-buckets",
+            seed=0,
+            min_candidates=2,
+        ),
+    )
+
+    assert rows[0] is not None
+    truth = json.loads(rows[0])
+    assert truth["expected_count"] == 2
+    assert truth["recall_groups"]["strict_ids"] == ["strict"]
+    assert truth["recall_groups"]["boundary_ids"] == [
+        "boundary-a",
+        "boundary-b",
+        "boundary-c",
+    ]
+
+
+@pytest.mark.parametrize("metric", ["cosine", "dot"])
+def test_k_boundary_groups_support_higher_is_better_metrics(metric: str) -> None:
+    result = _top_k_result(
+        [
+            (3.0, "strict"),
+            (2.0, "boundary-a"),
+            (2.0, "boundary-b"),
+            (1.0, "outside"),
+        ],
+        top_k=2,
+        metric=metric,
+    )
+
+    assert [match["id"] for match in result.matches] == ["strict", "boundary-a"]
+    assert result.recall_groups == {
+        "k": 2,
+        "strict_ids": ["strict"],
+        "boundary_ids": ["boundary-a", "boundary-b"],
+    }
 
 
 def test_prepare_ground_truth_writes_filtered_faiss_matches(

@@ -28,6 +28,7 @@ from ldbbench.runner.execute import (
     _split_concurrency,
     execute_benchmark,
     latency_summary,
+    load_ground_truth,
     parse_size_bytes,
     read_records,
     recall_at_k,
@@ -1760,6 +1761,105 @@ def test_dataset_metric_prefers_scenario_over_manifest() -> None:
 def test_recall_at_k() -> None:
     assert recall_at_k(actual=["a", "x"], expected=["a", "b"], k=2) == 0.5
     assert recall_at_k(actual=["a"], expected=None, k=2) is None
+
+
+def test_recall_at_k_accepts_alternate_k_boundary_candidate() -> None:
+    assert (
+        recall_at_k(
+            actual=["strict", "boundary-b"],
+            expected=["strict", "boundary-a"],
+            k=2,
+            recall_k=2,
+            strict=["strict"],
+            boundary=["boundary-a", "boundary-b"],
+        )
+        == 1.0
+    )
+
+
+def test_recall_at_k_does_not_replace_missing_strict_with_boundary() -> None:
+    assert (
+        recall_at_k(
+            actual=["boundary-a", "boundary-b"],
+            expected=["strict", "boundary-a"],
+            k=2,
+            recall_k=2,
+            strict=["strict"],
+            boundary=["boundary-a", "boundary-b"],
+        )
+        == 0.5
+    )
+
+
+def test_recall_at_k_rejects_candidate_outside_boundary() -> None:
+    assert (
+        recall_at_k(
+            actual=["strict", "outside"],
+            expected=["strict", "boundary-a"],
+            k=2,
+            recall_k=2,
+            strict=["strict"],
+            boundary=["boundary-a", "boundary-b"],
+        )
+        == 0.5
+    )
+
+
+def test_load_ground_truth_keeps_legacy_recall_behavior(tmp_path) -> None:
+    path = tmp_path / "ground_truth.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "query_id": "query",
+                "matches": [{"id": "a"}, {"id": "b"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    entry = load_ground_truth(path)["query"]
+
+    assert entry.recall_k is None
+    assert entry.strict_ids is None
+    assert entry.boundary_ids is None
+    assert recall_at_k(actual=["a", "x"], expected=entry.ids, k=2) == 0.5
+
+
+def test_load_ground_truth_reads_tie_aware_recall_groups(tmp_path) -> None:
+    path = tmp_path / "ground_truth.euclidean.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "query_id": "query",
+                "matches": [{"id": "strict"}, {"id": "boundary-a"}],
+                "recall_groups": {
+                    "k": 2,
+                    "strict_ids": ["strict"],
+                    "boundary_ids": ["boundary-a", "boundary-b"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    entry = load_ground_truth(path)["query"]
+
+    assert entry.recall_k == 2
+    assert entry.strict_ids == ["strict"]
+    assert entry.boundary_ids == ["boundary-a", "boundary-b"]
+    assert (
+        recall_at_k(
+            actual=["strict", "boundary-b"],
+            expected=entry.ids,
+            k=2,
+            recall_k=entry.recall_k,
+            strict=entry.strict_ids,
+            boundary=entry.boundary_ids,
+        )
+        == 1.0
+    )
 
 
 def test_latency_summary_empty_and_percentiles() -> None:

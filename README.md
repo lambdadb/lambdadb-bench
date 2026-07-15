@@ -99,6 +99,15 @@ When a ground-truth JSONL file is selected, its matching manifest is required.
 Before querying, the runner verifies the scenario metric and `top_k`, the JSONL
 filename and SHA-256, and any filtered name/field/operator configuration.
 
+Ground-truth recall is tie-aware at the kth boundary. Candidates with a score
+strictly better than the kth score must be returned, while any candidates whose
+ground-truth score is exactly equal to the kth score may fill the remaining
+slots. Ground-truth generation stores optional `recall_groups` only when a tie
+crosses that boundary; artifacts without this metadata keep the legacy ID-set
+recall behavior. Ties use exact equality from the selected ground-truth backend
+(`float32` FAISS scores for `faiss`, Python float scores for `exact`) rather than
+an added tolerance.
+
 ### 2. Configure a target
 
 Use one target config per database. The checked-in files are examples:
