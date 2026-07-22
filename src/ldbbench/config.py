@@ -21,6 +21,7 @@ VALID_PREPARE_MODES = {"existing", "create", "recreate"}
 VALID_WORKLOADS = {"standard", "search_under_ingest", "full_text_search"}
 VALID_SEARCH_UNDER_INGEST_PATTERNS = {"upload_and_ask", "parallel_upsert_query"}
 VALID_SEARCH_UNDER_INGEST_PROBE_SOURCES = {"queries"}
+VALID_DELETE_ORDERS = {"sequential", "random"}
 
 
 class ConfigError(ValueError):
@@ -38,6 +39,7 @@ class ScenarioConfig:
     description: str | None = None
     workload: str = "standard"
     search_under_ingest: dict[str, Any] = field(default_factory=dict)
+    delete: dict[str, Any] = field(default_factory=dict)
     quality: dict[str, Any] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
@@ -56,6 +58,7 @@ class ScenarioConfig:
                 f"{sorted(VALID_WORKLOADS)}"
             )
         search_under_ingest = _optional_mapping(raw, "search_under_ingest")
+        delete = _optional_mapping(raw, "delete")
 
         _validate_positive_int(dataset, "rows")
         _validate_positive_int(dataset, "dimensions")
@@ -97,6 +100,7 @@ class ScenarioConfig:
             workload=str(workload),
             default_consistency=str(consistency),
         )
+        _validate_delete(delete)
 
         stages = query.get("stages", [])
         if stages is not None:
@@ -126,6 +130,7 @@ class ScenarioConfig:
             query=query,
             workload=str(workload),
             search_under_ingest=search_under_ingest,
+            delete=delete,
             quality=_optional_mapping(raw, "quality"),
             metrics=_optional_mapping(raw, "metrics"),
             raw=raw,
@@ -506,6 +511,50 @@ def _validate_search_under_ingest(
         raise ConfigError(
             "scenario.search_under_ingest.max_chunks_per_document must be "
             "greater than or equal to min_chunks_per_document"
+        )
+
+
+def _validate_delete(config: Mapping[str, Any]) -> None:
+    if not config:
+        return
+
+    order = config.get("order")
+    if order not in VALID_DELETE_ORDERS:
+        raise ConfigError(
+            f"scenario.delete.order must be one of {sorted(VALID_DELETE_ORDERS)}"
+        )
+
+    seed = config.get("seed", 0)
+    if not isinstance(seed, int) or seed < 0:
+        raise ConfigError("scenario.delete.seed must be a non-negative integer")
+
+    _validate_optional_positive_int(config, "batch_size")
+    _validate_optional_positive_int(config, "visibility_sample_size")
+    visibility_timeout = config.get("visibility_timeout")
+    if visibility_timeout is not None and not isinstance(visibility_timeout, str):
+        raise ConfigError("scenario.delete.visibility_timeout must be a string")
+    visibility_poll_interval = config.get("visibility_poll_interval")
+    if visibility_poll_interval is not None and not isinstance(
+        visibility_poll_interval,
+        str,
+    ):
+        raise ConfigError(
+            "scenario.delete.visibility_poll_interval must be a string"
+        )
+
+    checkpoints = config.get("checkpoints_pct")
+    if not isinstance(checkpoints, list) or not checkpoints:
+        raise ConfigError("scenario.delete.checkpoints_pct must be a non-empty list")
+    if any(
+        not isinstance(checkpoint, int) or checkpoint <= 0 or checkpoint >= 100
+        for checkpoint in checkpoints
+    ):
+        raise ConfigError(
+            "scenario.delete.checkpoints_pct values must be integers between 1 and 99"
+        )
+    if checkpoints != sorted(set(checkpoints)):
+        raise ConfigError(
+            "scenario.delete.checkpoints_pct must be unique and increasing"
         )
 
 

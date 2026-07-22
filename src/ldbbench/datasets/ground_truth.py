@@ -14,6 +14,12 @@ from typing import Any
 
 from ldbbench.__about__ import __version__
 from ldbbench.config import VALID_DATASET_METRICS, ConfigError
+from ldbbench.datasets.deletion import (
+    LoadedDeletionPlan,
+    deletion_artifact_suffix,
+    deletion_checkpoint_count,
+    load_deletion_plan,
+)
 from ldbbench.datasets.prepare import (
     DATASET_MANIFEST_FILENAME,
     QUERIES_FILENAME,
@@ -110,6 +116,8 @@ def prepare_ground_truth(
     filter_value_source: str | None = None,
     filter_seed: int = 0,
     filter_min_candidates: int | None = None,
+    deletion_plan_path: str | Path | None = None,
+    delete_checkpoint_pct: int | None = None,
     dry_run: bool = False,
     progress: ProgressCallback | None = None,
 ) -> GroundTruthResult:
@@ -132,6 +140,13 @@ def prepare_ground_truth(
         filter_seed=filter_seed,
         filter_min_candidates=filter_min_candidates or top_k,
     )
+    if (deletion_plan_path is None) != (delete_checkpoint_pct is None):
+        raise ConfigError(
+            "deletion ground truth requires both deletion_plan_path and "
+            "delete_checkpoint_pct"
+        )
+    if filter_spec is not None and deletion_plan_path is not None:
+        raise ConfigError("filtered deletion ground truth is not supported yet")
 
     out = Path(dataset_dir)
     dataset_manifest = load_dataset_manifest(out)
@@ -144,15 +159,28 @@ def prepare_ground_truth(
 
     records_path = artifact_path(out, dataset_manifest, "records", RECORDS_FILENAME)
     queries_path = artifact_path(out, dataset_manifest, "queries", QUERIES_FILENAME)
+    deletion_plan = (
+        load_deletion_plan(deletion_plan_path, records_path=records_path)
+        if deletion_plan_path is not None
+        else None
+    )
+    deleted_ids = _deleted_ids(
+        deletion_plan,
+        checkpoint_pct=delete_checkpoint_pct,
+    )
     ground_truth_path = _ground_truth_output_path(
         out,
         metric=selected_metric,
         filter_spec=filter_spec,
+        deletion_plan=deletion_plan,
+        delete_checkpoint_pct=delete_checkpoint_pct,
     )
     manifest_path = _ground_truth_manifest_path(
         out,
         metric=selected_metric,
         filter_spec=filter_spec,
+        deletion_plan=deletion_plan,
+        delete_checkpoint_pct=delete_checkpoint_pct,
     )
 
     query_count = 0
@@ -174,7 +202,11 @@ def prepare_ground_truth(
         )
         if backend == "exact":
             ticker.emit("ground_truth: loading records for exact search")
-            records = list(read_vector_items(records_path))
+            records = [
+                record
+                for record in read_vector_items(records_path)
+                if record.id not in deleted_ids
+            ]
             if filter_spec is not None:
                 ensure_filter_bucket_metadata(records, dataset_manifest)
             ticker.emit(f"ground_truth: loaded records={len(records)}")
@@ -214,6 +246,7 @@ def prepare_ground_truth(
                     limit_queries=limit_queries,
                     batch_size=batch_size,
                     dataset_manifest=dataset_manifest,
+                    excluded_ids=deleted_ids,
                     progress=progress,
                 )
             else:
@@ -252,6 +285,8 @@ def prepare_ground_truth(
         record_count=record_count,
         query_count=query_count,
         filter_spec=filter_spec,
+        deletion_plan=deletion_plan,
+        delete_checkpoint_pct=delete_checkpoint_pct,
     )
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -367,6 +402,7 @@ def write_faiss_ground_truth(
     limit_queries: int | None,
     batch_size: int,
     dataset_manifest: Mapping[str, Any],
+    excluded_ids: set[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     faiss, np = import_faiss_dependencies()
@@ -382,6 +418,7 @@ def write_faiss_ground_truth(
         dimensions=dimensions,
         expected_records=expected_records,
         np=np,
+        excluded_ids=excluded_ids,
         progress=progress,
     )
     normalize = metric == "cosine"
@@ -992,11 +1029,19 @@ def read_faiss_records(
     dimensions: int,
     expected_records: int | None,
     np: Any,
+    excluded_ids: set[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> tuple[list[str], Any]:
+    excluded = excluded_ids or set()
     ids: list[str] = []
-    if expected_records is not None:
-        vectors = np.empty((expected_records, dimensions), dtype=np.float32)
+    source_count = 0
+    expected_live_records = (
+        expected_records - len(excluded) if expected_records is not None else None
+    )
+    if expected_live_records is not None and expected_live_records < 0:
+        raise ConfigError("deletion plan contains more IDs than the dataset")
+    if expected_live_records is not None:
+        vectors = np.empty((expected_live_records, dimensions), dtype=np.float32)
     else:
         rows = []
         vectors = None
@@ -1011,17 +1056,19 @@ def read_faiss_records(
                 path=Path(records_path),
                 line_number=line_number,
             )
+            source_count += 1
             if len(item.vector) != dimensions:
                 raise ConfigError(
                     f"vector dimension mismatch for record {item.id!r}: "
                     f"expected {dimensions}, got {len(item.vector)}"
                 )
+            if item.id in excluded:
+                continue
             ids.append(item.id)
             if vectors is not None:
-                if len(ids) > expected_records:
+                if len(ids) > expected_live_records:
                     raise ConfigError(
-                        f"{records_path} has more records than dataset manifest "
-                        f"declares ({expected_records})"
+                        "deletion plan live-record count does not match dataset"
                     )
                 vectors[len(ids) - 1] = item.vector
             else:
@@ -1029,14 +1076,22 @@ def read_faiss_records(
             ticker.maybe(
                 "ground_truth: loading records "
                 f"records={len(ids)}"
-                + (f"/{expected_records}" if expected_records is not None else "")
+                + (
+                    f"/{expected_live_records}"
+                    if expected_live_records is not None
+                    else ""
+                )
             )
 
     if vectors is not None:
-        if len(ids) != expected_records:
+        if source_count != expected_records:
             raise ConfigError(
-                f"{records_path} has {len(ids)} records but dataset manifest "
+                f"{records_path} has {source_count} records but dataset manifest "
                 f"declares {expected_records}"
+            )
+        if len(ids) != expected_live_records:
+            raise ConfigError(
+                "deletion plan IDs do not match the selected records artifact"
             )
         return ids, vectors
     return ids, np.asarray(rows, dtype=np.float32)
@@ -1488,6 +1543,8 @@ def build_ground_truth_manifest(
     record_count: int,
     query_count: int,
     filter_spec: FilterSpec | None = None,
+    deletion_plan: LoadedDeletionPlan | None = None,
+    delete_checkpoint_pct: int | None = None,
 ) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "created_at": datetime.now(UTC).isoformat(),
@@ -1523,6 +1580,25 @@ def build_ground_truth_manifest(
     }
     if filter_spec is not None:
         manifest["ground_truth"]["filter"] = filter_spec.as_dict()
+    if deletion_plan is not None and delete_checkpoint_pct is not None:
+        deleted_count = deletion_checkpoint_count(
+            deletion_plan.total_records,
+            delete_checkpoint_pct,
+        )
+        manifest["ground_truth"]["deletion"] = {
+            "order": deletion_plan.order,
+            "seed": deletion_plan.seed,
+            "checkpoint_pct": delete_checkpoint_pct,
+            "total_records": deletion_plan.total_records,
+            "deleted_count": deleted_count,
+            "remaining_count": deletion_plan.total_records - deleted_count,
+        }
+        manifest["artifacts"].update(
+            {
+                "deletion_plan": str(deletion_plan.path),
+                "deletion_plan_sha256": deletion_plan.plan_sha256,
+            }
+        )
     return manifest
 
 
@@ -1571,8 +1647,16 @@ def _ground_truth_output_path(
     *,
     metric: str,
     filter_spec: FilterSpec | None,
+    deletion_plan: LoadedDeletionPlan | None = None,
+    delete_checkpoint_pct: int | None = None,
 ) -> Path:
-    return dataset_dir / f"{_ground_truth_stem(metric, filter_spec=filter_spec)}.jsonl"
+    stem = _ground_truth_stem(
+        metric,
+        filter_spec=filter_spec,
+        deletion_plan=deletion_plan,
+        delete_checkpoint_pct=delete_checkpoint_pct,
+    )
+    return dataset_dir / f"{stem}.jsonl"
 
 
 def _ground_truth_manifest_path(
@@ -1580,10 +1664,16 @@ def _ground_truth_manifest_path(
     *,
     metric: str,
     filter_spec: FilterSpec | None,
+    deletion_plan: LoadedDeletionPlan | None = None,
+    delete_checkpoint_pct: int | None = None,
 ) -> Path:
-    return dataset_dir / (
-        f"{_ground_truth_stem(metric, filter_spec=filter_spec)}.manifest.json"
+    stem = _ground_truth_stem(
+        metric,
+        filter_spec=filter_spec,
+        deletion_plan=deletion_plan,
+        delete_checkpoint_pct=delete_checkpoint_pct,
     )
+    return dataset_dir / f"{stem}.manifest.json"
 
 
 def ground_truth_filename(metric: str) -> str:
@@ -1597,11 +1687,33 @@ def ground_truth_manifest_path(ground_truth_path: str | Path) -> Path:
     return path.with_suffix(".manifest.json")
 
 
-def _ground_truth_stem(metric: str, *, filter_spec: FilterSpec | None) -> str:
+def _ground_truth_stem(
+    metric: str,
+    *,
+    filter_spec: FilterSpec | None,
+    deletion_plan: LoadedDeletionPlan | None = None,
+    delete_checkpoint_pct: int | None = None,
+) -> str:
     stem = f"ground_truth.{_safe_name(metric)}"
     if filter_spec is not None:
         stem += f".filtered.{_safe_name(filter_spec.name)}"
+    if deletion_plan is not None and delete_checkpoint_pct is not None:
+        stem += f".{deletion_artifact_suffix(deletion_plan, delete_checkpoint_pct)}"
     return stem
+
+
+def _deleted_ids(
+    deletion_plan: LoadedDeletionPlan | None,
+    *,
+    checkpoint_pct: int | None,
+) -> set[str]:
+    if deletion_plan is None or checkpoint_pct is None:
+        return set()
+    count = deletion_checkpoint_count(
+        deletion_plan.total_records,
+        checkpoint_pct,
+    )
+    return set(deletion_plan.ids[:count])
 
 
 def _safe_name(value: str) -> str:

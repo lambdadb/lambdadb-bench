@@ -61,6 +61,47 @@ def test_ground_truth_cli_rejects_l2_metric() -> None:
         )
 
 
+def test_run_cli_accepts_delete_only_checkpoint_options() -> None:
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--scenario",
+            "scenario.yaml",
+            "--target",
+            "target.yaml",
+            "--out",
+            "result",
+            "--delete-only",
+            "--deletion-plan",
+            "plan.jsonl",
+            "--delete-checkpoint-pct",
+            "25",
+            "--allow-destructive",
+        ]
+    )
+
+    assert args.delete_only is True
+    assert args.deletion_plan == "plan.jsonl"
+    assert args.delete_checkpoint_pct == 25
+
+
+def test_run_cli_rejects_multiple_execution_phases() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "run",
+                "--scenario",
+                "scenario.yaml",
+                "--target",
+                "target.yaml",
+                "--out",
+                "result",
+                "--load-only",
+                "--delete-only",
+            ]
+        )
+
+
 def test_config_validate_command(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
     scenario_path = tmp_path / "scenario.yaml"
     target_path = tmp_path / "target.yaml"

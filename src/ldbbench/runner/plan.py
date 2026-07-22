@@ -51,6 +51,7 @@ def build_run_plan(
     target: TargetConfig,
     capabilities: AdapterCapabilities,
     allow_destructive: bool = False,
+    delete_only: bool = False,
 ) -> RunPlan:
     write_mode = str(scenario.load.get("write_mode"))
     query_consistency = _planned_query_consistency(scenario)
@@ -67,22 +68,23 @@ def build_run_plan(
     not_applicable: list[str] = []
     warnings: list[str] = []
 
-    if write_mode not in capabilities.supported_write_modes:
-        unsupported.append(
-            f"write_mode {write_mode!r} is not supported by {target.vendor}"
-        )
-
-    if query_consistency not in capabilities.supported_query_consistency:
-        if query_consistency == "strong":
-            not_applicable.append(
-                f"query consistency 'strong' is N/A for {target.vendor}: "
-                "no comparable read-after-write strong guarantee is declared"
-            )
-        else:
+    if not delete_only:
+        if write_mode not in capabilities.supported_write_modes:
             unsupported.append(
-                f"query consistency {query_consistency!r} is not supported by "
-                f"{target.vendor}"
+                f"write_mode {write_mode!r} is not supported by {target.vendor}"
             )
+
+        if query_consistency not in capabilities.supported_query_consistency:
+            if query_consistency == "strong":
+                not_applicable.append(
+                    f"query consistency 'strong' is N/A for {target.vendor}: "
+                    "no comparable read-after-write strong guarantee is declared"
+                )
+            else:
+                unsupported.append(
+                    f"query consistency {query_consistency!r} is not supported by "
+                    f"{target.vendor}"
+                )
 
     if target.prepare_mode not in capabilities.supported_prepare_modes:
         unsupported.append(
@@ -92,19 +94,36 @@ def build_run_plan(
     if target.prepare_mode == "recreate" and not allow_destructive:
         unsupported.append("prepare mode 'recreate' requires --allow-destructive")
 
-    if partition_filter_requested and not capabilities.supports_query_partition_filter:
+    if delete_only and not capabilities.supports_delete_by_id:
+        unsupported.append(f"delete by ID is not supported by {target.vendor}")
+    if delete_only and not allow_destructive:
+        unsupported.append("--delete-only requires --allow-destructive")
+
+    if (
+        not delete_only
+        and partition_filter_requested
+        and not capabilities.supports_query_partition_filter
+    ):
         not_applicable.append(
             f"query partition_filter is N/A for {target.vendor}: "
             "no equivalent physical partition pruning support is declared"
         )
 
-    if query_filter_requested and not capabilities.supports_query_filter:
+    if (
+        not delete_only
+        and query_filter_requested
+        and not capabilities.supports_query_filter
+    ):
         not_applicable.append(
             f"query filter is N/A for {target.vendor}: "
             "no logical metadata filter support is declared"
         )
 
-    if full_text_requested and not capabilities.supports_full_text_search:
+    if (
+        not delete_only
+        and full_text_requested
+        and not capabilities.supports_full_text_search
+    ):
         not_applicable.append(
             f"full-text search is N/A for {target.vendor}: "
             "no comparable full-text search support is declared"

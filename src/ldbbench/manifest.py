@@ -115,6 +115,7 @@ def build_run_manifest(
                 "write_mode": scenario.load.get("write_mode"),
             },
             "search_under_ingest": scenario.search_under_ingest,
+            "delete": scenario.delete,
         },
         "target": {
             "vendor": target.vendor,

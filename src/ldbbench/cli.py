@@ -19,6 +19,7 @@ from ldbbench.datasets import (
     default_dataset_output_dir,
     optimize_dataset,
     prepare_dataset,
+    prepare_deletion_plan,
     prepare_ground_truth,
 )
 from ldbbench.manifest import initialize_run_artifacts
@@ -124,6 +125,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optionally split records into this many msgpack shards.",
     )
     optimize.set_defaults(func=run_dataset_optimize)
+    delete_plan = dataset_subcommands.add_parser(
+        "delete-plan",
+        help="Build a deterministic document-deletion plan.",
+    )
+    delete_plan.add_argument(
+        "--scenario",
+        required=True,
+        help="Scenario YAML containing a delete block.",
+    )
+    delete_plan.add_argument(
+        "--dataset-dir",
+        required=True,
+        help="Prepared dataset cache directory.",
+    )
+    delete_plan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write only the deletion plan manifest.",
+    )
+    delete_plan.set_defaults(func=run_dataset_delete_plan)
     ground_truth = dataset_subcommands.add_parser(
         "ground-truth",
         help="Compute ground truth for prepared dataset artifacts.",
@@ -192,6 +213,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum loaded-record candidates per assigned filter value.",
     )
     ground_truth.add_argument(
+        "--deletion-plan",
+        help="Deletion plan JSONL used to compute survivor ground truth.",
+    )
+    ground_truth.add_argument(
+        "--delete-checkpoint-pct",
+        type=int,
+        help="Cumulative deletion checkpoint percent for survivor ground truth.",
+    )
+    ground_truth.add_argument(
         "--dry-run",
         action="store_true",
         help="Write only the ground truth manifest without computing neighbors.",
@@ -239,15 +269,37 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Limit queries executed in this run. Useful for smoke tests.",
     )
-    run.add_argument(
+    phase = run.add_mutually_exclusive_group()
+    phase.add_argument(
         "--load-only",
         action="store_true",
         help="Load records and skip query execution.",
     )
-    run.add_argument(
+    phase.add_argument(
         "--query-only",
         action="store_true",
         help="Skip loading and run queries against an existing prepared target.",
+    )
+    phase.add_argument(
+        "--delete-only",
+        action="store_true",
+        help="Delete one configured checkpoint and skip load/query execution.",
+    )
+    run.add_argument(
+        "--deletion-plan",
+        help="Deletion plan JSONL required by --delete-only.",
+    )
+    run.add_argument(
+        "--delete-checkpoint-pct",
+        type=int,
+        help="Configured cumulative checkpoint targeted by --delete-only.",
+    )
+    run.add_argument(
+        "--deletion-state",
+        help=(
+            "Prior deletion_state.json for progressive --delete-only, or the "
+            "completed state to validate for --query-only."
+        ),
     )
     run.add_argument(
         "--resume-load",
@@ -265,7 +317,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--allow-destructive",
         action="store_true",
-        help="Allow destructive preparation modes such as recreate.",
+        help=(
+            "Allow destructive operations such as recreate and document deletion."
+        ),
     )
     run.add_argument(
         "--allow-large-run",
@@ -389,6 +443,27 @@ def run_dataset_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_dataset_delete_plan(args: argparse.Namespace) -> int:
+    scenario = load_scenario(args.scenario)
+    if not scenario.delete:
+        raise ConfigError("scenario.delete must be set for dataset delete-plan")
+    result = prepare_deletion_plan(
+        dataset_dir=args.dataset_dir,
+        order=str(scenario.delete["order"]),
+        seed=int(scenario.delete.get("seed", 0)),
+        dry_run=args.dry_run,
+        progress=print_progress,
+    )
+    print(f"status: {result.manifest['status']}")
+    print(f"order: {result.manifest['deletion_plan']['order']}")
+    print(f"seed: {result.manifest['deletion_plan']['seed']}")
+    print(f"records: {result.manifest['deletion_plan']['records']}")
+    print(f"wrote {result.manifest_path}")
+    if not args.dry_run:
+        print(f"wrote {result.plan_path}")
+    return 0
+
+
 def run_dataset_ground_truth(args: argparse.Namespace) -> int:
     result = prepare_ground_truth(
         dataset_dir=args.dataset_dir,
@@ -403,6 +478,8 @@ def run_dataset_ground_truth(args: argparse.Namespace) -> int:
         filter_value_source=args.filter_value_source,
         filter_seed=args.filter_seed,
         filter_min_candidates=args.filter_min_candidates,
+        deletion_plan_path=args.deletion_plan,
+        delete_checkpoint_pct=args.delete_checkpoint_pct,
         dry_run=args.dry_run,
         progress=print_progress,
     )
@@ -412,6 +489,10 @@ def run_dataset_ground_truth(args: argparse.Namespace) -> int:
     print(f"top_k: {result.manifest['ground_truth']['top_k']}")
     if "filter" in result.manifest["ground_truth"]:
         print(f"filter: {result.manifest['ground_truth']['filter']['name']}")
+    if "deletion" in result.manifest["ground_truth"]:
+        deletion = result.manifest["ground_truth"]["deletion"]
+        print(f"delete_checkpoint_pct: {deletion['checkpoint_pct']}")
+        print(f"remaining_records: {deletion['remaining_count']}")
     print(f"records: {result.manifest['dataset']['records']}")
     print(f"queries: {result.manifest['dataset']['queries']}")
     print(f"wrote {result.manifest_path}")
@@ -441,6 +522,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         target=target,
         capabilities=adapter.capabilities,
         allow_destructive=args.allow_destructive,
+        delete_only=args.delete_only,
     )
     if not args.dry_run:
         if not args.dataset_dir:
@@ -458,6 +540,10 @@ def run_benchmark(args: argparse.Namespace) -> int:
             max_queries=args.max_queries,
             load_only=args.load_only,
             query_only=args.query_only,
+            delete_only=args.delete_only,
+            deletion_plan_path=args.deletion_plan,
+            delete_checkpoint_pct=args.delete_checkpoint_pct,
+            deletion_state_path=args.deletion_state,
             resume_load=args.resume_load,
             allow_destructive=args.allow_destructive,
             allow_large_run=args.allow_large_run,
@@ -522,12 +608,21 @@ def run_benchmark(args: argparse.Namespace) -> int:
                     "search_under_ingest_same_document_hit_rate_at_k: "
                     f"{search_summary['read_after_write_same_document_hit_rate_at_k']}"
                 )
+        if "deletion" in result.summary:
+            deletion = result.summary["deletion"]
+            print(f"deleted_documents: {deletion['deleted_count']}")
+            print(f"remaining_documents: {deletion['remaining_count']}")
+            print(f"delete_checkpoint_pct: {deletion['checkpoint_pct']}")
         print(f"wrote {result.ingest_events_path}")
+        if result.delete_events_path.exists():
+            print(f"wrote {result.delete_events_path}")
         print(f"wrote {result.query_events_path}")
         if result.search_under_ingest_events_path.exists():
             print(f"wrote {result.search_under_ingest_events_path}")
         if result.load_checkpoint_path.exists():
             print(f"wrote {result.load_checkpoint_path}")
+        if result.deletion_state_path.exists():
+            print(f"wrote {result.deletion_state_path}")
         print(f"wrote {result.summary_path}")
         return 0
 

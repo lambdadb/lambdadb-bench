@@ -11,6 +11,7 @@ import pytest
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    DeleteResult,
     PrepareResult,
     QueryMatch,
     QueryResult,
@@ -18,6 +19,7 @@ from ldbbench.adapters.base import (
     VectorRecord,
 )
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
+from ldbbench.datasets.deletion import prepare_deletion_plan
 from ldbbench.datasets.ground_truth import prepare_ground_truth
 from ldbbench.datasets.prepare import optimize_dataset, prepare_dataset
 from ldbbench.runner.execute import (
@@ -43,6 +45,7 @@ class FakeAdapter:
         supports_query_filter=True,
         supports_query_partition_filter=True,
         supports_full_text_search=True,
+        supports_delete_by_id=True,
     )
 
     def __init__(
@@ -52,6 +55,7 @@ class FakeAdapter:
         fail_every: int = 0,
         load_delay_seconds: float = 0.0,
         query_delay_seconds: float = 0.0,
+        stale_deleted_fetch: bool = False,
     ) -> None:
         self.prepared: dict[str, Any] | None = None
         self.upserted: list[list[VectorRecord]] = []
@@ -60,10 +64,13 @@ class FakeAdapter:
         self.filter_queries: list[dict[str, Any] | None] = []
         self.partition_filters: list[dict[str, Any] | None] = []
         self.full_text_queries: list[dict[str, Any]] = []
+        self.deleted_batches: list[list[str]] = []
+        self.deleted_ids: set[str] = set()
         self.fail_load_batch = fail_load_batch
         self.fail_every = fail_every
         self.load_delay_seconds = load_delay_seconds
         self.query_delay_seconds = query_delay_seconds
+        self.stale_deleted_fetch = stale_deleted_fetch
         self.query_calls = 0
         self.load_calls = 0
         self._lock = Lock()
@@ -152,6 +159,20 @@ class FakeAdapter:
             ][:top_k]
         )
 
+    def delete_batch(
+        self,
+        target: TargetConfig,
+        ids: list[str],
+    ) -> DeleteResult:
+        self.deleted_batches.append(list(ids))
+        deleted = set(ids)
+        self.deleted_ids.update(deleted)
+        self.upserted = [
+            [record for record in batch if record.id not in deleted]
+            for batch in self.upserted
+        ]
+        return DeleteResult(count=len(ids))
+
     def full_text_query(
         self,
         target: TargetConfig,
@@ -205,7 +226,11 @@ class FakeAdapter:
         consistency: str,
         include_vectors: bool = False,
     ) -> list[dict[str, Any]]:
-        return [{"id": item} for item in ids]
+        return [
+            {"id": item}
+            for item in ids
+            if self.stale_deleted_fetch or item not in self.deleted_ids
+        ]
 
 
 def make_scenario(
@@ -226,6 +251,7 @@ def make_scenario(
     search_under_ingest: dict[str, Any] | None = None,
     full_text: bool = False,
     metric: str = "cosine",
+    delete_order: str | None = None,
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": top_k,
@@ -281,6 +307,13 @@ def make_scenario(
     }
     if search_under_ingest is not None:
         mapping["search_under_ingest"] = search_under_ingest
+    if delete_order is not None:
+        mapping["delete"] = {
+            "order": delete_order,
+            "seed": 0,
+            "checkpoints_pct": [50, 75],
+            "batch_size": 1,
+        }
     if max_batch_bytes is not None:
         mapping["load"]["max_batch_bytes"] = max_batch_bytes
     if load_concurrency is not None:
@@ -1422,6 +1455,204 @@ def test_execute_benchmark_query_only_requires_existing_prepare_mode(tmp_path) -
             dataset_dir=dataset.output_dir,
             query_only=True,
         )
+
+
+def test_execute_benchmark_delete_only_writes_checkpoint_state(tmp_path) -> None:
+    scenario = make_scenario(delete_order="sequential")
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    plan = prepare_deletion_plan(
+        dataset_dir=dataset.output_dir,
+        order="sequential",
+    )
+    adapter = FakeAdapter()
+    adapter.upserted.append(
+        [
+            VectorRecord(id="a", vector=[1.0, 0.0]),
+            VectorRecord(id="b", vector=[0.0, 1.0]),
+            VectorRecord(id="c", vector=[0.8, 0.2]),
+        ]
+    )
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "delete-50",
+        dataset_dir=dataset.output_dir,
+        delete_only=True,
+        deletion_plan_path=plan.plan_path,
+        delete_checkpoint_pct=50,
+        allow_destructive=True,
+    )
+
+    state = json.loads(result.deletion_state_path.read_text(encoding="utf-8"))
+    events = [
+        json.loads(line)
+        for line in result.delete_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert adapter.deleted_batches == [["a"]]
+    assert events[0]["documents"] == 1
+    assert state["status"] == "completed"
+    assert state["deletion"]["deleted_count"] == 1
+    assert state["deletion"]["remaining_count"] == 2
+    assert state["deletion"]["visibility"]["status"] == "not_visible"
+    assert result.summary["load"]["skip_reason"] == "delete_only"
+    assert result.summary["query"]["skip_reason"] == "delete_only"
+
+
+def test_delete_only_resumes_to_later_checkpoint_and_query_validates_state(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(delete_order="sequential", top_k=1)
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    plan = prepare_deletion_plan(
+        dataset_dir=dataset.output_dir,
+        order="sequential",
+    )
+    ground_truth = prepare_ground_truth(
+        dataset_dir=dataset.output_dir,
+        top_k=1,
+        deletion_plan_path=plan.plan_path,
+        delete_checkpoint_pct=75,
+    )
+    adapter = FakeAdapter()
+    adapter.upserted.append(
+        [
+            VectorRecord(id="a", vector=[1.0, 0.0]),
+            VectorRecord(id="b", vector=[0.0, 1.0]),
+            VectorRecord(id="c", vector=[0.8, 0.2]),
+        ]
+    )
+
+    first = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "delete-50",
+        dataset_dir=dataset.output_dir,
+        delete_only=True,
+        deletion_plan_path=plan.plan_path,
+        delete_checkpoint_pct=50,
+        allow_destructive=True,
+    )
+    second = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "delete-75",
+        dataset_dir=dataset.output_dir,
+        delete_only=True,
+        deletion_plan_path=plan.plan_path,
+        delete_checkpoint_pct=75,
+        deletion_state_path=first.deletion_state_path,
+        allow_destructive=True,
+    )
+    query = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "query-75",
+        dataset_dir=dataset.output_dir,
+        ground_truth_path=ground_truth.ground_truth_path,
+        max_queries=1,
+        query_only=True,
+        deletion_state_path=second.deletion_state_path,
+    )
+
+    assert adapter.deleted_batches == [["a"], ["b"]]
+    assert second.summary["deletion"]["newly_deleted_count"] == 1
+    assert second.summary["deletion"]["deleted_count"] == 2
+    assert query.summary["query"]["recall_at_k"] == 1.0
+    assert query.summary["deletion"]["status"] == "validated"
+
+
+def test_delete_only_requires_destructive_opt_in(tmp_path) -> None:
+    scenario = make_scenario(delete_order="sequential")
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    plan = prepare_deletion_plan(
+        dataset_dir=dataset.output_dir,
+        order="sequential",
+    )
+
+    with pytest.raises(ConfigError, match="allow-destructive"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "delete",
+            dataset_dir=dataset.output_dir,
+            delete_only=True,
+            deletion_plan_path=plan.plan_path,
+            delete_checkpoint_pct=50,
+        )
+
+
+def test_query_only_delete_scenario_requires_deletion_state(tmp_path) -> None:
+    scenario = make_scenario(delete_order="sequential")
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+
+    with pytest.raises(ConfigError, match="requires --deletion-state"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=FakeAdapter(),
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "query",
+            dataset_dir=dataset.output_dir,
+            query_only=True,
+        )
+
+
+def test_delete_only_fails_state_when_deleted_ids_remain_visible(tmp_path) -> None:
+    scenario = make_scenario(delete_order="sequential")
+    scenario.delete["visibility_timeout"] = "1ms"
+    scenario.delete["visibility_poll_interval"] = "1ms"
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    plan = prepare_deletion_plan(
+        dataset_dir=dataset.output_dir,
+        order="sequential",
+    )
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=FakeAdapter(stale_deleted_fetch=True),
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "delete",
+        dataset_dir=dataset.output_dir,
+        delete_only=True,
+        deletion_plan_path=plan.plan_path,
+        delete_checkpoint_pct=50,
+        allow_destructive=True,
+    )
+
+    state = json.loads(result.deletion_state_path.read_text(encoding="utf-8"))
+    assert result.summary["status"] == "failed"
+    assert result.summary["deletion"]["status"] == "failed"
+    assert state["status"] == "failed"
+    assert state["deletion"]["visibility"]["status"] == "timeout"
 
 
 def test_execute_benchmark_writes_partial_summary_on_load_error(tmp_path) -> None:

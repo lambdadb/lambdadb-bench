@@ -190,6 +190,79 @@ query:
         load_scenario(scenario_path)
 
 
+def test_load_scenario_accepts_delete_configuration(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: delete-smoke
+dataset:
+  rows: 100
+  dimensions: 2
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+delete:
+  order: random
+  seed: 7
+  checkpoints_pct: [10, 25, 50]
+  batch_size: 100
+  visibility_timeout: 5m
+  visibility_poll_interval: 1s
+  visibility_sample_size: 10
+""",
+        encoding="utf-8",
+    )
+
+    scenario = load_scenario(scenario_path)
+
+    assert scenario.delete["order"] == "random"
+    assert scenario.delete["checkpoints_pct"] == [10, 25, 50]
+    assert scenario.delete["visibility_timeout"] == "5m"
+
+
+@pytest.mark.parametrize(
+    "delete_config, message",
+    [
+        ("order: unknown\n  checkpoints_pct: [10]", "delete.order"),
+        ("order: sequential\n  checkpoints_pct: [50, 10]", "unique and increasing"),
+        ("order: sequential\n  checkpoints_pct: [100]", "between 1 and 99"),
+        (
+            "order: sequential\n  checkpoints_pct: [10]\n  visibility_sample_size: 0",
+            "visibility_sample_size",
+        ),
+        (
+            "order: sequential\n  checkpoints_pct: [10]\n  visibility_timeout: 5",
+            "visibility_timeout",
+        ),
+    ],
+)
+def test_load_scenario_rejects_invalid_delete_configuration(
+    tmp_path,
+    delete_config: str,
+    message: str,
+) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        f"""
+name: delete-smoke
+dataset:
+  rows: 100
+  dimensions: 2
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+delete:
+  {delete_config}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        load_scenario(scenario_path)
+
+
 def test_load_scenario_accepts_search_under_ingest_workload(tmp_path) -> None:
     scenario_path = tmp_path / "scenario.yaml"
     scenario_path.write_text(

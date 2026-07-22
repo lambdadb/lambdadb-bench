@@ -169,6 +169,43 @@ def test_recreate_allowed_with_destructive_flag() -> None:
     assert plan.status == "supported"
 
 
+def test_delete_only_requires_destructive_flag() -> None:
+    plan = build_run_plan(
+        scenario=make_scenario(),
+        target=make_target(),
+        capabilities=QDRANT_DRYRUN.capabilities,
+        delete_only=True,
+    )
+
+    assert plan.status == "unsupported"
+    assert "--delete-only requires --allow-destructive" in plan.unsupported
+
+
+def test_delete_only_is_supported_with_explicit_opt_in() -> None:
+    plan = build_run_plan(
+        scenario=make_scenario(),
+        target=make_target(),
+        capabilities=QDRANT_DRYRUN.capabilities,
+        delete_only=True,
+        allow_destructive=True,
+    )
+
+    assert plan.status == "supported"
+
+
+def test_delete_only_ignores_unrelated_query_capabilities() -> None:
+    plan = build_run_plan(
+        scenario=make_scenario(consistency="strong", partition_filter=True),
+        target=make_target(vendor="qdrant"),
+        capabilities=QDRANT_DRYRUN.capabilities,
+        delete_only=True,
+        allow_destructive=True,
+    )
+
+    assert plan.status == "supported"
+    assert not plan.not_applicable
+
+
 def test_unsupported_write_mode_blocks_run() -> None:
     plan = build_run_plan(
         scenario=make_scenario(write_mode="bulk_upsert"),

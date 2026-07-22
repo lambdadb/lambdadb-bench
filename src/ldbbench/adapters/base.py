@@ -18,6 +18,7 @@ class AdapterCapabilities:
     supports_query_partition_filter: bool = False
     supports_nested_object_index: bool = False
     supports_full_text_search: bool = False
+    supports_delete_by_id: bool = False
     supported_prepare_modes: frozenset[str] = frozenset(
         {"existing", "create", "recreate"}
     )
@@ -32,6 +33,7 @@ class AdapterCapabilities:
             "supports_query_partition_filter": self.supports_query_partition_filter,
             "supports_nested_object_index": self.supports_nested_object_index,
             "supports_full_text_search": self.supports_full_text_search,
+            "supports_delete_by_id": self.supports_delete_by_id,
             "supported_prepare_modes": sorted(self.supported_prepare_modes),
             "vendor_consistency_options": self.vendor_consistency_options,
         }
@@ -61,6 +63,12 @@ class VectorRecord:
 
 @dataclass(frozen=True)
 class UpsertResult:
+    count: int
+    raw_response: object | None = None
+
+
+@dataclass(frozen=True)
+class DeleteResult:
     count: int
     raw_response: object | None = None
 
@@ -115,6 +123,13 @@ class VectorDBAdapter(Protocol):
         partition_filter: Mapping[str, Any] | None = None,
     ) -> QueryResult:
         """Run one vector query against the target."""
+
+    def delete_batch(
+        self,
+        target: TargetConfig,
+        ids: Sequence[str],
+    ) -> DeleteResult:
+        """Delete a batch of documents by source ID."""
 
     def full_text_query(
         self,

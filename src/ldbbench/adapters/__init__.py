@@ -3,6 +3,7 @@
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    DeleteResult,
     PrepareResult,
     QueryMatch,
     QueryResult,
@@ -18,6 +19,7 @@ from ldbbench.adapters.registry import get_adapter
 __all__ = [
     "AdapterCapabilities",
     "CheckResult",
+    "DeleteResult",
     "LambdaDBAdapter",
     "PineconeAdapter",
     "PrepareResult",

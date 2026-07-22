@@ -34,6 +34,7 @@ class FakeDocs:
         self.upserts: list[dict[str, Any]] = []
         self.bulk_upserts: list[dict[str, Any]] = []
         self.fetches: list[dict[str, Any]] = []
+        self.deletes: list[dict[str, Any]] = []
 
     def upsert(self, **kwargs: Any) -> dict[str, Any]:
         self.upserts.append(kwargs)
@@ -46,6 +47,10 @@ class FakeDocs:
     def fetch(self, **kwargs: Any) -> dict[str, Any]:
         self.fetches.append(kwargs)
         return {"docs": [{"doc": {"id": item}} for item in kwargs["ids"]]}
+
+    def delete(self, **kwargs: Any) -> dict[str, Any]:
+        self.deletes.append(kwargs)
+        return {"ok": True}
 
 
 class FakeCollections:
@@ -176,6 +181,16 @@ def test_check_validates_lambdadb_metadata_without_requiring_api_key() -> None:
     assert result.ok
     assert result.details["collection_name"] == "smoke"
     assert result.details["api_key_present"] is False
+
+
+def test_delete_batch_forwards_document_ids() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    result = adapter.delete_batch(make_target(), ["a", "b"])
+
+    assert result.count == 2
+    assert client.collections.docs.deletes == [{"ids": ["a", "b"]}]
 
 
 def test_check_reports_missing_project_name() -> None:

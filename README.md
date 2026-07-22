@@ -288,6 +288,12 @@ Real runs write:
 
 - `ingest_events.jsonl`: one event per upsert batch, including load errors.
 - `load_checkpoint.json`: resumable load watermark and matching load context.
+- `delete_events.jsonl`: one event per document-ID delete batch in
+  `--delete-only` runs.
+- `deletion_state.json`: written by `--delete-only` with the cumulative delete
+  checkpoint, target identity fingerprint, dataset/deletion-plan checksums,
+  and sampled delete-visibility result. Only a state whose sampled IDs are no
+  longer fetch-visible is marked `completed`.
 - `query_events.jsonl`: one event per query attempt, including query errors.
 - `search_under_ingest_events.jsonl`: one event per upload-and-ask probe when
   `search_under_ingest.pattern: upload_and_ask` is used. Parallel
@@ -297,6 +303,107 @@ Real runs write:
   summaries, load batching/upsert timing, error rates, recall when
   a ground-truth artifact is present, and search-under-ingest metrics when
   applicable.
+
+### Delete-only and search-after-delete runs
+
+Deletion scenarios use a deterministic plan and split mutation from search:
+
+```text
+load-only -> delete-only -> query-only with survivor ground truth
+```
+
+Use `scenarios/cohere-wikipedia-1m-delete-sequential.yaml` to delete in prepared
+record order, or `scenarios/cohere-wikipedia-1m-delete-random.yaml` for a seeded
+random order. `delete.checkpoints_pct` lists the allowed cumulative checkpoints;
+each `--delete-only` invocation advances to exactly one checkpoint. The delete
+block also controls post-delete verification through `visibility_timeout`,
+`visibility_poll_interval`, and `visibility_sample_size`.
+
+First create the checksummed deletion plan:
+
+```bash
+uv run ldbbench dataset delete-plan \
+  --scenario scenarios/cohere-wikipedia-1m-delete-random.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m
+```
+
+Then compute survivor ground truth outside the timed database run. Repeat this
+command for each checkpoint that will be queried:
+
+```bash
+uv run ldbbench dataset ground-truth \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --metric cosine \
+  --backend faiss \
+  --top-k 10 \
+  --deletion-plan data/datasets/cohere-wikipedia-1m/deletion_plan.random.seed-20260723.jsonl \
+  --delete-checkpoint-pct 25
+```
+
+After the collection has been loaded and the target config has been changed to
+`prepare.mode: existing`, advance the database to the 25% checkpoint:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m-delete-random.yaml \
+  --target configs/lambdadb.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --delete-only \
+  --deletion-plan data/datasets/cohere-wikipedia-1m/deletion_plan.random.seed-20260723.jsonl \
+  --delete-checkpoint-pct 25 \
+  --allow-destructive \
+  --allow-large-run \
+  --out results/lambdadb-delete-random-25
+```
+
+Search the remaining corpus using the matching state and survivor GT. A
+query-only run using a deletion scenario requires both arguments and rejects a
+state whose order, seed, or checkpoint is not configured by the scenario:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m-delete-random.yaml \
+  --target configs/lambdadb.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --query-only \
+  --deletion-state results/lambdadb-delete-random-25/deletion_state.json \
+  --ground-truth data/datasets/cohere-wikipedia-1m/ground_truth.cosine.deleted.random.seed-20260723.pct-025.jsonl \
+  --allow-large-run \
+  --out results/lambdadb-search-after-delete-random-25
+```
+
+To advance from 25% to 50%, pass the 25% state into the next delete-only run.
+Only the additional plan slice is sent to the database:
+
+```bash
+uv run ldbbench run \
+  --scenario scenarios/cohere-wikipedia-1m-delete-random.yaml \
+  --target configs/lambdadb.example.yaml \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --delete-only \
+  --deletion-plan data/datasets/cohere-wikipedia-1m/deletion_plan.random.seed-20260723.jsonl \
+  --delete-checkpoint-pct 50 \
+  --deletion-state results/lambdadb-delete-random-25/deletion_state.json \
+  --allow-destructive \
+  --allow-large-run \
+  --out results/lambdadb-delete-random-50
+```
+
+The runner rejects mismatched target fingerprints (including endpoint and
+configured project/region/namespace identity), records and queries checksums,
+deletion-plan checksum, scenario order/seed/checkpoint metadata, metric, top-k,
+or survivor GT checksum. Do not recreate the same remote collection between
+delete checkpoints or switch the credentials behind the configured API-key
+environment variable: a local fingerprint cannot distinguish those remote
+identity changes when the target config itself is unchanged.
+
+Delete completion verifies a deterministic sample from the full cumulative
+deleted prefix after all delete requests return. It is not an exhaustive scan
+of every deleted ID; any stale deleted hits that remain outside the sample still
+occupy result slots and reduce survivor recall. Query reports and
+`*-query-stages.csv` include delete order, seed, checkpoint percentage, and
+remaining-record count so checkpoint results can be compared directly.
+Filtered survivor GT is not supported in the initial implementation.
 
 ### Search-under-ingest read-after-write runs
 

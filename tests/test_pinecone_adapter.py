@@ -50,6 +50,7 @@ class FakeIndex:
         self.upserts: list[dict[str, Any]] = []
         self.queries: list[dict[str, Any]] = []
         self.fetches: list[dict[str, Any]] = []
+        self.deletes: list[dict[str, Any]] = []
 
     def upsert(self, **kwargs: Any) -> dict[str, Any]:
         self.upserts.append(kwargs)
@@ -72,6 +73,9 @@ class FakeIndex:
                 "b": FakeVector(metadata={"text": "beta"}, values=[0.2]),
             }
         )
+
+    def delete(self, **kwargs: Any) -> None:
+        self.deletes.append(kwargs)
 
 
 class FakeClient:
@@ -139,6 +143,16 @@ def test_check_validates_pinecone_metadata_without_requiring_api_key() -> None:
     assert result.details["index_host_present"] is False
     assert result.details["api_key_present"] is False
     assert result.details["namespace"] == "bench"
+
+
+def test_delete_batch_forwards_ids_and_namespace() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    result = adapter.delete_batch(make_target(), ["a", "b"])
+
+    assert result.count == 2
+    assert client.index.deletes == [{"ids": ["a", "b"], "namespace": "bench"}]
 
 
 def test_check_requires_index_name() -> None:

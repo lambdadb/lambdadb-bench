@@ -101,6 +101,80 @@ def test_generate_report_includes_parallel_search_under_ingest(tmp_path) -> None
     assert "700.000" in markdown
 
 
+def test_generate_report_includes_delete_only_results(tmp_path) -> None:
+    result_dir = write_result(
+        tmp_path,
+        "delete",
+        target_label="lambdadb-delete",
+        vendor="lambdadb",
+        load_rps=0.0,
+        query_qps=0.0,
+    )
+    summary_path = result_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["deletion"] = {
+        "status": "completed",
+        "order": "random",
+        "seed": 7,
+        "checkpoint_pct": 50,
+        "deleted_count": 500000,
+        "newly_deleted_count": 250000,
+        "remaining_count": 500000,
+        "visibility": {"status": "not_visible"},
+        "documents_per_second": 1200.0,
+        "latency_ms": {"p50": 20.0, "p95": 40.0},
+        "errors": 0,
+        "error_rate": 0.0,
+    }
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = generate_report(
+        [result_dir],
+        output_path=tmp_path / "reports" / "delete.md",
+    )
+
+    markdown = result.markdown_path.read_text(encoding="utf-8")
+    assert "## Delete Results" in markdown
+    assert "random" in markdown
+    assert "500000" in markdown
+    assert "1200.000" in markdown
+    assert "not_visible" in markdown
+
+
+def test_generate_report_labels_search_after_delete_checkpoint(tmp_path) -> None:
+    result_dir = write_result(
+        tmp_path,
+        "query-after-delete",
+        target_label="lambdadb-delete-query",
+        vendor="lambdadb",
+        load_rps=0.0,
+        query_qps=700.0,
+    )
+    summary_path = result_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["deletion"] = {
+        "status": "validated",
+        "order": "random",
+        "seed": 7,
+        "checkpoint_pct": 50,
+        "deleted_count": 500000,
+        "remaining_count": 500000,
+    }
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = generate_report(
+        [result_dir],
+        output_path=tmp_path / "reports" / "query-after-delete.md",
+    )
+
+    query_rows = list(csv.DictReader(result.query_csv_path.open(encoding="utf-8")))
+    assert query_rows[0]["delete_order"] == "random"
+    assert query_rows[0]["delete_checkpoint_pct"] == "50"
+    assert query_rows[0]["remaining_count"] == "500000"
+    markdown = result.markdown_path.read_text(encoding="utf-8")
+    assert "delete_checkpoint_pct" in markdown
+
+
 def test_generate_report_rejects_missing_manifest(tmp_path) -> None:
     result_dir = tmp_path / "empty-result"
     result_dir.mkdir()

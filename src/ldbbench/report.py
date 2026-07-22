@@ -36,6 +36,10 @@ LOAD_CSV_HEADERS = [
 QUERY_CSV_HEADERS = [
     "result_dir",
     "target",
+    "delete_order",
+    "delete_seed",
+    "delete_checkpoint_pct",
+    "remaining_count",
     "stage_index",
     "concurrency",
     "processes",
@@ -208,6 +212,19 @@ def _render_markdown(runs: list[RunReport]) -> str:
     lines.extend(
         [
             "",
+            "## Delete Results",
+            "",
+        ]
+    )
+    delete_rows = _delete_rows(runs)
+    lines.extend(
+        _markdown_table(delete_rows)
+        if delete_rows
+        else ["No delete-only results were found."]
+    )
+    lines.extend(
+        [
+            "",
             "## Recall And Quality Gates",
             "",
         ]
@@ -354,9 +371,14 @@ def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
     candidate_count = _mapping(stage.get("candidate_count"))
     expected_count = _mapping(stage.get("expected_count"))
     returned_count = _mapping(stage.get("returned_count"))
+    deletion = _mapping(run.summary.get("deletion"))
     return {
         "result_dir": str(run.path),
         "target": _target_label(run),
+        "delete_order": _fmt(deletion.get("order")),
+        "delete_seed": _fmt(deletion.get("seed")),
+        "delete_checkpoint_pct": _fmt(deletion.get("checkpoint_pct")),
+        "remaining_count": _fmt(deletion.get("remaining_count")),
         "stage_index": _fmt(stage.get("stage_index")),
         "concurrency": _fmt(stage.get("concurrency")),
         "processes": _fmt(stage.get("processes")),
@@ -437,6 +459,7 @@ def _quality_rows(runs: list[RunReport]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for run in runs:
         query = _mapping(run.summary.get("query"))
+        deletion = _mapping(run.summary.get("deletion"))
         gate = _recall_gate(run)
         recall = query.get("recall_at_k")
         passed = "N/A"
@@ -446,12 +469,48 @@ def _quality_rows(runs: list[RunReport]) -> list[dict[str, str]]:
             {
                 "result_dir": str(run.path),
                 "target": _target_label(run),
+                "delete_order": _fmt(deletion.get("order")),
+                "delete_seed": _fmt(deletion.get("seed")),
+                "delete_checkpoint_pct": _fmt(deletion.get("checkpoint_pct")),
+                "remaining_count": _fmt(deletion.get("remaining_count")),
                 "recall_at_k": _fmt_float(recall),
                 "recall_samples": _fmt(query.get("recall_samples")),
                 "recall_skip_reason": _fmt(query.get("recall_skip_reason")),
                 "min_recall": _fmt_float(gate),
                 "quality_gate": passed,
                 "query_mode": _fmt(query.get("mode")),
+            }
+        )
+    return rows
+
+
+def _delete_rows(runs: list[RunReport]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for run in runs:
+        deletion = _mapping(run.summary.get("deletion"))
+        if not deletion or "newly_deleted_count" not in deletion:
+            continue
+        latency = _mapping(deletion.get("latency_ms"))
+        visibility = _mapping(deletion.get("visibility"))
+        rows.append(
+            {
+                "result_dir": str(run.path),
+                "target": _target_label(run),
+                "status": _fmt(deletion.get("status")),
+                "order": _fmt(deletion.get("order")),
+                "seed": _fmt(deletion.get("seed")),
+                "checkpoint_pct": _fmt(deletion.get("checkpoint_pct")),
+                "deleted_count": _fmt(deletion.get("deleted_count")),
+                "newly_deleted_count": _fmt(deletion.get("newly_deleted_count")),
+                "remaining_count": _fmt(deletion.get("remaining_count")),
+                "visibility": _fmt(visibility.get("status")),
+                "documents_per_second": _fmt_float(
+                    deletion.get("documents_per_second")
+                ),
+                "p50_ms": _fmt_float(latency.get("p50")),
+                "p95_ms": _fmt_float(latency.get("p95")),
+                "errors": _fmt(deletion.get("errors")),
+                "error_rate": _fmt_float(deletion.get("error_rate")),
             }
         )
     return rows
@@ -467,6 +526,7 @@ def _warning_lines(runs: list[RunReport]) -> list[str]:
         load = _mapping(run.summary.get("load"))
         query = _mapping(run.summary.get("query"))
         search = _mapping(run.summary.get("search_under_ingest"))
+        deletion = _mapping(run.summary.get("deletion"))
         if load.get("status") == "skipped":
             warnings.append(
                 f"{target}: load stage skipped ({_fmt(load.get('skip_reason'))})."
@@ -496,6 +556,10 @@ def _warning_lines(runs: list[RunReport]) -> list[str]:
                 warnings.append(
                     f"{target}: search-under-ingest recorded {errors} errors."
                 )
+        if deletion:
+            errors = deletion.get("errors")
+            if isinstance(errors, int) and errors:
+                warnings.append(f"{target}: delete stage recorded {errors} errors.")
         gate = _recall_gate(run)
         recall = query.get("recall_at_k")
         if (

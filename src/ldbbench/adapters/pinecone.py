@@ -11,6 +11,7 @@ from typing import Any
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    DeleteResult,
     PrepareResult,
     QueryMatch,
     QueryResult,
@@ -37,6 +38,7 @@ PINECONE_CAPABILITIES = AdapterCapabilities(
     supports_read_after_write_strong=False,
     supports_query_filter=True,
     supports_query_partition_filter=False,
+    supports_delete_by_id=True,
     vendor_consistency_options={"data_freshness_model": "eventual"},
 )
 
@@ -201,6 +203,20 @@ class PineconeAdapter:
             kwargs["filter"] = pinecone_filter(filter_query)
         response = self._index(settings).query(**kwargs)
         return QueryResult(matches=_query_matches(response), raw_response=response)
+
+    def delete_batch(
+        self,
+        target: TargetConfig,
+        ids: Sequence[str],
+    ) -> DeleteResult:
+        settings = _settings_from_target(target)
+        if not ids:
+            return DeleteResult(count=0)
+        response = self._index(settings).delete(
+            ids=list(ids),
+            namespace=settings.namespace,
+        )
+        return DeleteResult(count=len(ids), raw_response=response)
 
     def full_text_query(
         self,

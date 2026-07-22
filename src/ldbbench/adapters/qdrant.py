@@ -12,6 +12,7 @@ from typing import Any
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    DeleteResult,
     PrepareResult,
     QueryMatch,
     QueryResult,
@@ -27,6 +28,7 @@ QDRANT_CAPABILITIES = AdapterCapabilities(
     supports_read_after_write_strong=False,
     supports_query_filter=True,
     supports_query_partition_filter=False,
+    supports_delete_by_id=True,
     vendor_consistency_options={
         "read_consistency": ["all", "majority", "quorum"],
         "write_ordering": ["weak", "medium", "strong"],
@@ -195,6 +197,21 @@ class QdrantAdapter:
             with_vectors=include_vectors,
         )
         return QueryResult(matches=_query_matches(response), raw_response=response)
+
+    def delete_batch(
+        self,
+        target: TargetConfig,
+        ids: Sequence[str],
+    ) -> DeleteResult:
+        settings = _settings_from_target(target)
+        if not ids:
+            return DeleteResult(count=0)
+        response = self._client(settings).delete(
+            collection_name=settings.collection_name,
+            points_selector=[_qdrant_point_id(item) for item in ids],
+            wait=True,
+        )
+        return DeleteResult(count=len(ids), raw_response=response)
 
     def full_text_query(
         self,

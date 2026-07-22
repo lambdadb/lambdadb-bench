@@ -8,6 +8,7 @@ from typing import Any
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    DeleteResult,
     PrepareResult,
     QueryResult,
     UpsertResult,
@@ -64,6 +65,13 @@ class StaticAdapter:
     ) -> QueryResult:
         raise NotImplementedError("dry-run adapters do not query real targets")
 
+    def delete_batch(
+        self,
+        target: TargetConfig,
+        ids: list[str],
+    ) -> DeleteResult:
+        raise NotImplementedError("dry-run adapters do not delete real documents")
+
     def full_text_query(
         self,
         target: TargetConfig,
@@ -98,6 +106,7 @@ LAMBDADB_DRYRUN = StaticAdapter(
         supports_query_partition_filter=True,
         supports_nested_object_index=True,
         supports_full_text_search=True,
+        supports_delete_by_id=True,
         vendor_consistency_options={"consistent_read": True},
     ),
 )
@@ -110,6 +119,7 @@ QDRANT_DRYRUN = StaticAdapter(
         supports_read_after_write_strong=False,
         supports_query_filter=True,
         supports_query_partition_filter=False,
+        supports_delete_by_id=True,
         vendor_consistency_options={
             "read_consistency": ["all", "majority", "quorum"],
             "write_ordering": ["weak", "medium", "strong"],
@@ -126,6 +136,7 @@ PINECONE_DRYRUN = StaticAdapter(
         supports_read_after_write_strong=False,
         supports_query_filter=True,
         supports_query_partition_filter=False,
+        supports_delete_by_id=True,
         vendor_consistency_options={"data_freshness_model": "eventual"},
     ),
 )

@@ -44,6 +44,7 @@ class FakeClient:
         self.upsert_calls: list[dict[str, Any]] = []
         self.query_points_calls: list[dict[str, Any]] = []
         self.retrieve_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[dict[str, Any]] = []
 
     def collection_exists(self, **kwargs: Any) -> bool:
         self.collection_exists_calls.append(kwargs)
@@ -100,6 +101,10 @@ class FakeClient:
             for item in kwargs["ids"]
         ]
 
+    def delete(self, **kwargs: Any) -> dict[str, Any]:
+        self.delete_calls.append(kwargs)
+        return {"status": "completed"}
+
 
 def make_target(**overrides: Any) -> TargetConfig:
     data = {
@@ -133,6 +138,22 @@ def test_check_validates_qdrant_metadata_without_requiring_api_key() -> None:
     assert result.details["collection_name"] == "smoke"
     assert result.details["prefer_grpc"] is True
     assert result.details["api_key_present"] is False
+
+
+def test_delete_batch_maps_source_ids_to_qdrant_point_ids() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+
+    result = adapter.delete_batch(make_target(), ["a", "b"])
+
+    assert result.count == 2
+    assert client.delete_calls == [
+        {
+            "collection_name": "smoke",
+            "points_selector": [_qdrant_point_id("a"), _qdrant_point_id("b")],
+            "wait": True,
+        }
+    ]
 
 
 def test_check_requires_endpoint_and_collection() -> None:

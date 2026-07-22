@@ -20,6 +20,11 @@ import msgpack
 
 from ldbbench.adapters.base import VectorDBAdapter, VectorRecord
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
+from ldbbench.datasets.deletion import (
+    LoadedDeletionPlan,
+    deletion_checkpoint_count,
+    load_deletion_plan,
+)
 from ldbbench.datasets.ground_truth import (
     artifact_path,
     ground_truth_filename,
@@ -35,6 +40,14 @@ from ldbbench.datasets.prepare import (
 )
 from ldbbench.manifest import initialize_run_artifacts, sha256_file
 from ldbbench.progress import ProgressCallback, ProgressTicker
+from ldbbench.runner.deletion import (
+    load_deletion_state,
+    run_delete_stage,
+    validate_deletion_state_scenario,
+    validate_ground_truth_deletion_state,
+    wait_until_deleted,
+    write_deletion_state,
+)
 from ldbbench.runner.plan import build_run_plan
 
 try:
@@ -44,9 +57,11 @@ except ImportError:  # pragma: no cover - kept for source-tree reuse without dep
 
 INGEST_EVENTS_FILENAME = "ingest_events.jsonl"
 QUERY_EVENTS_FILENAME = "query_events.jsonl"
+DELETE_EVENTS_FILENAME = "delete_events.jsonl"
 SEARCH_UNDER_INGEST_EVENTS_FILENAME = "search_under_ingest_events.jsonl"
 SUMMARY_FILENAME = "summary.json"
 LOAD_CHECKPOINT_FILENAME = "load_checkpoint.json"
+DELETION_STATE_FILENAME = "deletion_state.json"
 LARGE_RUN_ROW_THRESHOLD = 1_000_000
 LOAD_CHECKPOINT_SCHEMA_VERSION = 1
 QUERY_EVENT_FLUSH_INTERVAL = 1000
@@ -57,9 +72,11 @@ TEXT_QUERY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 class BenchmarkRunResult:
     output_dir: Path
     ingest_events_path: Path
+    delete_events_path: Path
     query_events_path: Path
     search_under_ingest_events_path: Path
     load_checkpoint_path: Path
+    deletion_state_path: Path
     summary_path: Path
     summary: dict[str, Any]
 
@@ -166,6 +183,10 @@ def execute_benchmark(
     max_queries: int | None = None,
     load_only: bool = False,
     query_only: bool = False,
+    delete_only: bool = False,
+    deletion_plan_path: str | Path | None = None,
+    delete_checkpoint_pct: int | None = None,
+    deletion_state_path: str | Path | None = None,
     resume_load: bool = False,
     allow_destructive: bool = False,
     allow_large_run: bool = False,
@@ -173,14 +194,47 @@ def execute_benchmark(
 ) -> BenchmarkRunResult:
     """Execute a small or explicitly opted-in benchmark run sequentially."""
 
-    if load_only and query_only:
-        raise ConfigError("--load-only and --query-only cannot be used together")
-    if query_only and target.prepare_mode != "existing":
-        raise ConfigError("--query-only requires target prepare.mode: existing")
-    if resume_load and query_only:
-        raise ConfigError("--resume-load cannot be used with --query-only")
+    phase_count = sum((load_only, query_only, delete_only))
+    if phase_count > 1:
+        raise ConfigError(
+            "--load-only, --query-only, and --delete-only are mutually exclusive"
+        )
+    if (query_only or delete_only) and target.prepare_mode != "existing":
+        phase = "--query-only" if query_only else "--delete-only"
+        raise ConfigError(f"{phase} requires target prepare.mode: existing")
+    if resume_load and (query_only or delete_only):
+        raise ConfigError(
+            "--resume-load cannot be used with --query-only or --delete-only"
+        )
     if resume_load and target.prepare_mode != "existing":
         raise ConfigError("--resume-load requires target prepare.mode: existing")
+    if delete_only:
+        if deletion_plan_path is None:
+            raise ConfigError("--delete-only requires --deletion-plan")
+        if delete_checkpoint_pct is None:
+            raise ConfigError("--delete-only requires --delete-checkpoint-pct")
+        if not scenario.delete:
+            raise ConfigError("--delete-only requires scenario.delete configuration")
+        if max_records is not None:
+            raise ConfigError("--delete-only does not support --max-records")
+    elif deletion_plan_path is not None or delete_checkpoint_pct is not None:
+        raise ConfigError(
+            "--deletion-plan and --delete-checkpoint-pct require --delete-only"
+        )
+    if deletion_state_path is not None and not (query_only or delete_only):
+        raise ConfigError("--deletion-state requires --query-only or --delete-only")
+    if query_only and scenario.delete and deletion_state_path is None:
+        raise ConfigError(
+            "--query-only with scenario.delete requires --deletion-state"
+        )
+    if query_only and deletion_state_path is not None and not scenario.delete:
+        raise ConfigError(
+            "--query-only with --deletion-state requires scenario.delete configuration"
+        )
+    if query_only and deletion_state_path is not None and ground_truth_path is None:
+        raise ConfigError(
+            "--query-only with --deletion-state requires explicit --ground-truth"
+        )
 
     _validate_limits(max_records=max_records, max_queries=max_queries)
     if _is_large_run(scenario, max_records=max_records) and not allow_large_run:
@@ -193,6 +247,7 @@ def execute_benchmark(
         target=target,
         capabilities=adapter.capabilities,
         allow_destructive=allow_destructive,
+        delete_only=delete_only,
     )
     if not plan.can_run:
         raise ConfigError("run plan is unsupported: " + "; ".join(plan.unsupported))
@@ -237,6 +292,12 @@ def execute_benchmark(
         fallback_key="queries",
         fallback_filename=QUERIES_FILENAME,
     )
+    json_queries_path = artifact_path(
+        dataset_path,
+        dataset_manifest,
+        "queries",
+        QUERIES_FILENAME,
+    )
     dataset_metric = _dataset_metric(scenario, dataset_manifest)
     query_filter_spec = _query_filter_spec(scenario)
     truth_path = _ground_truth_path(
@@ -246,8 +307,21 @@ def execute_benchmark(
     )
     if ground_truth_path is not None and not truth_path.exists():
         raise ConfigError(f"ground truth file {truth_path} does not exist")
-    uses_ground_truth = not load_only and (
-        scenario.workload != "full_text_search" or ground_truth_path is not None
+    deletion_state = (
+        load_deletion_state(
+            deletion_state_path,
+            target=target,
+            records_path=json_records_path,
+        )
+        if query_only and deletion_state_path is not None
+        else None
+    )
+    if deletion_state is not None:
+        validate_deletion_state_scenario(scenario, deletion_state)
+    uses_ground_truth = (
+        not load_only
+        and not delete_only
+        and (scenario.workload != "full_text_search" or ground_truth_path is not None)
     )
     if uses_ground_truth and truth_path.exists():
         validate_ground_truth_manifest(
@@ -256,11 +330,16 @@ def execute_benchmark(
             top_k=_top_k(scenario),
             query_filter_spec=query_filter_spec,
         )
+        validate_ground_truth_deletion_state(
+            truth_path,
+            deletion_state,
+            queries_path=json_queries_path,
+        )
         ground_truth = load_ground_truth(truth_path)
     else:
         ground_truth = {}
     record_shards = None
-    if not query_only:
+    if not query_only and not delete_only:
         record_shards = _record_shards_for_load(
             scenario=scenario,
             dataset_dir=dataset_path,
@@ -271,9 +350,11 @@ def execute_benchmark(
         )
 
     ingest_events_path = out / INGEST_EVENTS_FILENAME
+    delete_events_path = out / DELETE_EVENTS_FILENAME
     query_events_path = out / QUERY_EVENTS_FILENAME
     search_under_ingest_events_path = out / SEARCH_UNDER_INGEST_EVENTS_FILENAME
     load_checkpoint_path = out / LOAD_CHECKPOINT_FILENAME
+    deletion_state_output_path = out / DELETION_STATE_FILENAME
     summary_path = out / SUMMARY_FILENAME
     workload = scenario.workload
 
@@ -287,6 +368,118 @@ def execute_benchmark(
         metric=dataset_metric,
     )
     ticker.emit("run: target prepared")
+
+    if delete_only:
+        assert deletion_plan_path is not None
+        assert delete_checkpoint_pct is not None
+        plan_artifact = load_deletion_plan(
+            deletion_plan_path,
+            records_path=json_records_path,
+        )
+        _validate_scenario_deletion_plan(
+            scenario,
+            plan=plan_artifact,
+            checkpoint_pct=delete_checkpoint_pct,
+        )
+        previous_state = (
+            load_deletion_state(
+                deletion_state_path,
+                target=target,
+                records_path=json_records_path,
+                plan=plan_artifact,
+            )
+            if deletion_state_path is not None
+            else None
+        )
+        previous_deleted_count = _previous_deleted_count(previous_state)
+        target_deleted_count = deletion_checkpoint_count(
+            plan_artifact.total_records,
+            delete_checkpoint_pct,
+        )
+        if previous_deleted_count > target_deleted_count:
+            raise ConfigError(
+                "deletion state is ahead of the requested checkpoint: "
+                f"deleted={previous_deleted_count}, target={target_deleted_count}"
+            )
+        ids_to_delete = plan_artifact.ids[previous_deleted_count:target_deleted_count]
+        ingest_events_path.write_text("", encoding="utf-8")
+        query_events_path.write_text("", encoding="utf-8")
+        search_under_ingest_events_path.write_text("", encoding="utf-8")
+        delete_stage_summary = run_delete_stage(
+            adapter=adapter,
+            target=target,
+            ids=ids_to_delete,
+            batch_size=int(scenario.delete.get("batch_size", 500)),
+            events_path=delete_events_path,
+            progress=progress,
+        )
+        if delete_stage_summary["status"] == "completed":
+            delete_stage_summary["visibility"] = wait_until_deleted(
+                adapter=adapter,
+                target=target,
+                ids=plan_artifact.ids,
+                prefix_count=target_deleted_count,
+                consistency="eventual",
+                timeout_seconds=_delete_visibility_timeout_seconds(scenario),
+                poll_interval_seconds=_delete_visibility_poll_interval_seconds(
+                    scenario
+                ),
+                sample_size=_delete_visibility_sample_size(scenario),
+                progress=progress,
+            )
+        else:
+            delete_stage_summary["visibility"] = {
+                "status": "skipped",
+                "skip_reason": "delete_failed",
+                "samples": 0,
+                "visible": 0,
+                "attempts": 0,
+                "duration_seconds": 0.0,
+                "last_error": None,
+            }
+        state = write_deletion_state(
+            output_path=deletion_state_output_path,
+            target=target,
+            plan=plan_artifact,
+            checkpoint_pct=delete_checkpoint_pct,
+            previous_deleted_count=previous_deleted_count,
+            delete_summary=delete_stage_summary,
+        )
+        deletion_summary = {
+            **delete_stage_summary,
+            **state["deletion"],
+            "status": state["status"],
+            "request_status": delete_stage_summary["status"],
+            "previous_deleted_count": previous_deleted_count,
+            "newly_deleted_count": delete_stage_summary["documents"],
+            "state_status": state["status"],
+        }
+        summary = {
+            "status": "completed" if state["status"] == "completed" else "failed",
+            "run_manifest": str(paths.run_manifest),
+            "dataset_dir": str(dataset_path),
+            "ground_truth": None,
+            "load": skipped_load_summary(reason="delete_only"),
+            "query": skipped_query_summary(reason="delete_only"),
+            "workload": workload,
+            "deletion": deletion_summary,
+        }
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        ticker.emit(f"run: wrote summary status={summary['status']}")
+        return BenchmarkRunResult(
+            output_dir=out,
+            ingest_events_path=ingest_events_path,
+            delete_events_path=delete_events_path,
+            query_events_path=query_events_path,
+            search_under_ingest_events_path=search_under_ingest_events_path,
+            load_checkpoint_path=load_checkpoint_path,
+            deletion_state_path=deletion_state_output_path,
+            summary_path=summary_path,
+            summary=summary,
+        )
 
     if (
         workload == "search_under_ingest"
@@ -367,9 +560,11 @@ def execute_benchmark(
         return BenchmarkRunResult(
             output_dir=out,
             ingest_events_path=ingest_events_path,
+            delete_events_path=delete_events_path,
             query_events_path=query_events_path,
             search_under_ingest_events_path=search_under_ingest_events_path,
             load_checkpoint_path=load_checkpoint_path,
+            deletion_state_path=deletion_state_output_path,
             summary_path=summary_path,
             summary=summary,
         )
@@ -515,6 +710,11 @@ def execute_benchmark(
     }
     if search_under_ingest_summary is not None:
         summary["search_under_ingest"] = search_under_ingest_summary
+    if deletion_state is not None:
+        summary["deletion"] = {
+            "status": "validated",
+            **deletion_state["deletion"],
+        }
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -524,9 +724,11 @@ def execute_benchmark(
     return BenchmarkRunResult(
         output_dir=out,
         ingest_events_path=ingest_events_path,
+        delete_events_path=delete_events_path,
         query_events_path=query_events_path,
         search_under_ingest_events_path=search_under_ingest_events_path,
         load_checkpoint_path=load_checkpoint_path,
+        deletion_state_path=deletion_state_output_path,
         summary_path=summary_path,
         summary=summary,
     )
@@ -3863,6 +4065,40 @@ def _query_skip_reason(
     return None
 
 
+def _validate_scenario_deletion_plan(
+    scenario: ScenarioConfig,
+    *,
+    plan: LoadedDeletionPlan,
+    checkpoint_pct: int,
+) -> None:
+    configured_order = scenario.delete.get("order")
+    configured_seed = int(scenario.delete.get("seed", 0))
+    if plan.order != configured_order or plan.seed != configured_seed:
+        raise ConfigError(
+            "selected deletion plan does not match scenario.delete: "
+            f"plan=({plan.order}, {plan.seed}), "
+            f"scenario=({configured_order}, {configured_seed})"
+        )
+    checkpoints = scenario.delete.get("checkpoints_pct", [])
+    if checkpoint_pct not in checkpoints:
+        raise ConfigError(
+            f"delete checkpoint {checkpoint_pct} is not configured in "
+            "scenario.delete.checkpoints_pct"
+        )
+
+
+def _previous_deleted_count(state: Mapping[str, Any] | None) -> int:
+    if state is None:
+        return 0
+    deletion = state.get("deletion")
+    if not isinstance(deletion, Mapping):
+        raise ConfigError("deletion state is missing deletion metadata")
+    value = deletion.get("deleted_count")
+    if not isinstance(value, int) or value < 0:
+        raise ConfigError("deletion state deleted_count must be non-negative")
+    return value
+
+
 def _query_stage_summary(
     *,
     stage_index: int,
@@ -4644,6 +4880,31 @@ def _visibility_poll_interval_seconds(scenario: ScenarioConfig) -> float:
             "scenario.load.query_visibility_poll_interval must be a string"
         )
     return parse_duration_seconds(value)
+
+
+def _delete_visibility_timeout_seconds(scenario: ScenarioConfig) -> float:
+    value = scenario.delete.get("visibility_timeout", "5m")
+    if not isinstance(value, str):
+        raise ConfigError("scenario.delete.visibility_timeout must be a string")
+    return parse_duration_seconds(value)
+
+
+def _delete_visibility_poll_interval_seconds(scenario: ScenarioConfig) -> float:
+    value = scenario.delete.get("visibility_poll_interval", "1s")
+    if not isinstance(value, str):
+        raise ConfigError(
+            "scenario.delete.visibility_poll_interval must be a string"
+        )
+    return parse_duration_seconds(value)
+
+
+def _delete_visibility_sample_size(scenario: ScenarioConfig) -> int:
+    value = scenario.delete.get("visibility_sample_size", 10)
+    if not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            "scenario.delete.visibility_sample_size must be a positive integer"
+        )
+    return value
 
 
 def _top_k(scenario: ScenarioConfig) -> int:

@@ -12,6 +12,7 @@ from typing import Any
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    DeleteResult,
     PrepareResult,
     QueryMatch,
     QueryResult,
@@ -53,6 +54,7 @@ LAMBDADB_CAPABILITIES = AdapterCapabilities(
     supports_query_partition_filter=True,
     supports_nested_object_index=True,
     supports_full_text_search=True,
+    supports_delete_by_id=True,
     vendor_consistency_options={
         "consistent_read": True,
         "partition_filter": True,
@@ -234,6 +236,18 @@ class LambdaDBAdapter:
             matches=_query_matches(response),
             raw_response=response,
         )
+
+    def delete_batch(
+        self,
+        target: TargetConfig,
+        ids: Sequence[str],
+    ) -> DeleteResult:
+        settings = _settings_from_target(target)
+        if not ids:
+            return DeleteResult(count=0)
+        collection = self._client(settings).collection(settings.collection_name)
+        response = collection.docs.delete(ids=list(ids))
+        return DeleteResult(count=len(ids), raw_response=response)
 
     def full_text_query(
         self,
