@@ -19,9 +19,10 @@ from ldbbench.adapters.base import (
     VectorRecord,
 )
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
-from ldbbench.datasets.deletion import prepare_deletion_plan
+from ldbbench.datasets.deletion import load_deletion_plan, prepare_deletion_plan
 from ldbbench.datasets.ground_truth import prepare_ground_truth
 from ldbbench.datasets.prepare import optimize_dataset, prepare_dataset
+from ldbbench.runner.deletion import load_deletion_state
 from ldbbench.runner.execute import (
     _batches,
     _dataset_metric,
@@ -1502,6 +1503,53 @@ def test_execute_benchmark_delete_only_writes_checkpoint_state(tmp_path) -> None
     assert state["deletion"]["visibility"]["status"] == "not_visible"
     assert result.summary["load"]["skip_reason"] == "delete_only"
     assert result.summary["query"]["skip_reason"] == "delete_only"
+
+
+def test_delete_only_can_skip_visibility_wait(tmp_path) -> None:
+    scenario = make_scenario(delete_order="sequential")
+    scenario.delete["wait_until_deletion_visible"] = False
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    plan_result = prepare_deletion_plan(
+        dataset_dir=dataset.output_dir,
+        order="sequential",
+    )
+    adapter = FakeAdapter(stale_deleted_fetch=True)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "delete-50",
+        dataset_dir=dataset.output_dir,
+        delete_only=True,
+        deletion_plan_path=plan_result.plan_path,
+        delete_checkpoint_pct=50,
+        allow_destructive=True,
+    )
+
+    state = load_deletion_state(
+        result.deletion_state_path,
+        target=target,
+        records_path=dataset.records_path,
+        plan=load_deletion_plan(
+            plan_result.plan_path,
+            records_path=dataset.records_path,
+        ),
+    )
+    assert state["status"] == "completed"
+    assert state["deletion"]["visibility"] == {
+        "attempts": 0,
+        "duration_seconds": 0.0,
+        "last_error": None,
+        "samples": 0,
+        "skip_reason": "disabled_by_scenario",
+        "status": "skipped",
+        "visible": None,
+    }
 
 
 def test_delete_only_resumes_to_later_checkpoint_and_query_validates_state(

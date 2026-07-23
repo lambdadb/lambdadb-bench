@@ -21,6 +21,7 @@ from ldbbench.manifest import sha256_file, sha256_mapping
 from ldbbench.progress import ProgressCallback, ProgressTicker
 
 DELETION_STATE_SCHEMA_VERSION = 2
+DISABLED_VISIBILITY_SKIP_REASON = "disabled_by_scenario"
 
 
 def run_delete_stage(
@@ -218,7 +219,7 @@ def write_deletion_state(
         "completed"
         if delete_summary.get("status") == "completed"
         and deleted_count == expected_deleted_count
-        and visibility_status in {"not_visible", "not_applicable"}
+        and _is_completed_visibility(visibility, visibility_status)
         else "failed"
     )
     state: dict[str, Any] = {
@@ -468,10 +469,10 @@ def _validate_state_counts(
         raise ConfigError(f"{state_path} deleted_count must be non-negative")
     if not isinstance(remaining_count, int) or remaining_count < 0:
         raise ConfigError(f"{state_path} remaining_count must be non-negative")
-    if not isinstance(visibility, Mapping) or visibility.get("status") not in {
-        "not_visible",
-        "not_applicable",
-    }:
+    visibility_status = (
+        visibility.get("status") if isinstance(visibility, Mapping) else None
+    )
+    if not _is_completed_visibility(visibility, visibility_status):
         raise ConfigError(
             f"{state_path} does not contain completed delete visibility metadata"
         )
@@ -501,6 +502,16 @@ def _latency_summary(values: list[float]) -> dict[str, float | None]:
         "p99": _percentile(ordered, 99),
         "max": ordered[-1],
     }
+
+
+def _is_completed_visibility(visibility: Any, status: Any) -> bool:
+    if status in {"not_visible", "not_applicable"}:
+        return True
+    return (
+        status == "skipped"
+        and isinstance(visibility, Mapping)
+        and visibility.get("skip_reason") == DISABLED_VISIBILITY_SKIP_REASON
+    )
 
 
 def _sample_ids(

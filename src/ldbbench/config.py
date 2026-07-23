@@ -529,6 +529,7 @@ def _validate_delete(config: Mapping[str, Any]) -> None:
         raise ConfigError("scenario.delete.seed must be a non-negative integer")
 
     _validate_optional_positive_int(config, "batch_size")
+    _validate_optional_bool(config, "wait_until_deletion_visible")
     _validate_optional_positive_int(config, "visibility_sample_size")
     visibility_timeout = config.get("visibility_timeout")
     if visibility_timeout is not None and not isinstance(visibility_timeout, str):

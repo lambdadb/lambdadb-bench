@@ -26,6 +26,7 @@ delete:
   seed: 0
   checkpoints_pct: [10, 25, 50, 75, 90]
   batch_size: 500
+  wait_until_deletion_visible: false
   visibility_timeout: 5m
   visibility_poll_interval: 1s
   visibility_sample_size: 10

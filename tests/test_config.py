@@ -207,6 +207,7 @@ delete:
   seed: 7
   checkpoints_pct: [10, 25, 50]
   batch_size: 100
+  wait_until_deletion_visible: false
   visibility_timeout: 5m
   visibility_poll_interval: 1s
   visibility_sample_size: 10
@@ -218,6 +219,7 @@ delete:
 
     assert scenario.delete["order"] == "random"
     assert scenario.delete["checkpoints_pct"] == [10, 25, 50]
+    assert scenario.delete["wait_until_deletion_visible"] is False
     assert scenario.delete["visibility_timeout"] == "5m"
 
 
@@ -234,6 +236,11 @@ delete:
         (
             "order: sequential\n  checkpoints_pct: [10]\n  visibility_timeout: 5",
             "visibility_timeout",
+        ),
+        (
+            "order: sequential\n  checkpoints_pct: [10]\n"
+            "  wait_until_deletion_visible: 'no'",
+            "wait_until_deletion_visible",
         ),
     ],
 )

@@ -296,8 +296,10 @@ Real runs write:
   `--delete-only` runs.
 - `deletion_state.json`: written by `--delete-only` with the cumulative delete
   checkpoint, target identity fingerprint, dataset/deletion-plan checksums,
-  and sampled delete-visibility result. Only a state whose sampled IDs are no
-  longer fetch-visible is marked `completed`.
+  and sampled delete-visibility result. By default, only a state whose sampled
+  IDs are no longer fetch-visible is marked `completed`; when
+  `delete.wait_until_deletion_visible` is false, successful delete requests
+  produce a completed state with visibility marked `skipped`.
 - `query_events.jsonl`: one event per query attempt, including query errors.
 - `search_under_ingest_events.jsonl`: one event per upload-and-ask probe when
   `search_under_ingest.pattern: upload_and_ask` is used. Parallel
@@ -320,8 +322,12 @@ Use `scenarios/cohere-wikipedia-1m-delete-sequential.yaml` to delete in prepared
 record order, or `scenarios/cohere-wikipedia-1m-delete-random.yaml` for a seeded
 random order. `delete.checkpoints_pct` lists the allowed cumulative checkpoints;
 each `--delete-only` invocation advances to exactly one checkpoint. The delete
-block also controls post-delete verification through `visibility_timeout`,
-`visibility_poll_interval`, and `visibility_sample_size`.
+block also controls post-delete verification through
+`wait_until_deletion_visible`, `visibility_timeout`,
+`visibility_poll_interval`, and `visibility_sample_size`. Visibility waiting is
+enabled by default. When disabled, the delete-only run finishes after all delete
+requests succeed and records `visibility.status: skipped`; a subsequent query
+may still observe stale deleted documents in an eventually consistent target.
 
 First create the checksummed deletion plan:
 

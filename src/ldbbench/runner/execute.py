@@ -41,6 +41,7 @@ from ldbbench.datasets.prepare import (
 from ldbbench.manifest import initialize_run_artifacts, sha256_file
 from ldbbench.progress import ProgressCallback, ProgressTicker
 from ldbbench.runner.deletion import (
+    DISABLED_VISIBILITY_SKIP_REASON,
     load_deletion_state,
     run_delete_stage,
     validate_deletion_state_scenario,
@@ -414,19 +415,31 @@ def execute_benchmark(
             progress=progress,
         )
         if delete_stage_summary["status"] == "completed":
-            delete_stage_summary["visibility"] = wait_until_deleted(
-                adapter=adapter,
-                target=target,
-                ids=plan_artifact.ids,
-                prefix_count=target_deleted_count,
-                consistency="eventual",
-                timeout_seconds=_delete_visibility_timeout_seconds(scenario),
-                poll_interval_seconds=_delete_visibility_poll_interval_seconds(
-                    scenario
-                ),
-                sample_size=_delete_visibility_sample_size(scenario),
-                progress=progress,
-            )
+            if _wait_until_deletion_visible(scenario):
+                delete_stage_summary["visibility"] = wait_until_deleted(
+                    adapter=adapter,
+                    target=target,
+                    ids=plan_artifact.ids,
+                    prefix_count=target_deleted_count,
+                    consistency="eventual",
+                    timeout_seconds=_delete_visibility_timeout_seconds(scenario),
+                    poll_interval_seconds=_delete_visibility_poll_interval_seconds(
+                        scenario
+                    ),
+                    sample_size=_delete_visibility_sample_size(scenario),
+                    progress=progress,
+                )
+            else:
+                ticker.emit("delete_visibility: skipped reason=disabled_by_scenario")
+                delete_stage_summary["visibility"] = {
+                    "status": "skipped",
+                    "skip_reason": DISABLED_VISIBILITY_SKIP_REASON,
+                    "samples": 0,
+                    "visible": None,
+                    "attempts": 0,
+                    "duration_seconds": 0.0,
+                    "last_error": None,
+                }
         else:
             delete_stage_summary["visibility"] = {
                 "status": "skipped",
@@ -4887,6 +4900,15 @@ def _delete_visibility_timeout_seconds(scenario: ScenarioConfig) -> float:
     if not isinstance(value, str):
         raise ConfigError("scenario.delete.visibility_timeout must be a string")
     return parse_duration_seconds(value)
+
+
+def _wait_until_deletion_visible(scenario: ScenarioConfig) -> bool:
+    value = scenario.delete.get("wait_until_deletion_visible", True)
+    if not isinstance(value, bool):
+        raise ConfigError(
+            "scenario.delete.wait_until_deletion_visible must be a boolean"
+        )
+    return value
 
 
 def _delete_visibility_poll_interval_seconds(scenario: ScenarioConfig) -> float:
