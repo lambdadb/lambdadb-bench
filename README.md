@@ -407,6 +407,12 @@ delete checkpoints or switch the credentials behind the configured API-key
 environment variable: a local fingerprint cannot distinguish those remote
 identity changes when the target config itself is unchanged.
 
+Delete-only, checkpoint-resume, and query-only validation compare the
+`records_sha256` recorded in their manifests instead of re-reading the complete
+`records.jsonl` on every run. The deletion plan itself is still checksummed and
+fully parsed. Regenerate the dataset artifacts and deletion plan together after
+manually changing `records.jsonl`.
+
 Delete completion verifies a deterministic sample from the full cumulative
 deleted prefix after all delete requests return. It is not an exhaustive scan
 of every deleted ID; any stale deleted hits that remain outside the sample still

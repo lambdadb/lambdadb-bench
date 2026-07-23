@@ -22,6 +22,7 @@ from ldbbench.adapters.base import VectorDBAdapter, VectorRecord
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
 from ldbbench.datasets.deletion import (
     LoadedDeletionPlan,
+    dataset_records_sha256,
     deletion_checkpoint_count,
     load_deletion_plan,
 )
@@ -285,6 +286,11 @@ def execute_benchmark(
         "records",
         RECORDS_FILENAME,
     )
+    json_records_sha256 = (
+        dataset_records_sha256(dataset_manifest)
+        if delete_only or deletion_state_path is not None
+        else None
+    )
     queries_path, _queries_sha256 = _preferred_artifact_path(
         dataset_path,
         dataset_manifest,
@@ -313,6 +319,7 @@ def execute_benchmark(
             deletion_state_path,
             target=target,
             records_path=json_records_path,
+            expected_records_sha256=json_records_sha256,
         )
         if query_only and deletion_state_path is not None
         else None
@@ -373,9 +380,14 @@ def execute_benchmark(
     if delete_only:
         assert deletion_plan_path is not None
         assert delete_checkpoint_pct is not None
+        ticker.emit("delete: validating deletion plan")
         plan_artifact = load_deletion_plan(
             deletion_plan_path,
             records_path=json_records_path,
+            expected_records_sha256=json_records_sha256,
+        )
+        ticker.emit(
+            f"delete: validated deletion plan records={plan_artifact.total_records}"
         )
         _validate_scenario_deletion_plan(
             scenario,
@@ -388,6 +400,7 @@ def execute_benchmark(
                 target=target,
                 records_path=json_records_path,
                 plan=plan_artifact,
+                expected_records_sha256=json_records_sha256,
             )
             if deletion_state_path is not None
             else None

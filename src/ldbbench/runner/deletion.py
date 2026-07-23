@@ -263,6 +263,7 @@ def load_deletion_state(
     target: TargetConfig,
     records_path: str | Path,
     plan: LoadedDeletionPlan | None = None,
+    expected_records_sha256: str | None = None,
 ) -> dict[str, Any]:
     state_path = Path(path)
     try:
@@ -305,7 +306,21 @@ def load_deletion_state(
         raise ConfigError(
             f"{state_path} records artifact does not match selected dataset"
         )
-    if sha256_file(selected_records) != declared_sha256:
+    reference_sha256 = (
+        plan.records_sha256 if plan is not None else expected_records_sha256
+    )
+    if (
+        plan is not None
+        and expected_records_sha256 is not None
+        and plan.records_sha256 != expected_records_sha256
+    ):
+        raise ConfigError(
+            f"{state_path} deletion plan records checksum does not match "
+            "dataset manifest"
+        )
+    if reference_sha256 is None:
+        reference_sha256 = sha256_file(selected_records)
+    if declared_sha256 != reference_sha256:
         raise ConfigError(f"{state_path} records checksum does not match dataset")
 
     _validate_state_counts(state_path, dataset, deletion)

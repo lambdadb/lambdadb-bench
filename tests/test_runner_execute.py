@@ -1569,6 +1569,7 @@ def test_delete_only_resumes_to_later_checkpoint_and_query_validates_state(
         deletion_plan_path=plan.plan_path,
         delete_checkpoint_pct=75,
     )
+    dataset.records_path.unlink()
     adapter = FakeAdapter()
     adapter.upserted.append(
         [

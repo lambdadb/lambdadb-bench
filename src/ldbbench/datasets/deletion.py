@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from collections.abc import Mapping
@@ -62,19 +63,28 @@ def prepare_deletion_plan(
     plan_path = directory / deletion_plan_filename(order=order, seed=seed)
     manifest_path = deletion_plan_manifest_path(plan_path)
     expected_records = _dataset_record_count(dataset_manifest)
+    expected_records_sha256 = dataset_records_sha256(dataset_manifest)
     ticker = ProgressTicker(progress)
 
     ids: list[str] = []
+    records_sha256 = expected_records_sha256
     if dry_run:
         ticker.emit(f"delete_plan: planning order={order} seed={seed}")
         status = "planned"
     else:
         ticker.emit(f"delete_plan: loading records order={order} seed={seed}")
-        ids = _read_record_ids(records_path, progress=progress)
+        ids, records_sha256 = _read_record_ids(records_path, progress=progress)
         if expected_records is not None and len(ids) != expected_records:
             raise ConfigError(
                 f"{records_path} has {len(ids)} records but dataset manifest "
                 f"declares {expected_records}"
+            )
+        if (
+            expected_records_sha256 is not None
+            and records_sha256 != expected_records_sha256
+        ):
+            raise ConfigError(
+                f"{records_path} checksum does not match dataset manifest"
             )
         if order == "random":
             random.Random(seed).shuffle(ids)
@@ -98,7 +108,7 @@ def prepare_deletion_plan(
         },
         "artifacts": {
             "records": str(records_path),
-            "records_sha256": _sha256_if_exists(records_path),
+            "records_sha256": records_sha256,
             "deletion_plan": str(plan_path),
             "deletion_plan_sha256": _sha256_if_exists(plan_path),
         },
@@ -118,6 +128,7 @@ def load_deletion_plan(
     plan_path: str | Path,
     *,
     records_path: str | Path | None = None,
+    expected_records_sha256: str | None = None,
 ) -> LoadedDeletionPlan:
     path = Path(plan_path)
     manifest_path = deletion_plan_manifest_path(path)
@@ -177,11 +188,20 @@ def load_deletion_plan(
             f"{manifest_path} records artifact {declared_records!r} does not "
             f"match selected records {str(selected_records)!r}"
         )
-    actual_records_sha256 = sha256_file(selected_records)
-    if actual_records_sha256 != declared_records_sha256:
-        raise ConfigError(
-            f"{selected_records} checksum does not match deletion plan manifest"
-        )
+    if expected_records_sha256 is None:
+        actual_records_sha256 = sha256_file(selected_records)
+        if actual_records_sha256 != declared_records_sha256:
+            raise ConfigError(
+                f"{selected_records} checksum does not match deletion plan manifest"
+            )
+    else:
+        if not expected_records_sha256:
+            raise ConfigError("expected records checksum must be non-empty")
+        if expected_records_sha256 != declared_records_sha256:
+            raise ConfigError(
+                f"{manifest_path} records checksum does not match dataset manifest"
+            )
+        actual_records_sha256 = expected_records_sha256
 
     ids = _read_plan_ids(path)
     declared_count = details.get("records")
@@ -236,6 +256,18 @@ def deletion_artifact_suffix(plan: LoadedDeletionPlan, checkpoint_pct: int) -> s
     return f"deleted.{identity}.pct-{checkpoint_pct:03d}"
 
 
+def dataset_records_sha256(dataset_manifest: Mapping[str, Any]) -> str | None:
+    artifacts = dataset_manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise ConfigError("dataset manifest artifacts must be a mapping")
+    value = artifacts.get("records_sha256")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ConfigError("dataset manifest records_sha256 must be a non-empty string")
+    return value
+
+
 def _validate_order_and_seed(order: str, seed: int) -> None:
     if order not in VALID_DELETE_ORDERS:
         raise ConfigError(
@@ -249,11 +281,13 @@ def _read_record_ids(
     records_path: Path,
     *,
     progress: ProgressCallback | None,
-) -> list[str]:
+) -> tuple[list[str], str]:
     ids: list[str] = []
+    digest = hashlib.sha256()
     ticker = ProgressTicker(progress)
-    with records_path.open("r", encoding="utf-8") as file:
+    with records_path.open("rb") as file:
         for line_number, line in enumerate(file, start=1):
+            digest.update(line)
             if not line.strip():
                 continue
             raw = json.loads(line)
@@ -266,7 +300,7 @@ def _read_record_ids(
             ticker.maybe(f"delete_plan: loading records={len(ids)}")
     if len(set(ids)) != len(ids):
         raise ConfigError(f"{records_path} contains duplicate document IDs")
-    return ids
+    return ids, digest.hexdigest()
 
 
 def _write_plan(path: Path, ids: list[str]) -> None:

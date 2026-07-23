@@ -5,7 +5,9 @@ import json
 import pytest
 
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
+from ldbbench.datasets import deletion as deletion_module
 from ldbbench.datasets.deletion import (
+    dataset_records_sha256,
     deletion_checkpoint_count,
     load_deletion_plan,
     prepare_deletion_plan,
@@ -60,8 +62,19 @@ def _dataset(tmp_path):
     )
 
 
-def test_prepare_sequential_deletion_plan_uses_record_order(tmp_path) -> None:
+def test_prepare_sequential_deletion_plan_uses_record_order(
+    tmp_path,
+    monkeypatch,
+) -> None:
     dataset = _dataset(tmp_path)
+    original_sha256_file = deletion_module.sha256_file
+    hashed_paths = []
+
+    def tracked_sha256_file(path):
+        hashed_paths.append(path)
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(deletion_module, "sha256_file", tracked_sha256_file)
 
     result = prepare_deletion_plan(
         dataset_dir=dataset.output_dir,
@@ -70,6 +83,7 @@ def test_prepare_sequential_deletion_plan_uses_record_order(tmp_path) -> None:
     loaded = load_deletion_plan(
         result.plan_path,
         records_path=dataset.records_path,
+        expected_records_sha256=dataset_records_sha256(dataset.manifest),
     )
 
     assert loaded.ids == ["a", "b", "c"]
@@ -77,6 +91,24 @@ def test_prepare_sequential_deletion_plan_uses_record_order(tmp_path) -> None:
     assert loaded.total_records == 3
     assert result.manifest["artifacts"]["records_sha256"]
     assert result.manifest["artifacts"]["deletion_plan_sha256"]
+    assert dataset.records_path not in hashed_paths
+
+
+def test_load_deletion_plan_rejects_dataset_manifest_checksum_mismatch(
+    tmp_path,
+) -> None:
+    dataset = _dataset(tmp_path)
+    result = prepare_deletion_plan(
+        dataset_dir=dataset.output_dir,
+        order="sequential",
+    )
+
+    with pytest.raises(ConfigError, match="does not match dataset manifest"):
+        load_deletion_plan(
+            result.plan_path,
+            records_path=dataset.records_path,
+            expected_records_sha256="stale-records-checksum",
+        )
 
 
 def test_random_deletion_plan_is_seeded_and_reproducible(tmp_path) -> None:

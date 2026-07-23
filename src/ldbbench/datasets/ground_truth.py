@@ -16,6 +16,7 @@ from ldbbench.__about__ import __version__
 from ldbbench.config import VALID_DATASET_METRICS, ConfigError
 from ldbbench.datasets.deletion import (
     LoadedDeletionPlan,
+    dataset_records_sha256,
     deletion_artifact_suffix,
     deletion_checkpoint_count,
     load_deletion_plan,
@@ -160,7 +161,11 @@ def prepare_ground_truth(
     records_path = artifact_path(out, dataset_manifest, "records", RECORDS_FILENAME)
     queries_path = artifact_path(out, dataset_manifest, "queries", QUERIES_FILENAME)
     deletion_plan = (
-        load_deletion_plan(deletion_plan_path, records_path=records_path)
+        load_deletion_plan(
+            deletion_plan_path,
+            records_path=records_path,
+            expected_records_sha256=dataset_records_sha256(dataset_manifest),
+        )
         if deletion_plan_path is not None
         else None
     )
