@@ -10,6 +10,10 @@ adapters.
 See [docs/DESIGN.md](docs/DESIGN.md) for the current design decisions, workload
 model, adapter contract, result format, and implementation phases.
 
+Future evaluation of Meta/Faiss DINO10B as a 1024-dimensional,
+billion-scale byte-vector workload is recorded in
+[docs/DINO10B_FUTURE_WORK.md](docs/DINO10B_FUTURE_WORK.md).
+
 ## Quickstart
 
 Install the package in editable mode with development dependencies:
