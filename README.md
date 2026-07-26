@@ -92,6 +92,29 @@ uv run --extra groundtruth ldbbench dataset ground-truth \
   --batch-size 100
 ```
 
+Prepared records include deterministic synthetic bucket metadata for approximate
+50%, 10%, 5%, 1%, and 0.1% equality filters. Generate the 5% filtered ground
+truth with:
+
+```bash
+uv run --extra groundtruth ldbbench dataset ground-truth \
+  --dataset-dir data/datasets/cohere-wikipedia-1m \
+  --top-k 10 \
+  --backend faiss \
+  --batch-size 100 \
+  --filter-name synthetic_bucket_5pct \
+  --filter-field filter_bucket_20 \
+  --filter-value-source eligible-record-buckets \
+  --filter-seed 20260511 \
+  --filter-min-candidates 10
+```
+
+The ground-truth and load paths deterministically backfill `filter_bucket_20`
+when reusing dataset artifacts prepared by an older version. A database
+collection loaded before this field was added still needs the
+`filter_bucket_20` metadata index and a full record upsert before running
+`scenarios/cohere-wikipedia-1m-filtered-5pct.yaml`.
+
 Ground-truth filenames include the metric so multiple variants can coexist,
 for example `ground_truth.cosine.jsonl`, `ground_truth.euclidean.jsonl`, and
 `ground_truth.euclidean.filtered.synthetic_bucket_1pct.jsonl`. Manifest files

@@ -1335,6 +1335,7 @@ def ensure_filter_bucket_metadata(
             for field in (
                 "filter_bucket_2",
                 "filter_bucket_10",
+                "filter_bucket_20",
                 "filter_bucket_100",
                 "filter_bucket_1000",
             )

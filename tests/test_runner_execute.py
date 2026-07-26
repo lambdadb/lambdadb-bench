@@ -532,6 +532,7 @@ def test_execute_benchmark_backfills_filter_buckets_for_legacy_load_cache(
     metadata = adapter.upserted[0][0].metadata
     assert metadata["filter_bucket_2"]
     assert metadata["filter_bucket_10"]
+    assert metadata["filter_bucket_20"]
     assert metadata["filter_bucket_100"]
     assert metadata["filter_bucket_1000"]
 

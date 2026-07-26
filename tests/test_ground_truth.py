@@ -290,8 +290,8 @@ def test_prepare_ground_truth_backfills_missing_filter_buckets(tmp_path) -> None
     result = prepare_ground_truth(
         dataset_dir=tmp_path,
         top_k=1,
-        filter_name="synthetic_bucket_50pct",
-        filter_field="filter_bucket_2",
+        filter_name="synthetic_bucket_5pct",
+        filter_field="filter_bucket_20",
         filter_value_source="eligible-record-buckets",
     )
 
@@ -299,7 +299,7 @@ def test_prepare_ground_truth_backfills_missing_filter_buckets(tmp_path) -> None
         result.ground_truth_path.read_text(encoding="utf-8").splitlines()[0]
     )
     assert truth["candidate_count"] >= 1
-    assert truth["filter"]["field"] == "filter_bucket_2"
+    assert truth["filter"]["field"] == "filter_bucket_20"
 
 
 def test_prepare_ground_truth_writes_faiss_matches(tmp_path, monkeypatch) -> None:
@@ -538,15 +538,21 @@ def test_prepare_ground_truth_writes_filtered_faiss_matches(
     fake_faiss.IndexFlatIP = FakeIndexFlatIP
     fake_faiss.normalize_L2 = normalize_l2
     monkeypatch.setitem(sys.modules, "faiss", fake_faiss)
-    prepare_fixture_dataset(tmp_path)
+    dataset = prepare_fixture_dataset(tmp_path)
+    stripped = []
+    for line in dataset.records_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        record["metadata"].pop("filter_bucket_20")
+        stripped.append(json.dumps(record, sort_keys=True))
+    dataset.records_path.write_text("\n".join(stripped) + "\n", encoding="utf-8")
 
     result = prepare_ground_truth(
         dataset_dir=tmp_path,
         top_k=1,
         backend="faiss",
         batch_size=2,
-        filter_name="synthetic_bucket_50pct",
-        filter_field="filter_bucket_2",
+        filter_name="synthetic_bucket_5pct",
+        filter_field="filter_bucket_20",
         filter_value_source="eligible-record-buckets",
     )
 
@@ -556,7 +562,7 @@ def test_prepare_ground_truth_writes_filtered_faiss_matches(
     assert result.manifest["ground_truth"]["backend"] == "faiss"
     assert result.manifest["ground_truth"]["filtered_index_values"] >= 1
     assert result.manifest["ground_truth"]["candidate_count"]["eligible_values"] >= 1
-    assert truth["filter"]["field"] == "filter_bucket_2"
+    assert truth["filter"]["field"] == "filter_bucket_20"
     assert truth["candidate_count"] >= 1
     assert [match["id"] for match in truth["matches"]]
 

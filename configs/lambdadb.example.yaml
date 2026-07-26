@@ -27,6 +27,8 @@ index_configs:
         type: keyword
       filter_bucket_10:
         type: keyword
+      filter_bucket_20:
+        type: keyword
       filter_bucket_100:
         type: keyword
       filter_bucket_1000:

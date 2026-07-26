@@ -17,6 +17,7 @@ METADATA_INDEX_CONFIG = {
         "objectIndexConfigs": {
             "filter_bucket_2": {"type": "keyword"},
             "filter_bucket_10": {"type": "keyword"},
+            "filter_bucket_20": {"type": "keyword"},
             "filter_bucket_100": {"type": "keyword"},
             "filter_bucket_1000": {"type": "keyword"},
         },
@@ -320,6 +321,7 @@ def test_prepare_create_preserves_metadata_object_text_index_config() -> None:
                         "url": {"type": "keyword"},
                         "filter_bucket_2": {"type": "keyword"},
                         "filter_bucket_10": {"type": "keyword"},
+                        "filter_bucket_20": {"type": "keyword"},
                         "filter_bucket_100": {"type": "keyword"},
                         "filter_bucket_1000": {"type": "keyword"},
                     },

@@ -25,7 +25,7 @@ RECORD_SHARD_FILENAME_TEMPLATE = "records-{index:05d}.msgpack"
 DATASET_MANIFEST_FILENAME = "dataset_manifest.json"
 SUPPORTED_PROVIDERS = {"huggingface"}
 DEFAULT_QUERY_COUNT = 1000
-FILTER_BUCKET_COUNTS = (2, 10, 100, 1000)
+FILTER_BUCKET_COUNTS = (2, 10, 20, 100, 1000)
 
 try:
     import orjson

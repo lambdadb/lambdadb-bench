@@ -111,6 +111,7 @@ def test_prepare_dataset_writes_normalized_records_and_queries(tmp_path) -> None
     assert result.manifest["dataset"]["written_source_rows"] == 3
     assert result.manifest["dataset"]["written_rows"] == 2
     assert result.manifest["dataset"]["written_query_rows"] == 1
+    assert result.manifest["dataset"]["filter_buckets"] == [2, 10, 20, 100, 1000]
     assert result.manifest["artifacts"]["raw_records_sha256"]
     assert result.manifest["artifacts"]["records_sha256"]
     assert result.manifest["artifacts"]["queries_sha256"]
@@ -143,6 +144,7 @@ def test_prepare_dataset_writes_normalized_records_and_queries(tmp_path) -> None
             {
                 "filter_bucket_2",
                 "filter_bucket_10",
+                "filter_bucket_20",
                 "filter_bucket_100",
                 "filter_bucket_1000",
             }
