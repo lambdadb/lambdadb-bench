@@ -242,7 +242,19 @@ Use the smoke dataset first. This contacts the configured database.
 Supplying `--max-queries` keeps the query step in bounded one-pass smoke mode.
 Without `--max-queries`, `run` uses `scenario.query.stages` and repeats the
 prepared query set for each configured concurrency/duration stage.
-If `scenario.load.wait_until_query_visible` is true, the runner waits for a
+After a successful load, the runner waits until the collection is ready and
+reports as many documents as were loaded before any query runs (LambdaDB:
+ACTIVE and `numDocs` equal to the loaded count). If that wait times out, the
+run is marked `failed` and queries are skipped with `doc_count_timeout`.
+Adapters that cannot report a document count record the wait as skipped.
+The wait only checks that the indexed count reaches the expected total, so it
+does not confirm that a load which overwrites existing documents without
+changing the count has been applied; comparing against a pre-load baseline is
+follow-up work.
+`ldbbench run` exits with status 1 whenever the run status is `failed`, for
+example after load errors or a wait timeout, so scripts can stop before a
+later `--query-only` run measures an unfinished index.
+If `scenario.load.wait_until_query_visible` is true, the runner then waits for a
 small sample of loaded records to be returned by vector query before starting
 the query stage.
 
@@ -313,6 +325,11 @@ uv run ldbbench run \
 
 Real runs write:
 
+- `run_manifest.json`: scenario and target fingerprints plus tool provenance:
+  `tool.git_commit`, `tool.git_dirty` (uncommitted tracked changes), and the
+  vendor SDK in `tool.sdk_package` and `tool.sdk_version`. The commit comes
+  from the checkout for editable installs and from the recorded commit for git
+  installs; it is `null` when neither is available.
 - `ingest_events.jsonl`: one event per upsert batch, including load errors.
 - `load_checkpoint.json`: resumable load watermark and matching load context.
 - `delete_events.jsonl`: one event per document-ID delete batch in
@@ -324,6 +341,8 @@ Real runs write:
   `delete.wait_until_deletion_visible` is false, successful delete requests
   produce a completed state with visibility marked `skipped`.
 - `query_events.jsonl`: one event per query attempt, including query errors.
+  Successful events include `server_took_ms` when the database reports its own
+  query time (LambdaDB `took`).
 - `search_under_ingest_events.jsonl`: one event per upload-and-ask probe when
   `search_under_ingest.pattern: upload_and_ask` is used. Parallel
   upsert/query runs write their operation events to `ingest_events.jsonl` and
@@ -331,7 +350,10 @@ Real runs write:
 - `summary.json`: load/query counts, latency percentiles, QPS, per-stage query
   summaries, load batching/upsert timing, error rates, recall when
   a ground-truth artifact is present, and search-under-ingest metrics when
-  applicable.
+  applicable. `load.doc_count` records the post-load document-count wait
+  (`status`, `expected`, `observed`, `attempts`, `duration_seconds`), and
+  `query.server_took_ms` summarizes server-reported query time with the same
+  percentiles as the client-side `query.latency_ms`.
 
 ### Delete-only and search-after-delete runs
 
@@ -708,6 +730,12 @@ Useful load settings:
   splits batches by both `batch_size` and this byte limit to avoid oversized
   requests. The first sharded load path does not support `max_batch_bytes`;
   remove this setting when `sharded_records: true`.
+- `wait_until_doc_count`: when true (the default), wait after the load until the
+  collection is ready and reports every loaded document, including records
+  loaded by an earlier run that `--resume-load` skipped.
+- `doc_count_timeout`: optional duration string, defaults to `1h`. The run fails
+  when the count does not match within this time.
+- `doc_count_poll_interval`: optional duration string, defaults to `5s`.
 - `wait_until_query_visible`: when true, wait for a loaded-record sample to be
   visible through vector query before the query stage starts.
 - `query_visibility_timeout`: optional duration string, defaults to `60s`.

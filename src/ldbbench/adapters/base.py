@@ -19,6 +19,7 @@ class AdapterCapabilities:
     supports_nested_object_index: bool = False
     supports_full_text_search: bool = False
     supports_delete_by_id: bool = False
+    supports_collection_stats: bool = False
     supported_prepare_modes: frozenset[str] = frozenset(
         {"existing", "create", "recreate"}
     )
@@ -34,6 +35,7 @@ class AdapterCapabilities:
             "supports_nested_object_index": self.supports_nested_object_index,
             "supports_full_text_search": self.supports_full_text_search,
             "supports_delete_by_id": self.supports_delete_by_id,
+            "supports_collection_stats": self.supports_collection_stats,
             "supported_prepare_modes": sorted(self.supported_prepare_modes),
             "vendor_consistency_options": self.vendor_consistency_options,
         }
@@ -84,10 +86,19 @@ class QueryMatch:
 class QueryResult:
     matches: list[QueryMatch]
     raw_response: object | None = None
+    server_took_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class CollectionStats:
+    ready: bool
+    num_docs: int | None
+    status: str | None = None
 
 
 class VectorDBAdapter(Protocol):
     vendor: str
+    sdk_package: str
     capabilities: AdapterCapabilities
 
     def check(self, target: TargetConfig) -> CheckResult:
@@ -153,3 +164,6 @@ class VectorDBAdapter(Protocol):
         include_vectors: bool = False,
     ) -> Sequence[Mapping[str, Any]]:
         """Fetch documents by ID from the target."""
+
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        """Report whether the target collection is ready and its searchable count."""

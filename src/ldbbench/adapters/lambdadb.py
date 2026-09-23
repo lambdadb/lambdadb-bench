@@ -12,6 +12,7 @@ from typing import Any
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    CollectionStats,
     DeleteResult,
     PrepareResult,
     QueryMatch,
@@ -22,6 +23,7 @@ from ldbbench.adapters.base import (
 from ldbbench.adapters.filters import lambdadb_filter
 from ldbbench.config import ConfigError, TargetConfig
 
+SDK_PACKAGE = "lambdadb"
 DEFAULT_VECTOR_FIELD = "vector"
 DEFAULT_METADATA_FIELD = "metadata"
 DEFAULT_DELETE_WAIT_TIMEOUT_SECONDS = 60.0
@@ -56,6 +58,7 @@ LAMBDADB_CAPABILITIES = AdapterCapabilities(
     supports_nested_object_index=True,
     supports_full_text_search=True,
     supports_delete_by_id=True,
+    supports_collection_stats=True,
     vendor_consistency_options={
         "consistent_read": True,
         "partition_filter": True,
@@ -81,6 +84,7 @@ class LambdaDBTargetSettings:
 
 class LambdaDBAdapter:
     vendor = "lambdadb"
+    sdk_package = SDK_PACKAGE
     capabilities = LAMBDADB_CAPABILITIES
 
     def __init__(
@@ -236,6 +240,7 @@ class LambdaDBAdapter:
         return QueryResult(
             matches=_query_matches(response),
             raw_response=response,
+            server_took_ms=_took_ms(response),
         )
 
     def delete_batch(
@@ -283,6 +288,7 @@ class LambdaDBAdapter:
         return QueryResult(
             matches=_query_matches(response),
             raw_response=response,
+            server_took_ms=_took_ms(response),
         )
 
     def fetch(
@@ -301,6 +307,18 @@ class LambdaDBAdapter:
             include_vectors=include_vectors,
         )
         return _documents(response)
+
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        settings = _settings_from_target(target)
+        response = self._client(settings).collections.get(
+            collection_name=settings.collection_name,
+        )
+        status = _collection_status(response)
+        return CollectionStats(
+            ready=_is_active_collection_status(status),
+            num_docs=_collection_num_docs(response),
+            status=status,
+        )
 
     def _client(self, settings: LambdaDBTargetSettings) -> Any:
         api_key = _api_key(settings, self._environ)
@@ -518,6 +536,14 @@ def _collection_status(response: Any) -> str | None:
         value = _field_value(response, key)
         if value is not None:
             return _status_text(value)
+    return None
+
+
+def _collection_num_docs(response: Any) -> int | None:
+    for key in ("num_docs", "numDocs"):
+        value = _field_value(response, key)
+        if isinstance(value, int):
+            return value
     return None
 
 
@@ -757,4 +783,14 @@ def _score_from_result(result: Any) -> float | None:
         score = getattr(result, "score", None)
     if isinstance(score, int | float):
         return float(score)
+    return None
+
+
+def _took_ms(response: Any) -> float | None:
+    if isinstance(response, Mapping):
+        took = response.get("took")
+    else:
+        took = getattr(response, "took", None)
+    if isinstance(took, int | float):
+        return float(took)
     return None

@@ -90,6 +90,13 @@ class LoadStageResult:
 
 
 @dataclass(frozen=True)
+class DocCountWaitConfig:
+    enabled: bool
+    timeout_seconds: float
+    poll_interval_seconds: float
+
+
+@dataclass(frozen=True)
 class PartitionFilterSpec:
     field: str
     metadata_field: str
@@ -266,6 +273,7 @@ def execute_benchmark(
         scenario_path=scenario_path,
         target_path=target_path,
         output_dir=out,
+        sdk_package=adapter.sdk_package,
         adapter_capabilities=adapter.capabilities.as_dict(),
         dry_run_plan=plan.as_dict(),
     )
@@ -307,6 +315,7 @@ def execute_benchmark(
     )
     dataset_metric = _dataset_metric(scenario, dataset_manifest)
     query_filter_spec = _query_filter_spec(scenario)
+    doc_count_wait = _doc_count_wait_config(scenario)
     truth_path = _ground_truth_path(
         dataset_path,
         ground_truth_path,
@@ -639,7 +648,29 @@ def execute_benchmark(
             f"status={ingest_summary['status']} records={ingest_summary['records']} "
             f"errors={ingest_summary['errors']}"
         )
-        if ingest_summary["errors"] == 0 and _wait_until_query_visible(scenario):
+        load_succeeded = ingest_summary["errors"] == 0
+        if load_succeeded:
+            expected_docs = (
+                ingest_summary["records"] + ingest_summary["skipped_records"]
+            )
+            if doc_count_wait.enabled:
+                ingest_summary["doc_count"] = wait_until_doc_count(
+                    adapter=adapter,
+                    target=target,
+                    expected=expected_docs,
+                    timeout_seconds=doc_count_wait.timeout_seconds,
+                    poll_interval_seconds=doc_count_wait.poll_interval_seconds,
+                    progress=progress,
+                )
+            else:
+                ticker.emit("doc_count: skipped reason=disabled_by_scenario")
+                ingest_summary["doc_count"] = skipped_doc_count_summary(
+                    enabled=False,
+                    expected=expected_docs,
+                    reason="disabled_by_scenario",
+                )
+            load_succeeded = ingest_summary["doc_count"]["status"] != "timeout"
+        if load_succeeded and _wait_until_query_visible(scenario):
             ticker.emit("run: waiting for query visibility")
             ingest_summary["visibility"] = wait_until_query_visible(
                 adapter=adapter,
@@ -2100,6 +2131,7 @@ def run_query_stage(
             mode="staged" if stages else "one_pass",
             started=time.perf_counter(),
             latencies=[],
+            server_tooks=[],
             recalls=[],
             candidate_counts=[],
             expected_counts=[],
@@ -2168,6 +2200,7 @@ def run_query_stage(
         mode="one_pass",
         started=started,
         latencies=state.latencies,
+        server_tooks=state.server_tooks,
         recalls=state.recalls,
         candidate_counts=state.candidate_counts,
         expected_counts=state.expected_counts,
@@ -2414,6 +2447,7 @@ def run_staged_query_stage(
         mode="staged",
         started=started,
         latencies=state.latencies,
+        server_tooks=state.server_tooks,
         recalls=state.recalls,
         candidate_counts=state.candidate_counts,
         expected_counts=state.expected_counts,
@@ -2649,6 +2683,7 @@ class QueryRunState:
     queries: int = 0
     errors: int = 0
     latencies: list[float] = field(default_factory=list)
+    server_tooks: list[float] = field(default_factory=list)
     recalls: list[float] = field(default_factory=list)
     candidate_counts: list[int] = field(default_factory=list)
     expected_counts: list[int] = field(default_factory=list)
@@ -2662,6 +2697,9 @@ class QueryRunState:
             latency_ms = event.get("latency_ms")
             if isinstance(latency_ms, int | float):
                 self.latencies.append(float(latency_ms))
+            server_took_ms = event.get("server_took_ms")
+            if isinstance(server_took_ms, int | float):
+                self.server_tooks.append(float(server_took_ms))
             recall = event.get("recall_at_k")
             if isinstance(recall, int | float):
                 self.recalls.append(float(recall))
@@ -2891,6 +2929,8 @@ def execute_query_once(
             "status": "ok",
         }
     )
+    if result.server_took_ms is not None:
+        base_event["server_took_ms"] = result.server_took_ms
     if ground_truth_entry is not None:
         if ground_truth_entry.candidate_count is not None:
             base_event["candidate_count"] = ground_truth_entry.candidate_count
@@ -3333,6 +3373,7 @@ def _query_summary(
     mode: str,
     started: float,
     latencies: list[float],
+    server_tooks: list[float],
     recalls: list[float],
     candidate_counts: list[int],
     expected_counts: list[int],
@@ -3358,6 +3399,7 @@ def _query_summary(
         "queries_per_second": _rate(query_count, duration_seconds),
         "attempts_per_second": _rate(attempts, duration_seconds),
         "latency_ms": latency_summary(latencies),
+        "server_took_ms": latency_summary(server_tooks),
         "recall_at_k": _mean(recalls) if recalls else None,
         "recall_samples": len(recalls),
         "processes": processes,
@@ -3395,6 +3437,7 @@ def skipped_query_summary(*, reason: str) -> dict[str, Any]:
         mode="skipped",
         started=time.perf_counter(),
         latencies=[],
+        server_tooks=[],
         recalls=[],
         candidate_counts=[],
         expected_counts=[],
@@ -3430,6 +3473,100 @@ def skipped_load_summary(*, reason: str) -> dict[str, Any]:
         "batching_records_per_second": 0.0,
         "latency_ms": latency_summary([]),
         "attempt_latency_ms": latency_summary([]),
+    }
+
+
+def wait_until_doc_count(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    expected: int,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    ticker = ProgressTicker(progress)
+    if not adapter.capabilities.supports_collection_stats:
+        ticker.emit("doc_count: skipped reason=unsupported_by_adapter")
+        return skipped_doc_count_summary(
+            enabled=True,
+            expected=expected,
+            reason="unsupported_by_adapter",
+        )
+
+    attempts = 0
+    observed: int | None = None
+    collection_status: str | None = None
+    matched = False
+    last_error: dict[str, str] | None = None
+    started = time.perf_counter()
+    deadline = started + timeout_seconds
+    ticker.emit(
+        f"doc_count: waiting expected={expected} timeout_seconds={timeout_seconds}"
+    )
+    while True:
+        attempts += 1
+        try:
+            stats = adapter.collection_stats(target)
+        except Exception as exc:  # noqa: BLE001
+            last_error = {
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+        else:
+            last_error = None
+            observed = stats.num_docs
+            collection_status = stats.status
+            matched = stats.ready and observed == expected
+        if matched:
+            break
+        ticker.maybe(
+            "doc_count: progress "
+            f"observed={observed}/{expected} "
+            f"collection_status={collection_status} attempts={attempts} "
+            f"elapsed_seconds={time.perf_counter() - started:.1f}"
+        )
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval_seconds, remaining))
+
+    duration_seconds = time.perf_counter() - started
+    status = "match" if matched else "timeout"
+    ticker.emit(
+        f"doc_count: finished status={status} observed={observed}/{expected} "
+        f"duration_seconds={duration_seconds:.1f}"
+    )
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "status": status,
+        "expected": expected,
+        "observed": observed,
+        "collection_status": collection_status,
+        "attempts": attempts,
+        "duration_seconds": duration_seconds,
+        "timeout_seconds": timeout_seconds,
+    }
+    if last_error is not None:
+        summary.update(last_error)
+    return summary
+
+
+def skipped_doc_count_summary(
+    *,
+    enabled: bool,
+    expected: int,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "status": "skipped",
+        "skip_reason": reason,
+        "expected": expected,
+        "observed": None,
+        "collection_status": None,
+        "attempts": 0,
+        "duration_seconds": 0.0,
     }
 
 
@@ -3991,6 +4128,7 @@ def run_parallel_search_under_ingest_stage(
         mode="parallel_under_ingest",
         started=started,
         latencies=query_state.latencies,
+        server_tooks=query_state.server_tooks,
         recalls=query_state.recalls,
         candidate_counts=query_state.candidate_counts,
         expected_counts=query_state.expected_counts,
@@ -4061,10 +4199,7 @@ def run_status(
     query_summary: Mapping[str, Any],
     search_under_ingest_summary: Mapping[str, Any] | None = None,
 ) -> str:
-    if load_summary.get("errors", 0):
-        return "failed"
-    visibility = load_summary.get("visibility")
-    if isinstance(visibility, Mapping) and visibility.get("status") == "timeout":
+    if _load_failure_reason(load_summary) is not None:
         return "failed"
     if query_summary.get("errors", 0):
         return "completed_with_errors"
@@ -4081,13 +4216,21 @@ def _query_skip_reason(
     load_summary: Mapping[str, Any],
     load_only: bool,
 ) -> str | None:
-    if load_summary.get("errors", 0):
-        return "load_failed"
-    visibility = load_summary.get("visibility")
-    if isinstance(visibility, Mapping) and visibility.get("status") == "timeout":
-        return "visibility_timeout"
+    failure_reason = _load_failure_reason(load_summary)
+    if failure_reason is not None:
+        return failure_reason
     if load_only:
         return "load_only"
+    return None
+
+
+def _load_failure_reason(load_summary: Mapping[str, Any]) -> str | None:
+    if load_summary.get("errors", 0):
+        return "load_failed"
+    for wait_name in ("doc_count", "visibility"):
+        wait = load_summary.get(wait_name)
+        if isinstance(wait, Mapping) and wait.get("status") == "timeout":
+            return f"{wait_name}_timeout"
     return None
 
 
@@ -4155,6 +4298,7 @@ def _query_stage_summary(
         "queries_per_second": _rate(state.queries, elapsed_seconds),
         "attempts_per_second": _rate(attempts, elapsed_seconds),
         "latency_ms": latency_summary(state.latencies),
+        "server_took_ms": latency_summary(state.server_tooks),
         "recall_at_k": _mean(state.recalls) if state.recalls else None,
         "recall_samples": len(state.recalls),
     }
@@ -4891,6 +5035,23 @@ def _wait_until_query_visible(scenario: ScenarioConfig) -> bool:
     if not isinstance(value, bool):
         raise ConfigError("scenario.load.wait_until_query_visible must be a boolean")
     return value
+
+
+def _doc_count_wait_config(scenario: ScenarioConfig) -> DocCountWaitConfig:
+    enabled = scenario.load.get("wait_until_doc_count", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("scenario.load.wait_until_doc_count must be a boolean")
+    timeout = scenario.load.get("doc_count_timeout", "1h")
+    if not isinstance(timeout, str):
+        raise ConfigError("scenario.load.doc_count_timeout must be a string")
+    poll_interval = scenario.load.get("doc_count_poll_interval", "5s")
+    if not isinstance(poll_interval, str):
+        raise ConfigError("scenario.load.doc_count_poll_interval must be a string")
+    return DocCountWaitConfig(
+        enabled=enabled,
+        timeout_seconds=parse_duration_seconds(timeout),
+        poll_interval_seconds=parse_duration_seconds(poll_interval),
+    )
 
 
 def _visibility_timeout_seconds(scenario: ScenarioConfig) -> float:

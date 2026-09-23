@@ -31,6 +31,8 @@ LOAD_CSV_HEADERS = [
     "p99_ms",
     "errors",
     "error_rate",
+    "doc_count",
+    "doc_count_seconds",
     "visibility",
 ]
 QUERY_CSV_HEADERS = [
@@ -58,6 +60,9 @@ QUERY_CSV_HEADERS = [
     "p50_ms",
     "p95_ms",
     "p99_ms",
+    "server_took_p50_ms",
+    "server_took_p95_ms",
+    "server_took_p99_ms",
     "recall_at_k",
     "candidate_count_p50",
     "expected_count_p50",
@@ -282,12 +287,17 @@ def _write_csv(
 def _workload_rows(runs: list[RunReport]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for run in runs:
+        tool = _mapping(run.manifest.get("tool"))
         scenario = _mapping(run.manifest.get("scenario"))
         dataset = _mapping(scenario.get("dataset"))
         query = _mapping(scenario.get("query"))
         rows.append(
             {
                 "result_dir": str(run.path),
+                "tool_commit": _fmt(tool.get("git_commit")),
+                "tool_dirty": _fmt(tool.get("git_dirty")),
+                "sdk_package": _fmt(tool.get("sdk_package")),
+                "sdk_version": _fmt(tool.get("sdk_version")),
                 "scenario": _fmt(scenario.get("name")),
                 "dataset_rows": _fmt(dataset.get("rows")),
                 "dimensions": _fmt(dataset.get("dimensions")),
@@ -324,6 +334,7 @@ def _load_rows(runs: list[RunReport]) -> list[dict[str, str]]:
     for run in runs:
         load = _mapping(run.summary.get("load"))
         latency = _mapping(load.get("attempt_latency_ms") or load.get("latency_ms"))
+        doc_count = _mapping(load.get("doc_count"))
         visibility = _mapping(load.get("visibility"))
         rows.append(
             {
@@ -344,6 +355,8 @@ def _load_rows(runs: list[RunReport]) -> list[dict[str, str]]:
                 "p99_ms": _fmt_float(latency.get("p99")),
                 "errors": _fmt(load.get("errors")),
                 "error_rate": _fmt_float(load.get("error_rate")),
+                "doc_count": _fmt(doc_count.get("status")),
+                "doc_count_seconds": _fmt_float(doc_count.get("duration_seconds")),
                 "visibility": _fmt(visibility.get("status")),
             }
         )
@@ -366,6 +379,7 @@ def _query_stage_rows(runs: list[RunReport]) -> list[dict[str, str]]:
 
 def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
     latency = _mapping(stage.get("latency_ms"))
+    server_took = _mapping(stage.get("server_took_ms"))
     filter_config = _mapping(stage.get("filter"))
     full_text_config = _mapping(stage.get("full_text"))
     candidate_count = _mapping(stage.get("candidate_count"))
@@ -399,6 +413,9 @@ def _query_stage_row(run: RunReport, stage: dict[str, Any]) -> dict[str, str]:
         "p50_ms": _fmt_float(latency.get("p50")),
         "p95_ms": _fmt_float(latency.get("p95")),
         "p99_ms": _fmt_float(latency.get("p99")),
+        "server_took_p50_ms": _fmt_float(server_took.get("p50")),
+        "server_took_p95_ms": _fmt_float(server_took.get("p95")),
+        "server_took_p99_ms": _fmt_float(server_took.get("p99")),
         "recall_at_k": _fmt_float(stage.get("recall_at_k")),
         "candidate_count_p50": _fmt_float(candidate_count.get("p50")),
         "expected_count_p50": _fmt_float(expected_count.get("p50")),
@@ -523,6 +540,10 @@ def _warning_lines(runs: list[RunReport]) -> list[str]:
         status = run.summary.get("status")
         if status != "completed":
             warnings.append(f"{target}: run status is {_fmt(status)}.")
+        if _mapping(run.manifest.get("tool")).get("git_dirty") is True:
+            warnings.append(
+                f"{target}: lambdadb-bench had uncommitted changes during the run."
+            )
         load = _mapping(run.summary.get("load"))
         query = _mapping(run.summary.get("query"))
         search = _mapping(run.summary.get("search_under_ingest"))

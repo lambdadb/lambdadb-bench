@@ -153,6 +153,7 @@ the run manifest.
 Required run metadata:
 
 - Vendor and adapter version.
+- Benchmark tool commit and whether its checkout had uncommitted changes.
 - SDK name and SDK version.
 - Protocol, when relevant, such as REST or gRPC.
 - Adapter capabilities, including supported consistency levels.
@@ -368,7 +369,9 @@ Measure for each concurrency stage:
 - Unsupported consistency results as `N/A`, with a reason.
 
 Latency should be measured client-side around the SDK call. The report should
-state that this includes network and SDK overhead.
+state that this includes network and SDK overhead. When the database reports
+its own query time, such as LambdaDB `took`, record it separately as
+server-side time.
 
 ### Cost
 

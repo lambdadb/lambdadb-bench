@@ -6,8 +6,11 @@ from threading import Barrier
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
+from lambdadb import LambdaDB
 
+from ldbbench.adapters.base import CollectionStats
 from ldbbench.adapters.lambdadb import LambdaDBAdapter
 from ldbbench.config import ConfigError, TargetConfig
 
@@ -121,6 +124,7 @@ class FakeCollections:
     def query(self, **kwargs: Any) -> dict[str, Any]:
         self.queries.append(kwargs)
         return {
+            "took": 3,
             "docs": [
                 {"doc": {"id": "a"}, "score": 0.91},
                 {"doc": {"id": "b"}, "score": 0.42},
@@ -731,6 +735,51 @@ def test_full_text_query_uses_query_string_default_field() -> None:
     ]
 
 
+def test_queries_report_server_took() -> None:
+    adapter = make_adapter(FakeClient())
+
+    vector_result = adapter.query(
+        make_target(),
+        vector=[0.1, 0.2],
+        top_k=2,
+        consistency="eventual",
+    )
+    text_result = adapter.full_text_query(
+        make_target(),
+        query_text="alpha",
+        field="metadata.text",
+        top_k=2,
+        consistency="eventual",
+    )
+
+    assert vector_result.server_took_ms == 3.0
+    assert text_result.server_took_ms == 3.0
+
+
+def test_collection_stats_treats_describe_without_status_as_ready() -> None:
+    response = SimpleNamespace(
+        collection=SimpleNamespace(collection_name="smoke", num_docs=42),
+    )
+    client = SimpleNamespace(
+        collections=SimpleNamespace(get=lambda **_kwargs: response),
+    )
+
+    stats = make_adapter(client).collection_stats(make_target())
+
+    assert stats == CollectionStats(ready=True, num_docs=42, status=None)
+
+
+def test_collection_stats_is_not_ready_while_collection_is_creating() -> None:
+    response = {"collection": {"collectionStatus": "CREATING", "numDocs": 0}}
+    client = SimpleNamespace(
+        collections=SimpleNamespace(get=lambda **_kwargs: response),
+    )
+
+    stats = make_adapter(client).collection_stats(make_target())
+
+    assert stats == CollectionStats(ready=False, num_docs=0, status="CREATING")
+
+
 def test_full_text_query_passes_partition_filter() -> None:
     client = FakeClient()
     adapter = make_adapter(client)
@@ -817,6 +866,145 @@ def test_fetch_maps_eventual_consistency_to_consistent_read_false() -> None:
             "include_vectors": True,
         }
     ]
+
+
+class DevelopServer:
+    """Answers the real SDK with lambdadb develop response shapes."""
+
+    upload_url = "https://bucket.example.test/bulk/1.json?X-Amz-Signature=sig"
+
+    def __init__(self, *, num_docs: int = 0) -> None:
+        self.num_docs = num_docs
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        path = request.url.path
+        if request.method == "PUT" and str(request.url) == self.upload_url:
+            return httpx.Response(200)
+        if path == "/projects/demo/collections" and request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "collection": {
+                        "collectionName": "smoke",
+                        "description": "",
+                        "tags": {},
+                        "defaultBranchName": "main",
+                        "snapshotRetentionInDays": 7,
+                        "createdAt": 1,
+                    }
+                },
+            )
+        if path == "/projects/demo/collections/smoke" and request.method == "GET":
+            return httpx.Response(200, json={"collection": self._collection()})
+        if path == "/projects/demo/collections/smoke/query":
+            return httpx.Response(
+                200,
+                json={
+                    "took": 7,
+                    "total": 1,
+                    "docs": [{"collection": "smoke", "doc": {"id": "a"}, "score": 0.9}],
+                    "isDocsInline": True,
+                },
+            )
+        if path == "/projects/demo/collections/smoke/docs/bulk-upsert":
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "url": self.upload_url,
+                        "type": "application/json",
+                        "httpMethod": "PUT",
+                        "objectKey": "bulk/1.json",
+                        "sizeLimitBytes": 1_000_000,
+                        "headers": {"If-None-Match": "*"},
+                    },
+                )
+            return httpx.Response(
+                202,
+                json={"message": "Bulk upsert request is accepted"},
+            )
+        return httpx.Response(404, json={"message": f"unexpected {path}"})
+
+    def _collection(self) -> dict[str, Any]:
+        return {
+            "projectName": "demo",
+            "collectionName": "smoke",
+            "indexConfigs": {
+                "dense": {"type": "vector", "dimensions": 2, "similarity": "cosine"}
+            },
+            "numPartitions": 1,
+            "numDocs": self.num_docs,
+            "description": "",
+            "tags": {},
+            "defaultBranchName": "main",
+            "snapshotRetentionInDays": 7,
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+
+
+def make_sdk_adapter(server: DevelopServer) -> LambdaDBAdapter:
+    def client_factory(**kwargs: Any) -> LambdaDB:
+        http_client = httpx.Client(transport=httpx.MockTransport(server))
+        return LambdaDB(**kwargs, client=http_client)
+
+    return LambdaDBAdapter(
+        client_factory=client_factory,
+        environ={"LAMBDADB_API_KEY": "secret"},
+    )
+
+
+def test_sdk_prepare_create_accepts_develop_created_response() -> None:
+    server = DevelopServer()
+    adapter = make_sdk_adapter(server)
+    target = make_target(prepare={"mode": "create"}, create_wait_poll_seconds=0.001)
+
+    result = adapter.prepare(target, dimensions=2, metric="cosine")
+
+    assert result.ok
+    assert [(request.method, request.url.path) for request in server.requests] == [
+        ("POST", "/projects/demo/collections"),
+        ("GET", "/projects/demo/collections/smoke"),
+    ]
+
+
+def test_sdk_collection_stats_reads_develop_num_docs() -> None:
+    adapter = make_sdk_adapter(DevelopServer(num_docs=3))
+
+    stats = adapter.collection_stats(make_target())
+
+    assert stats == CollectionStats(ready=True, num_docs=3, status=None)
+
+
+def test_sdk_bulk_upsert_sends_signed_upload_headers() -> None:
+    server = DevelopServer()
+    adapter = make_sdk_adapter(server)
+
+    adapter.upsert_batch(
+        make_target(),
+        [{"id": "a", "vector": [0.1, 0.2], "metadata": {}}],
+        write_mode="bulk_upsert",
+    )
+
+    uploads = [request for request in server.requests if request.method == "PUT"]
+    assert len(uploads) == 1
+    assert uploads[0].headers["If-None-Match"] == "*"
+
+
+def test_sdk_query_reports_develop_server_took() -> None:
+    adapter = make_sdk_adapter(DevelopServer())
+
+    result = adapter.query(
+        make_target(),
+        vector=[0.1, 0.2],
+        top_k=1,
+        consistency="eventual",
+    )
+
+    assert [match.id for match in result.matches] == ["a"]
+    assert result.server_took_ms == 7.0
 
 
 def test_operations_require_api_key_env() -> None:

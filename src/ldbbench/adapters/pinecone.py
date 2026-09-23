@@ -11,6 +11,7 @@ from typing import Any
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    CollectionStats,
     DeleteResult,
     PrepareResult,
     QueryMatch,
@@ -21,6 +22,7 @@ from ldbbench.adapters.base import (
 from ldbbench.adapters.filters import pinecone_filter
 from ldbbench.config import ConfigError, TargetConfig
 
+SDK_PACKAGE = "pinecone"
 DEFAULT_CLOUD = "aws"
 DEFAULT_NAMESPACE = ""
 DEFAULT_CREATE_TIMEOUT_SECONDS = 600
@@ -62,6 +64,7 @@ class PineconeTargetSettings:
 
 class PineconeAdapter:
     vendor = "pinecone"
+    sdk_package = SDK_PACKAGE
     capabilities = PINECONE_CAPABILITIES
 
     def __init__(
@@ -248,6 +251,9 @@ class PineconeAdapter:
             namespace=settings.namespace,
         )
         return _documents(response, include_vectors=include_vectors)
+
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        raise ConfigError("Pinecone adapter does not report collection stats")
 
     def _client(self, settings: PineconeTargetSettings) -> Any:
         api_key = _api_key(settings, self._environ)
