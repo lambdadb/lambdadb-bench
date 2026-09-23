@@ -6,13 +6,13 @@ resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and sys_platform == 'win32'",
-    "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
-    "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.12' and sys_platform == 'win32'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
@@ -682,16 +682,16 @@ wheels = [
 
 [[package]]
 name = "lambdadb"
-version = "0.7.5"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpcore" },
     { name = "httpx" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/74/62bbdfa693004647cd9825c10ddafd22024d6a69d4c6de60e823a3be8288/lambdadb-0.7.5.tar.gz", hash = "sha256:572773fe34cca4f5fc14a618088ca52edb8961b9e8553695db5940bfac621f56", size = 61265, upload-time = "2026-05-07T08:20:46.689Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/ee/6b348cbd37069e020a913f1384842e8ecee6bfc301acee93bbdd477bc185/lambdadb-0.9.0.tar.gz", hash = "sha256:557cc6e260e7739d33d5c9713c6b453e4a49064290407349ba896e5b7d3fb6d7", size = 82971, upload-time = "2026-09-16T09:48:39.133Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/75/57/6f3d090b230fe49f2a1d3c9e9ed52930d0cd737f04e970f1cdd6a9811623/lambdadb-0.7.5-py3-none-any.whl", hash = "sha256:810d9ef61dda0f6410e66093b8d633255be7598c94e5e16c4bde3ccf664a371b", size = 86797, upload-time = "2026-05-07T08:20:45.244Z" },
+    { url = "https://files.pythonhosted.org/packages/65/4e/0801231f770c8f5aa76fa65702379737d2c0d2bcb5158ad7b62a6080cd3e/lambdadb-0.9.0-py3-none-any.whl", hash = "sha256:3913d810a2a720dca164658b3f7e250fcd66c895d576900d3eeb6989b775d809", size = 112861, upload-time = "2026-09-16T09:48:37.658Z" },
 ]
 
 [[package]]
@@ -722,7 +722,7 @@ groundtruth = [
 requires-dist = [
     { name = "datasets", specifier = ">=2.20" },
     { name = "faiss-cpu", marker = "extra == 'groundtruth'", specifier = ">=1.8.0" },
-    { name = "lambdadb", specifier = ">=0.7.5" },
+    { name = "lambdadb", specifier = ">=0.9.0" },
     { name = "msgpack", specifier = ">=1.1" },
     { name = "numpy", marker = "extra == 'groundtruth'", specifier = ">=1.26" },
     { name = "orjson", specifier = ">=3.11" },

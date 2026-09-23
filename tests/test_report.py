@@ -59,6 +59,50 @@ def test_generate_report_writes_markdown_and_csv(tmp_path) -> None:
     assert query_rows[1]["queries_per_second"] == "700.000"
 
 
+def test_generate_report_includes_doc_count_server_took_and_provenance(
+    tmp_path,
+) -> None:
+    result_dir = write_result(
+        tmp_path,
+        "lambdadb",
+        target_label="lambdadb-develop",
+        vendor="lambdadb",
+        load_rps=1200.0,
+        query_qps=700.0,
+    )
+    summary_path = result_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["load"]["doc_count"] = {"status": "match", "duration_seconds": 442.7}
+    summary["query"]["stages"][0]["server_took_ms"] = {
+        "p50": 11.0,
+        "p95": 20.5,
+        "p99": 31.25,
+    }
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    manifest_path = result_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["tool"] = {
+        "git_commit": "0123abcd",
+        "git_dirty": True,
+        "sdk_package": "lambdadb",
+        "sdk_version": "0.9.0",
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = generate_report([result_dir], output_path=tmp_path / "report.md")
+
+    markdown = result.markdown_path.read_text(encoding="utf-8")
+    load_row = next(csv.DictReader(result.load_csv_path.open(encoding="utf-8")))
+    query_row = next(csv.DictReader(result.query_csv_path.open(encoding="utf-8")))
+    assert load_row["doc_count"] == "match"
+    assert load_row["doc_count_seconds"] == "442.700"
+    assert query_row["server_took_p50_ms"] == "11.000"
+    assert query_row["server_took_p95_ms"] == "20.500"
+    assert query_row["server_took_p99_ms"] == "31.250"
+    assert "| 0123abcd | yes | lambdadb | 0.9.0 |" in markdown
+    assert "lambdadb-bench had uncommitted changes during the run" in markdown
+
+
 def test_generate_report_includes_parallel_search_under_ingest(tmp_path) -> None:
     result_dir = write_result(
         tmp_path,

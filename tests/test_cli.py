@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from ldbbench.cli import build_parser, main
+from ldbbench.runner.execute import (
+    BenchmarkRunResult,
+    skipped_load_summary,
+    skipped_query_summary,
+)
 
 
 def test_help_prints_usage(capsys: pytest.CaptureFixture[str]) -> None:
@@ -538,9 +544,101 @@ prepare:
     )
 
     captured = capsys.readouterr()
+    manifest = json.loads((output_dir / "run_manifest.json").read_text("utf-8"))
     assert exit_code == 0
     assert "dry_run: supported" in captured.out
-    assert (output_dir / "run_manifest.json").exists()
+    assert manifest["tool"]["sdk_package"] == "qdrant-client"
+
+
+def test_run_exits_nonzero_when_doc_count_wait_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    target_path = tmp_path / "target.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 1
+  dimensions: 1024
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+""",
+        encoding="utf-8",
+    )
+    target_path.write_text(
+        """
+vendor: lambdadb
+name: lambdadb-ci
+endpoint: https://api.example.test
+project_name: demo
+api_key_env: LAMBDADB_API_KEY
+collection_name: smoke
+prepare:
+  mode: create
+""",
+        encoding="utf-8",
+    )
+    load_summary = {
+        **skipped_load_summary(reason="unused"),
+        "status": "completed",
+        "records": 1,
+        "concurrency": 1,
+        "processes": 1,
+        "worker_threads_per_process": [1],
+        "doc_count": {
+            "status": "timeout",
+            "expected": 1,
+            "observed": 0,
+            "duration_seconds": 60.0,
+        },
+    }
+    summary = {
+        "status": "failed",
+        "load": load_summary,
+        "query": skipped_query_summary(reason="doc_count_timeout"),
+    }
+
+    def fake_execute_benchmark(**kwargs):
+        out = Path(kwargs["output_dir"])
+        return BenchmarkRunResult(
+            output_dir=out,
+            ingest_events_path=out / "ingest_events.jsonl",
+            delete_events_path=out / "delete_events.jsonl",
+            query_events_path=out / "query_events.jsonl",
+            search_under_ingest_events_path=out / "search.jsonl",
+            load_checkpoint_path=out / "load_checkpoint.json",
+            deletion_state_path=out / "deletion_state.json",
+            summary_path=out / "summary.json",
+            summary=summary,
+        )
+
+    monkeypatch.setattr("ldbbench.cli.execute_benchmark", fake_execute_benchmark)
+
+    exit_code = main(
+        [
+            "run",
+            "--scenario",
+            str(scenario_path),
+            "--target",
+            str(target_path),
+            "--dataset-dir",
+            str(tmp_path / "dataset"),
+            "--out",
+            str(tmp_path / "result"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "run: failed" in captured.out
+    assert (
+        "doc_count: timeout observed=0 expected=1 duration_seconds=60.0" in captured.out
+    )
 
 
 def test_run_without_dry_run_fails(

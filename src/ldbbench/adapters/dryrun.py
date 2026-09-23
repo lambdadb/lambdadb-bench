@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ldbbench.adapters import lambdadb, pinecone, qdrant
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    CollectionStats,
     DeleteResult,
     PrepareResult,
     QueryResult,
@@ -20,6 +22,7 @@ from ldbbench.config import TargetConfig
 @dataclass(frozen=True)
 class StaticAdapter:
     vendor: str
+    sdk_package: str
     capabilities: AdapterCapabilities
 
     def check(self, target: TargetConfig) -> CheckResult:
@@ -95,9 +98,13 @@ class StaticAdapter:
     ) -> list[dict[str, Any]]:
         raise NotImplementedError("dry-run adapters do not fetch real documents")
 
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        raise NotImplementedError("dry-run adapters do not read real collections")
+
 
 LAMBDADB_DRYRUN = StaticAdapter(
     vendor="lambdadb",
+    sdk_package=lambdadb.SDK_PACKAGE,
     capabilities=AdapterCapabilities(
         supported_write_modes=frozenset({"upsert", "bulk_upsert"}),
         supported_query_consistency=frozenset({"eventual", "strong"}),
@@ -107,12 +114,14 @@ LAMBDADB_DRYRUN = StaticAdapter(
         supports_nested_object_index=True,
         supports_full_text_search=True,
         supports_delete_by_id=True,
+        supports_collection_stats=True,
         vendor_consistency_options={"consistent_read": True},
     ),
 )
 
 QDRANT_DRYRUN = StaticAdapter(
     vendor="qdrant",
+    sdk_package=qdrant.SDK_PACKAGE,
     capabilities=AdapterCapabilities(
         supported_write_modes=frozenset({"upsert"}),
         supported_query_consistency=frozenset({"eventual"}),
@@ -130,6 +139,7 @@ QDRANT_DRYRUN = StaticAdapter(
 
 PINECONE_DRYRUN = StaticAdapter(
     vendor="pinecone",
+    sdk_package=pinecone.SDK_PACKAGE,
     capabilities=AdapterCapabilities(
         supported_write_modes=frozenset({"upsert"}),
         supported_query_consistency=frozenset({"eventual"}),

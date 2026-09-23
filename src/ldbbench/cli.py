@@ -381,6 +381,7 @@ def run_manifest_init(args: argparse.Namespace) -> int:
         scenario_path=args.scenario,
         target_path=args.target,
         output_dir=args.out,
+        sdk_package=adapter.sdk_package,
         adapter_capabilities=adapter.capabilities.as_dict(),
     )
     print(f"wrote {paths.run_manifest}")
@@ -575,6 +576,13 @@ def run_benchmark(args: argparse.Namespace) -> int:
         if result.summary["load"]["errors"]:
             print(f"load_errors: {result.summary['load']['errors']}")
             print(f"load_error_rate: {result.summary['load']['error_rate']}")
+        if "doc_count" in result.summary["load"]:
+            doc_count = result.summary["load"]["doc_count"]
+            print(
+                f"doc_count: {doc_count['status']} "
+                f"observed={doc_count['observed']} expected={doc_count['expected']} "
+                f"duration_seconds={doc_count['duration_seconds']:.1f}"
+            )
         if "visibility" in result.summary["load"]:
             print(f"visibility: {result.summary['load']['visibility']['status']}")
         print(f"queries: {result.summary['query']['queries']}")
@@ -624,7 +632,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         if result.deletion_state_path.exists():
             print(f"wrote {result.deletion_state_path}")
         print(f"wrote {result.summary_path}")
-        return 0
+        return 1 if result.summary["status"] == "failed" else 0
 
     paths = initialize_run_artifacts(
         scenario=scenario,
@@ -632,6 +640,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         scenario_path=args.scenario,
         target_path=args.target,
         output_dir=args.out,
+        sdk_package=adapter.sdk_package,
         adapter_capabilities=adapter.capabilities.as_dict(),
         dry_run_plan=plan.as_dict(),
     )

@@ -26,7 +26,7 @@ classifiers = [
 ]
 dependencies = [
   "datasets>=2.20",
-  "lambdadb>=0.7.5",
+  "lambdadb>=0.9.0",
   "msgpack>=1.1",
   "orjson>=3.11",
   "pinecone>=9.0.0",

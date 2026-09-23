@@ -12,6 +12,7 @@ from typing import Any
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    CollectionStats,
     DeleteResult,
     PrepareResult,
     QueryMatch,
@@ -21,6 +22,8 @@ from ldbbench.adapters.base import (
 )
 from ldbbench.adapters.filters import qdrant_filter
 from ldbbench.config import ConfigError, TargetConfig
+
+SDK_PACKAGE = "qdrant-client"
 
 QDRANT_CAPABILITIES = AdapterCapabilities(
     supported_write_modes=frozenset({"upsert"}),
@@ -57,6 +60,7 @@ class QdrantTargetSettings:
 
 class QdrantAdapter:
     vendor = "qdrant"
+    sdk_package = SDK_PACKAGE
     capabilities = QDRANT_CAPABILITIES
 
     def __init__(
@@ -245,6 +249,9 @@ class QdrantAdapter:
             with_vectors=include_vectors,
         )
         return [_document_from_point(point) for point in response]
+
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        raise ConfigError("Qdrant adapter does not report collection stats")
 
     def _client(self, settings: QdrantTargetSettings) -> Any:
         api_key = _api_key(settings, self._environ)

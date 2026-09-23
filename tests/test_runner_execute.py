@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from threading import Lock
 from typing import Any
 
@@ -11,6 +12,7 @@ import pytest
 from ldbbench.adapters.base import (
     AdapterCapabilities,
     CheckResult,
+    CollectionStats,
     DeleteResult,
     PrepareResult,
     QueryMatch,
@@ -40,6 +42,7 @@ from ldbbench.runner.execute import (
 
 class FakeAdapter:
     vendor = "fake"
+    sdk_package = "fake-sdk"
     capabilities = AdapterCapabilities(
         supported_write_modes=frozenset({"upsert", "bulk_upsert"}),
         supported_query_consistency=frozenset({"eventual"}),
@@ -234,6 +237,42 @@ class FakeAdapter:
         ]
 
 
+class IndexingAdapter(FakeAdapter):
+    """Reports loaded documents after an index lag and returns server timings."""
+
+    capabilities = replace(FakeAdapter.capabilities, supports_collection_stats=True)
+
+    def __init__(
+        self,
+        *,
+        polls_until_indexed: int | None = 0,
+        stats_errors: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.polls_until_indexed = polls_until_indexed
+        self.stats_errors = stats_errors
+        self.stats_calls = 0
+        self.calls: list[str] = []
+
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        self.stats_calls += 1
+        self.calls.append("stats")
+        if self.stats_calls <= self.stats_errors:
+            raise RuntimeError("describe unavailable")
+        loaded = sum(len(batch) for batch in self.upserted)
+        indexed = (
+            self.polls_until_indexed is not None
+            and self.stats_calls > self.polls_until_indexed
+        )
+        return CollectionStats(ready=True, num_docs=loaded if indexed else loaded - 1)
+
+    def query(self, target: TargetConfig, **kwargs: Any) -> QueryResult:
+        self.calls.append("query")
+        result = super().query(target, **kwargs)
+        return replace(result, server_took_ms=float(self.query_calls))
+
+
 def make_scenario(
     *,
     rows: int = 3,
@@ -253,6 +292,7 @@ def make_scenario(
     full_text: bool = False,
     metric: str = "cosine",
     delete_order: str | None = None,
+    load_options: dict[str, Any] | None = None,
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": top_k,
@@ -323,6 +363,7 @@ def make_scenario(
         mapping["load"]["sharded_records"] = True
     if shard_count is not None:
         mapping["load"]["shard_count"] = shard_count
+    mapping["load"].update(load_options or {})
     return ScenarioConfig.from_mapping(mapping)
 
 
@@ -452,7 +493,12 @@ def test_execute_benchmark_writes_events_and_summary(tmp_path) -> None:
     assert query_events[0]["query_id"] == "query"
     assert query_events[0]["matches"] == ["a", "c"]
     assert query_events[0]["recall_at_k"] == 1.0
+    assert "server_took_ms" not in query_events[0]
     assert result.summary["load"]["records"] == 3
+    assert result.summary["load"]["doc_count"]["status"] == "skipped"
+    assert (
+        result.summary["load"]["doc_count"]["skip_reason"] == "unsupported_by_adapter"
+    )
     assert result.summary["load"]["records_read"] == 3
     assert result.summary["load"]["write_mode"] == "upsert"
     assert result.summary["load"]["record_source"]["format"] == "msgpack"
@@ -462,6 +508,7 @@ def test_execute_benchmark_writes_events_and_summary(tmp_path) -> None:
     assert result.summary["load"]["attempt_latency_ms"]["max"] is not None
     assert result.summary["query"]["queries"] == 1
     assert result.summary["query"]["recall_at_k"] == 1.0
+    assert result.summary["query"]["server_took_ms"]["p50"] is None
     assert result.summary_path.exists()
 
 
@@ -1374,6 +1421,203 @@ def test_execute_benchmark_waits_until_query_visible(tmp_path) -> None:
     assert result.summary["load"]["visibility"]["visible"] == 3
 
 
+def test_execute_benchmark_waits_for_loaded_doc_count_before_queries(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(load_options={"doc_count_poll_interval": "1ms"})
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = IndexingAdapter(polls_until_indexed=2)
+    progress: list[str] = []
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        max_queries=1,
+        progress=progress.append,
+    )
+
+    doc_count = result.summary["load"]["doc_count"]
+    assert result.summary["status"] == "completed"
+    assert doc_count["status"] == "match"
+    assert doc_count["expected"] == 3
+    assert doc_count["observed"] == 3
+    assert doc_count["attempts"] == 3
+    assert doc_count["duration_seconds"] > 0
+    assert adapter.calls == ["stats", "stats", "stats", "query"]
+    assert "doc_count: waiting expected=3 timeout_seconds=3600.0" in progress
+    assert any(line.startswith("doc_count: finished status=match") for line in progress)
+
+
+def test_execute_benchmark_fails_when_doc_count_times_out(tmp_path) -> None:
+    scenario = make_scenario(
+        wait_until_query_visible=True,
+        load_options={
+            "doc_count_timeout": "20ms",
+            "doc_count_poll_interval": "1ms",
+        },
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = IndexingAdapter(polls_until_indexed=None)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        max_queries=1,
+    )
+
+    doc_count = result.summary["load"]["doc_count"]
+    assert result.summary["status"] == "failed"
+    assert result.summary["query"]["skip_reason"] == "doc_count_timeout"
+    assert doc_count["status"] == "timeout"
+    assert doc_count["expected"] == 3
+    assert doc_count["observed"] == 2
+    assert doc_count["timeout_seconds"] == 0.02
+    assert doc_count["duration_seconds"] >= 0.02
+    assert "visibility" not in result.summary["load"]
+    assert adapter.query_calls == 0
+
+
+def test_doc_count_wait_retries_failed_status_checks(tmp_path) -> None:
+    scenario = make_scenario(load_options={"doc_count_poll_interval": "1ms"})
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = IndexingAdapter(stats_errors=1)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+
+    doc_count = result.summary["load"]["doc_count"]
+    assert doc_count["status"] == "match"
+    assert doc_count["attempts"] == 2
+    assert "error_type" not in doc_count
+
+
+def test_doc_count_timeout_records_last_status_error(tmp_path) -> None:
+    scenario = make_scenario(
+        load_options={"doc_count_timeout": "5ms", "doc_count_poll_interval": "1ms"},
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=IndexingAdapter(stats_errors=1_000_000),
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+
+    doc_count = result.summary["load"]["doc_count"]
+    assert result.summary["status"] == "failed"
+    assert doc_count["status"] == "timeout"
+    assert doc_count["observed"] is None
+    assert doc_count["error_type"] == "RuntimeError"
+    assert doc_count["error_message"] == "describe unavailable"
+
+
+def test_doc_count_wait_can_be_disabled(tmp_path) -> None:
+    scenario = make_scenario(load_options={"wait_until_doc_count": False})
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = IndexingAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+
+    assert result.summary["load"]["doc_count"]["status"] == "skipped"
+    assert result.summary["load"]["doc_count"]["skip_reason"] == "disabled_by_scenario"
+    assert adapter.stats_calls == 0
+
+
+def test_invalid_doc_count_timeout_fails_before_load(tmp_path) -> None:
+    scenario = make_scenario(load_options={"doc_count_timeout": 60})
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = IndexingAdapter()
+
+    with pytest.raises(ConfigError, match="doc_count_timeout"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=adapter,
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+            load_only=True,
+        )
+
+    assert adapter.prepared is None
+    assert adapter.upserted == []
+
+
+def test_execute_benchmark_summarizes_server_took(tmp_path) -> None:
+    scenario = make_scenario(stages=[{"concurrency": 1, "max_requests": 3}])
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=IndexingAdapter(),
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    expected_summary = {"min": 1.0, "p50": 2.0, "p95": 2.9, "p99": 2.98, "max": 3.0}
+    assert [event["server_took_ms"] for event in query_events] == [1.0, 2.0, 3.0]
+    assert result.summary["query"]["server_took_ms"] == pytest.approx(
+        expected_summary
+    )
+    assert result.summary["query"]["stages"][0]["server_took_ms"] == pytest.approx(
+        expected_summary
+    )
+
+
 def test_execute_benchmark_load_only_skips_queries(tmp_path) -> None:
     scenario = make_scenario()
     target = make_target()
@@ -1785,6 +2029,7 @@ def test_execute_benchmark_can_resume_load_from_checkpoint(tmp_path) -> None:
     assert resumed.summary["status"] == "completed"
     assert resumed.summary["load"]["records"] == 1
     assert resumed.summary["load"]["skipped_records"] == 2
+    assert resumed.summary["load"]["doc_count"]["expected"] == 3
     assert resumed.summary["load"]["skipped_batches"] == 1
     assert resumed.summary["load"]["checkpoint"]["resume_enabled"] is True
     assert resumed.summary["load"]["checkpoint"]["resumed_from_batch_index"] == 1
