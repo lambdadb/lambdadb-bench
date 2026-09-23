@@ -314,6 +314,24 @@ class PreexistingDocsAdapter(IndexingAdapter):
         return replace(stats, num_docs=(stats.num_docs or 0) + 4)
 
 
+class NeverPublishedAdapter(FakeAdapter):
+    capabilities = replace(FakeAdapter.capabilities, supports_collection_stats=True)
+    head = 1790121600000
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stats_calls = 0
+
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        self.stats_calls += 1
+        return CollectionStats(
+            ready=True,
+            num_docs=3,
+            data_updated_at=self.head,
+            supports_data_updated_at=True,
+        )
+
+
 def make_scenario(
     *,
     rows: int = 3,
@@ -1488,6 +1506,7 @@ def test_execute_benchmark_waits_for_loaded_doc_count_before_queries(
     )
 
     doc_count = result.summary["load"]["doc_count"]
+    checkpoint = json.loads(result.load_checkpoint_path.read_text(encoding="utf-8"))
     assert result.summary["status"] == "completed"
     assert doc_count["status"] == "match"
     assert doc_count["expected"] == 3
@@ -1501,6 +1520,8 @@ def test_execute_benchmark_waits_for_loaded_doc_count_before_queries(
         for line in progress
     )
     assert any(line.startswith("doc_count: finished status=match") for line in progress)
+    assert checkpoint["publish_wait"]["completed"] is True
+    assert checkpoint["publish_wait"]["result"]["status"] == "match"
 
 
 def test_doc_count_wait_requires_head_advance_when_load_updates_existing_docs(
@@ -1530,6 +1551,65 @@ def test_doc_count_wait_requires_head_advance_when_load_updates_existing_docs(
     assert doc_count["observed_data_updated_at"] == adapter.updated_head.isoformat()
     assert doc_count["data_updated_after_baseline"] is True
     assert doc_count["attempts"] == 3
+
+
+def test_resume_load_continues_unfinished_publish_wait_from_saved_baseline(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(
+        load_options={
+            "doc_count_timeout": "5ms",
+            "doc_count_poll_interval": "1ms",
+        }
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    output_dir = tmp_path / "result"
+
+    first = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=NeverPublishedAdapter(),
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=output_dir,
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+    checkpoint = json.loads(first.load_checkpoint_path.read_text(encoding="utf-8"))
+
+    resumed_adapter = NeverPublishedAdapter()
+    resumed = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=resumed_adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=output_dir,
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+        resume_load=True,
+    )
+
+    resumed_wait = resumed.summary["load"]["doc_count"]
+    assert first.summary["load"]["doc_count"]["status"] == "timeout"
+    assert resumed.summary["status"] == "failed"
+    assert resumed.summary["load"]["records"] == 0
+    assert resumed.summary["load"]["skipped_records"] == 3
+    assert resumed_wait["status"] == "timeout"
+    assert resumed_wait["baseline_data_updated_at"] == (
+        str(NeverPublishedAdapter.head)
+    )
+    assert resumed_wait["data_updated_after_baseline"] is False
+    assert resumed_wait["attempts"] > 1
+    assert resumed_adapter.stats_calls == resumed_wait["attempts"]
+
+    publish_wait = checkpoint["publish_wait"]
+    assert publish_wait["baseline"]["num_docs"] == 3
+    assert publish_wait["baseline"]["data_updated_at"] == NeverPublishedAdapter.head
+    assert publish_wait["load_changed_data"] is True
+    assert publish_wait["completed"] is False
 
 
 def test_doc_count_wait_fails_immediately_when_observed_exceeds_expected(

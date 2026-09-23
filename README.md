@@ -247,10 +247,13 @@ reports as many documents as were loaded before any query runs (LambdaDB:
 ACTIVE and `numDocs` equal to the loaded count). If that wait times out, the
 run is marked `failed` and queries are skipped with `doc_count_timeout`.
 Adapters that cannot report a document count record the wait as skipped.
-The wait only checks that the indexed count reaches the expected total, so it
-does not confirm that a load which overwrites existing documents without
-changing the count has been applied; comparing against a pre-load baseline is
-follow-up work.
+For a fresh collection created with `prepare.mode: create` or
+`prepare.mode: recreate`, count growth to the expected total is a complete
+publication signal. For overwrite loads, a matching count and an advanced
+`dataUpdatedAt` do not prove that the last batch is published: overwritten
+documents do not increase `numDocs`, and the head can advance while other
+batches are still publishing. Those loads have no complete publication signal
+until the server exposes a per-load or per-batch signal.
 `ldbbench run` exits with status 1 whenever the run status is `failed`, for
 example after load errors or a wait timeout, so scripts can stop before a
 later `--query-only` run measures an unfinished index.
@@ -334,6 +337,9 @@ Real runs write:
   `null` when neither is available, and reports warn when it is `null`.
 - `ingest_events.jsonl`: one event per upsert batch, including load errors.
 - `load_checkpoint.json`: resumable load watermark and matching load context.
+  Its `publish_wait` state retains the pre-load count/head baseline and wait
+  result so `--resume-load` can continue after a timeout. A checkpoint without
+  that state cannot be resumed safely when collection-stat waiting is enabled.
 - `delete_events.jsonl`: one event per document-ID delete batch in
   `--delete-only` runs.
 - `deletion_state.json`: written by `--delete-only` with the cumulative delete
@@ -742,8 +748,13 @@ Useful load settings:
   runner captures `numDocs` and LambdaDB `dataUpdatedAt` before loading; when
   this run writes records, the count must match and LambdaDB's data head must
   advance past that baseline. This checks collection-level publication, not
-  query visibility or a sample of documents. An observed count above expected
-  fails immediately. Adapters without collection statistics skip this wait.
+  query visibility or a sample of documents. On a fresh collection created
+  with `prepare.mode: create` or `prepare.mode: recreate`, `numDocs` growth to
+  the expected total is a complete publication signal. On overwrite loads, a
+  matching count and an advanced `dataUpdatedAt` do not prove that the last
+  batch is published; there is no complete signal until the server exposes a
+  per-load or per-batch signal. An observed count above expected fails
+  immediately. Adapters without collection statistics skip this wait.
 - `doc_count_timeout`: optional duration string, defaults to `1h`. The run fails
   when the expected count and required data-head advance do not appear within
   this time.
