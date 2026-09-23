@@ -18,7 +18,7 @@ from typing import Any
 
 import msgpack
 
-from ldbbench.adapters.base import VectorDBAdapter, VectorRecord
+from ldbbench.adapters.base import CollectionStats, VectorDBAdapter, VectorRecord
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
 from ldbbench.datasets.deletion import (
     LoadedDeletionPlan,
@@ -604,6 +604,19 @@ def execute_benchmark(
             summary=summary,
         )
 
+    doc_count_baseline = None
+    if (
+        not query_only
+        and doc_count_wait.enabled
+        and adapter.capabilities.supports_collection_stats
+    ):
+        try:
+            doc_count_baseline = adapter.collection_stats(target)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"failed to capture collection baseline before load: {exc}"
+            ) from exc
+
     if query_only:
         ticker.emit("run: skipping load query_only=true")
         ingest_events_path.write_text("", encoding="utf-8")
@@ -658,6 +671,8 @@ def execute_benchmark(
                     adapter=adapter,
                     target=target,
                     expected=expected_docs,
+                    baseline=doc_count_baseline,
+                    load_changed_data=ingest_summary["records"] > 0,
                     timeout_seconds=doc_count_wait.timeout_seconds,
                     poll_interval_seconds=doc_count_wait.poll_interval_seconds,
                     progress=progress,
@@ -669,7 +684,10 @@ def execute_benchmark(
                     expected=expected_docs,
                     reason="disabled_by_scenario",
                 )
-            load_succeeded = ingest_summary["doc_count"]["status"] != "timeout"
+            load_succeeded = ingest_summary["doc_count"]["status"] in {
+                "match",
+                "skipped",
+            }
         if load_succeeded and _wait_until_query_visible(scenario):
             ticker.emit("run: waiting for query visibility")
             ingest_summary["visibility"] = wait_until_query_visible(
@@ -729,6 +747,24 @@ def execute_benchmark(
         search_under_ingest_events_path.write_text("", encoding="utf-8")
         ticker.emit("run: loading query vectors")
         queries = list(read_records(queries_path, limit=max_queries))
+        query_events_path.write_text("", encoding="utf-8")
+        warmup_query_count = _query_warmup_count(scenario)
+        if warmup_query_count:
+            ticker.emit(f"query: warmup starting queries={warmup_query_count}")
+            run_query_warmup(
+                adapter=adapter,
+                target=target,
+                queries=queries,
+                query_count=warmup_query_count,
+                top_k=_top_k(scenario),
+                consistency=str(scenario.query.get("consistency", "eventual")),
+                include_vectors=bool(scenario.query.get("include_vectors", False)),
+                ground_truth=ground_truth,
+                partition_filter_spec=_partition_filter_spec(scenario),
+                query_filter_spec=query_filter_spec,
+                full_text_query_spec=_full_text_query_spec(scenario),
+            )
+            ticker.emit(f"query: warmup finished queries={warmup_query_count}")
         ticker.emit(f"run: starting query stage query_vectors={len(queries)}")
         query_summary = run_query_stage(
             adapter=adapter,
@@ -2122,9 +2158,13 @@ def run_query_stage(
     events_output.parent.mkdir(parents=True, exist_ok=True)
     query_list = list(queries)
     ticker = ProgressTicker(progress)
-    _validate_partition_filter_query_records(query_list, partition_filter_spec)
-    _validate_query_filter_ground_truth(query_list, query_filter_spec, ground_truth)
-    _validate_full_text_query_records(query_list, full_text_query_spec)
+    _validate_query_inputs(
+        query_list,
+        ground_truth=ground_truth,
+        partition_filter_spec=partition_filter_spec,
+        query_filter_spec=query_filter_spec,
+        full_text_query_spec=full_text_query_spec,
+    )
     if not query_list:
         events_output.write_text("", encoding="utf-8")
         return _query_summary(
@@ -2214,6 +2254,71 @@ def run_query_stage(
         query_filter_spec=query_filter_spec,
         full_text_query_spec=full_text_query_spec,
     )
+
+
+def run_query_warmup(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    queries: Sequence[VectorRecord],
+    query_count: int,
+    top_k: int,
+    consistency: str,
+    include_vectors: bool,
+    ground_truth: Mapping[str, GroundTruthEntry],
+    partition_filter_spec: PartitionFilterSpec | None = None,
+    query_filter_spec: LogicalFilterSpec | None = None,
+    full_text_query_spec: FullTextQuerySpec | None = None,
+) -> None:
+    """Run unrecorded queries to warm the executor before measured stages."""
+
+    if not queries:
+        raise ConfigError(
+            "scenario.query.warmup requires query vectors, but none are available"
+        )
+    _validate_query_inputs(
+        queries,
+        ground_truth=ground_truth,
+        partition_filter_spec=partition_filter_spec,
+        query_filter_spec=query_filter_spec,
+        full_text_query_spec=full_text_query_spec,
+    )
+    for query_index in range(1, query_count + 1):
+        query = queries[(query_index - 1) % len(queries)]
+        event = execute_query_once(
+            adapter=adapter,
+            target=target,
+            query=query,
+            query_index=query_index,
+            query_stage_index=None,
+            worker_index=None,
+            top_k=top_k,
+            consistency=consistency,
+            include_vectors=include_vectors,
+            ground_truth=ground_truth,
+            partition_filter_spec=partition_filter_spec,
+            query_filter_spec=query_filter_spec,
+            full_text_query_spec=full_text_query_spec,
+        )
+        if event["status"] != "ok":
+            raise RuntimeError(
+                f"warmup query {query_index} failed: "
+                f"{event.get('error_type', 'UnknownError')}: "
+                f"{event.get('error_message', 'query failed')}"
+            )
+
+
+def _validate_query_inputs(
+    queries: Sequence[VectorRecord],
+    *,
+    ground_truth: Mapping[str, GroundTruthEntry],
+    partition_filter_spec: PartitionFilterSpec | None,
+    query_filter_spec: LogicalFilterSpec | None,
+    full_text_query_spec: FullTextQuerySpec | None,
+) -> None:
+    _validate_partition_filter_query_records(queries, partition_filter_spec)
+    _validate_query_filter_ground_truth(queries, query_filter_spec, ground_truth)
+    _validate_full_text_query_records(queries, full_text_query_spec)
 
 
 def run_staged_query_stage(
@@ -3481,6 +3586,8 @@ def wait_until_doc_count(
     adapter: VectorDBAdapter,
     target: TargetConfig,
     expected: int,
+    baseline: CollectionStats | None = None,
+    load_changed_data: bool = False,
     timeout_seconds: float,
     poll_interval_seconds: float,
     progress: ProgressCallback | None = None,
@@ -3497,15 +3604,20 @@ def wait_until_doc_count(
     attempts = 0
     observed: int | None = None
     collection_status: str | None = None
-    matched = False
+    observed_data_updated_at: datetime | int | None = None
+    data_updated_after_baseline: bool | None = None
+    status = "timeout"
     last_error: dict[str, str] | None = None
     started = time.perf_counter()
     deadline = started + timeout_seconds
     ticker.emit(
-        f"doc_count: waiting expected={expected} timeout_seconds={timeout_seconds}"
+        f"doc_count: waiting expected={expected} "
+        f"baseline_num_docs={baseline.num_docs if baseline else None} "
+        f"timeout_seconds={timeout_seconds}"
     )
     while True:
         attempts += 1
+        matched = False
         try:
             stats = adapter.collection_stats(target)
         except Exception as exc:  # noqa: BLE001
@@ -3517,8 +3629,26 @@ def wait_until_doc_count(
             last_error = None
             observed = stats.num_docs
             collection_status = stats.status
-            matched = stats.ready and observed == expected
+            observed_data_updated_at = stats.data_updated_at
+            requires_head_advance = load_changed_data and (
+                stats.supports_data_updated_at
+                or (baseline is not None and baseline.supports_data_updated_at)
+            )
+            data_updated_after_baseline = (
+                _data_updated_after_baseline(baseline, stats)
+                if requires_head_advance
+                else None
+            )
+            if observed is not None and observed > expected:
+                status = "over_count"
+                break
+            matched = (
+                stats.ready
+                and observed == expected
+                and data_updated_after_baseline is not False
+            )
         if matched:
+            status = "match"
             break
         ticker.maybe(
             "doc_count: progress "
@@ -3532,7 +3662,6 @@ def wait_until_doc_count(
         time.sleep(min(poll_interval_seconds, remaining))
 
     duration_seconds = time.perf_counter() - started
-    status = "match" if matched else "timeout"
     ticker.emit(
         f"doc_count: finished status={status} observed={observed}/{expected} "
         f"duration_seconds={duration_seconds:.1f}"
@@ -3542,6 +3671,13 @@ def wait_until_doc_count(
         "status": status,
         "expected": expected,
         "observed": observed,
+        "baseline_num_docs": baseline.num_docs if baseline else None,
+        "baseline_data_updated_at": (
+            _timestamp_text(baseline.data_updated_at) if baseline else None
+        ),
+        "observed_data_updated_at": _timestamp_text(observed_data_updated_at),
+        "load_changed_data": load_changed_data,
+        "data_updated_after_baseline": data_updated_after_baseline,
         "collection_status": collection_status,
         "attempts": attempts,
         "duration_seconds": duration_seconds,
@@ -3550,6 +3686,30 @@ def wait_until_doc_count(
     if last_error is not None:
         summary.update(last_error)
     return summary
+
+
+def _data_updated_after_baseline(
+    baseline: CollectionStats | None,
+    observed: CollectionStats,
+) -> bool:
+    if not observed.supports_data_updated_at or observed.data_updated_at is None:
+        return False
+    baseline_updated_at = (
+        baseline.data_updated_at
+        if baseline is not None and baseline.supports_data_updated_at
+        else None
+    )
+    if baseline_updated_at is None:
+        return True
+    if type(observed.data_updated_at) is not type(baseline_updated_at):
+        return False
+    return observed.data_updated_at > baseline_updated_at
+
+
+def _timestamp_text(value: datetime | int | None) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value) if value is not None else None
 
 
 def skipped_doc_count_summary(
@@ -4229,8 +4389,10 @@ def _load_failure_reason(load_summary: Mapping[str, Any]) -> str | None:
         return "load_failed"
     for wait_name in ("doc_count", "visibility"):
         wait = load_summary.get(wait_name)
-        if isinstance(wait, Mapping) and wait.get("status") == "timeout":
-            return f"{wait_name}_timeout"
+        if isinstance(wait, Mapping):
+            status = wait.get("status")
+            if status in {"timeout", "over_count"}:
+                return f"{wait_name}_{status}"
     return None
 
 
@@ -5294,6 +5456,15 @@ def _query_stages(scenario: ScenarioConfig) -> list[dict[str, Any]] | None:
         dict(_as_stage_mapping(stage, stage_index=index))
         for index, stage in enumerate(stages, start=1)
     ]
+
+
+def _query_warmup_count(scenario: ScenarioConfig) -> int:
+    warmup = scenario.query.get("warmup")
+    if warmup is None:
+        return 0
+    if not isinstance(warmup, Mapping):
+        raise ConfigError("scenario.query.warmup must be a mapping")
+    return warmup["query_count"] if warmup["enabled"] else 0
 
 
 def _partition_filter_spec(scenario: ScenarioConfig) -> PartitionFilterSpec | None:
