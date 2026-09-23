@@ -249,6 +249,9 @@ def _render_markdown(runs: list[RunReport]) -> str:
         lines.append("- No warnings detected from the available summaries.")
     lines.extend(
         [
+            "- For LambdaDB, `server_took_ms` is the coordinator's whole query time "
+            "for routing, fan-out, retrieve, and merge; it excludes the gateway "
+            "and transport.",
             "- Cost assumptions are not normalized yet; values are reported as N/A.",
             "",
             "## Generated Artifacts",
@@ -538,9 +541,15 @@ def _warning_lines(runs: list[RunReport]) -> list[str]:
     for run in runs:
         target = _target_label(run)
         status = run.summary.get("status")
+        tool = _mapping(run.manifest.get("tool"))
         if status != "completed":
             warnings.append(f"{target}: run status is {_fmt(status)}.")
-        if _mapping(run.manifest.get("tool")).get("git_dirty") is True:
+        if tool.get("git_commit") is None:
+            warnings.append(
+                f"{target}: benchmark source commit is unavailable; "
+                "the run cannot be traced to a lambdadb-bench revision."
+            )
+        if tool.get("git_dirty") is True:
             warnings.append(
                 f"{target}: lambdadb-bench had uncommitted changes during the run."
             )

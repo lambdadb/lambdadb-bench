@@ -79,6 +79,96 @@ query:
     assert scenario.query["stages"][0]["max_requests"] == 100
 
 
+def test_load_scenario_accepts_query_warmup(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 100
+  dimensions: 2
+load:
+  write_mode: upsert
+query:
+  query_count: 10
+  query_source: heldout_dataset_vectors
+  warmup:
+    enabled: true
+    query_count: 3
+""",
+        encoding="utf-8",
+    )
+
+    scenario = load_scenario(scenario_path)
+
+    assert scenario.query["warmup"] == {"enabled": True, "query_count": 3}
+
+
+def test_load_scenario_rejects_unknown_query_keys(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 100
+  dimensions: 2
+load:
+  write_mode: upsert
+query:
+  consistency: eventual
+  warmup_count: 3
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="unknown scenario.query key.*warmup_count"):
+        load_scenario(scenario_path)
+
+
+def test_load_scenario_rejects_unknown_query_warmup_keys(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 100
+  dimensions: 2
+load:
+  write_mode: upsert
+query:
+  warmup:
+    enabled: true
+    query_count: 3
+    concurrency: 2
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="scenario.query.warmup.*concurrency"):
+        load_scenario(scenario_path)
+
+
+def test_load_scenario_requires_query_warmup_enabled_flag(tmp_path) -> None:
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        """
+name: smoke
+dataset:
+  rows: 100
+  dimensions: 2
+load:
+  write_mode: upsert
+query:
+  warmup:
+    query_count: 3
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="scenario.query.warmup.enabled is required"):
+        load_scenario(scenario_path)
+
+
 def test_load_scenario_accepts_euclidean_metric(tmp_path) -> None:
     scenario_path = tmp_path / "scenario.yaml"
     scenario_path.write_text(

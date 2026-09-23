@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from threading import Lock
 from typing import Any
 
@@ -258,19 +259,77 @@ class IndexingAdapter(FakeAdapter):
     def collection_stats(self, target: TargetConfig) -> CollectionStats:
         self.stats_calls += 1
         self.calls.append("stats")
-        if self.stats_calls <= self.stats_errors:
+        if self.upserted and self.stats_calls <= self.stats_errors + 1:
             raise RuntimeError("describe unavailable")
         loaded = sum(len(batch) for batch in self.upserted)
-        indexed = (
-            self.polls_until_indexed is not None
-            and self.stats_calls > self.polls_until_indexed
+        if not self.upserted:
+            return CollectionStats(ready=True, num_docs=0)
+        polls_after_load = self.stats_calls - 1
+        indexed = self.polls_until_indexed is not None and (
+            polls_after_load > self.polls_until_indexed
         )
-        return CollectionStats(ready=True, num_docs=loaded if indexed else loaded - 1)
+        return CollectionStats(
+            ready=True,
+            num_docs=loaded if indexed else max(loaded - 1, 0),
+        )
 
     def query(self, target: TargetConfig, **kwargs: Any) -> QueryResult:
         self.calls.append("query")
         result = super().query(target, **kwargs)
         return replace(result, server_took_ms=float(self.query_calls))
+
+
+class HeadAdvancingAdapter(IndexingAdapter):
+    baseline_head = datetime(2026, 9, 23, tzinfo=UTC)
+    updated_head = datetime(2026, 9, 23, 0, 0, 5, tzinfo=UTC)
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.head_polls = 0
+
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        stats = super().collection_stats(target)
+        if not self.upserted:
+            return replace(
+                stats,
+                num_docs=3,
+                data_updated_at=self.baseline_head,
+                supports_data_updated_at=True,
+            )
+        self.head_polls += 1
+        updated_at = (
+            self.baseline_head if self.head_polls <= 2 else self.updated_head
+        )
+        return replace(
+            stats,
+            num_docs=3,
+            data_updated_at=updated_at,
+            supports_data_updated_at=True,
+        )
+
+
+class PreexistingDocsAdapter(IndexingAdapter):
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        stats = super().collection_stats(target)
+        return replace(stats, num_docs=(stats.num_docs or 0) + 4)
+
+
+class NeverPublishedAdapter(FakeAdapter):
+    capabilities = replace(FakeAdapter.capabilities, supports_collection_stats=True)
+    head = 1790121600000
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stats_calls = 0
+
+    def collection_stats(self, target: TargetConfig) -> CollectionStats:
+        self.stats_calls += 1
+        return CollectionStats(
+            ready=True,
+            num_docs=3,
+            data_updated_at=self.head,
+            supports_data_updated_at=True,
+        )
 
 
 def make_scenario(
@@ -293,6 +352,7 @@ def make_scenario(
     metric: str = "cosine",
     delete_order: str | None = None,
     load_options: dict[str, Any] | None = None,
+    query_warmup: dict[str, Any] | None = None,
 ) -> ScenarioConfig:
     query: dict[str, Any] = {
         "top_k": top_k,
@@ -301,6 +361,8 @@ def make_scenario(
     }
     if stages is not None:
         query["stages"] = stages
+    if query_warmup is not None:
+        query["warmup"] = query_warmup
     if partition_filter:
         query["partition_filter"] = {
             "field": "metadata.url",
@@ -1444,15 +1506,208 @@ def test_execute_benchmark_waits_for_loaded_doc_count_before_queries(
     )
 
     doc_count = result.summary["load"]["doc_count"]
+    checkpoint = json.loads(result.load_checkpoint_path.read_text(encoding="utf-8"))
     assert result.summary["status"] == "completed"
     assert doc_count["status"] == "match"
     assert doc_count["expected"] == 3
     assert doc_count["observed"] == 3
     assert doc_count["attempts"] == 3
     assert doc_count["duration_seconds"] > 0
-    assert adapter.calls == ["stats", "stats", "stats", "query"]
-    assert "doc_count: waiting expected=3 timeout_seconds=3600.0" in progress
+    assert adapter.calls == ["stats", "stats", "stats", "stats", "query"]
+    assert any(
+        line.startswith("doc_count: waiting expected=3")
+        and "timeout_seconds=3600.0" in line
+        for line in progress
+    )
     assert any(line.startswith("doc_count: finished status=match") for line in progress)
+    assert checkpoint["publish_wait"]["completed"] is True
+    assert checkpoint["publish_wait"]["result"]["status"] == "match"
+
+
+def test_doc_count_wait_requires_head_advance_when_load_updates_existing_docs(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(load_options={"doc_count_poll_interval": "1ms"})
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = HeadAdvancingAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+
+    doc_count = result.summary["load"]["doc_count"]
+    assert doc_count["status"] == "match"
+    assert doc_count["baseline_num_docs"] == 3
+    assert doc_count["baseline_data_updated_at"] == adapter.baseline_head.isoformat()
+    assert doc_count["observed_data_updated_at"] == adapter.updated_head.isoformat()
+    assert doc_count["data_updated_after_baseline"] is True
+    assert doc_count["attempts"] == 3
+
+
+def test_resume_load_continues_unfinished_publish_wait_from_saved_baseline(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(
+        load_options={
+            "doc_count_timeout": "5ms",
+            "doc_count_poll_interval": "1ms",
+        }
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    output_dir = tmp_path / "result"
+
+    first = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=NeverPublishedAdapter(),
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=output_dir,
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+    )
+    checkpoint = json.loads(first.load_checkpoint_path.read_text(encoding="utf-8"))
+
+    resumed_adapter = NeverPublishedAdapter()
+    resumed = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=resumed_adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=output_dir,
+        dataset_dir=dataset.output_dir,
+        load_only=True,
+        resume_load=True,
+    )
+
+    resumed_wait = resumed.summary["load"]["doc_count"]
+    assert first.summary["load"]["doc_count"]["status"] == "timeout"
+    assert resumed.summary["status"] == "failed"
+    assert resumed.summary["load"]["records"] == 0
+    assert resumed.summary["load"]["skipped_records"] == 3
+    assert resumed_wait["status"] == "timeout"
+    assert resumed_wait["baseline_data_updated_at"] == (
+        str(NeverPublishedAdapter.head)
+    )
+    assert resumed_wait["data_updated_after_baseline"] is False
+    assert resumed_wait["attempts"] > 1
+    assert resumed_adapter.stats_calls == resumed_wait["attempts"]
+
+    publish_wait = checkpoint["publish_wait"]
+    assert publish_wait["baseline"]["num_docs"] == 3
+    assert publish_wait["baseline"]["data_updated_at"] == NeverPublishedAdapter.head
+    assert publish_wait["load_changed_data"] is True
+    assert publish_wait["completed"] is False
+
+
+def test_doc_count_wait_fails_immediately_when_observed_exceeds_expected(
+    tmp_path,
+) -> None:
+    scenario = make_scenario()
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = PreexistingDocsAdapter()
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        max_queries=1,
+    )
+
+    doc_count = result.summary["load"]["doc_count"]
+    assert result.summary["status"] == "failed"
+    assert result.summary["query"]["skip_reason"] == "doc_count_over_count"
+    assert doc_count["status"] == "over_count"
+    assert doc_count["observed"] == 7
+    assert doc_count["expected"] == 3
+    assert doc_count["attempts"] == 1
+    assert adapter.stats_calls == 2
+    assert adapter.query_calls == 0
+
+
+def test_query_warmup_runs_after_doc_count_wait_without_recording_results(
+    tmp_path,
+) -> None:
+    scenario = make_scenario(
+        query_warmup={"enabled": True, "query_count": 3},
+        load_options={"doc_count_poll_interval": "1ms"},
+    )
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = IndexingAdapter()
+    progress: list[str] = []
+
+    result = execute_benchmark(
+        scenario=scenario,
+        target=target,
+        adapter=adapter,
+        scenario_path=scenario_path,
+        target_path=target_path,
+        output_dir=tmp_path / "result",
+        dataset_dir=dataset.output_dir,
+        max_queries=1,
+        progress=progress.append,
+    )
+
+    query_events = [
+        json.loads(line)
+        for line in result.query_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert adapter.query_calls == 4
+    assert result.summary["query"]["queries"] == 1
+    assert result.summary["query"]["server_took_ms"]["p50"] == 4.0
+    assert len(query_events) == 1
+    assert query_events[0]["server_took_ms"] == 4.0
+    doc_count_finished = next(
+        index
+        for index, line in enumerate(progress)
+        if line.startswith("doc_count: finished status=match")
+    )
+    assert doc_count_finished < progress.index("query: warmup starting queries=3")
+    assert progress.index("query: warmup finished queries=3") < progress.index(
+        "query: starting one_pass queries=1"
+    )
+
+
+def test_query_warmup_failure_stops_before_measured_queries(tmp_path) -> None:
+    scenario = make_scenario(query_warmup={"enabled": True, "query_count": 1})
+    target = make_target()
+    scenario_path, target_path = write_configs(tmp_path, scenario, target)
+    dataset = prepare_fixture_dataset(tmp_path, scenario)
+    adapter = FakeAdapter(fail_every=1)
+
+    with pytest.raises(RuntimeError, match="warmup query 1 failed"):
+        execute_benchmark(
+            scenario=scenario,
+            target=target,
+            adapter=adapter,
+            scenario_path=scenario_path,
+            target_path=target_path,
+            output_dir=tmp_path / "result",
+            dataset_dir=dataset.output_dir,
+            max_queries=1,
+        )
+
+    assert adapter.query_calls == 1
 
 
 def test_execute_benchmark_fails_when_doc_count_times_out(tmp_path) -> None:

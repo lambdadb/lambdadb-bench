@@ -22,6 +22,19 @@ VALID_WORKLOADS = {"standard", "search_under_ingest", "full_text_search"}
 VALID_SEARCH_UNDER_INGEST_PATTERNS = {"upload_and_ask", "parallel_upsert_query"}
 VALID_SEARCH_UNDER_INGEST_PROBE_SOURCES = {"queries"}
 VALID_DELETE_ORDERS = {"sequential", "random"}
+VALID_SCENARIO_QUERY_KEYS = {
+    "consistency",
+    "filter",
+    "full_text",
+    "include_vectors",
+    "partition_filter",
+    "processes",
+    "query_count",
+    "query_source",
+    "stages",
+    "top_k",
+    "warmup",
+}
 
 
 class ConfigError(ValueError):
@@ -51,6 +64,8 @@ class ScenarioConfig:
         dataset = _required_mapping(raw, "dataset")
         load = _required_mapping(raw, "load")
         query = _required_mapping(raw, "query")
+        _validate_query_keys(query)
+        _validate_query_warmup(query)
         workload = raw.get("workload", "standard")
         if workload not in VALID_WORKLOADS:
             raise ConfigError(
@@ -563,6 +578,37 @@ def _validate_positive_int(data: Mapping[str, Any], key: str) -> None:
     value = data.get(key)
     if not isinstance(value, int) or value <= 0:
         raise ConfigError(f"{key} must be a positive integer")
+
+
+def _validate_query_keys(query: Mapping[str, Any]) -> None:
+    unknown = sorted(set(query) - VALID_SCENARIO_QUERY_KEYS, key=str)
+    if unknown:
+        formatted = ", ".join(repr(key) for key in unknown)
+        raise ConfigError(f"unknown scenario.query key(s): {formatted}")
+
+
+def _validate_query_warmup(query: Mapping[str, Any]) -> None:
+    if "warmup" not in query:
+        return
+    warmup = _as_dict(query["warmup"], "scenario.query.warmup")
+    unknown = sorted(set(warmup) - {"enabled", "query_count"}, key=str)
+    if unknown:
+        formatted = ", ".join(repr(key) for key in unknown)
+        raise ConfigError(f"unknown scenario.query.warmup key(s): {formatted}")
+
+    if "enabled" not in warmup:
+        raise ConfigError("scenario.query.warmup.enabled is required")
+    enabled = warmup["enabled"]
+    if not isinstance(enabled, bool):
+        raise ConfigError("scenario.query.warmup.enabled must be a boolean")
+    query_count = warmup.get("query_count", 0)
+    if not isinstance(query_count, int) or isinstance(query_count, bool):
+        raise ConfigError("scenario.query.warmup.query_count must be an integer")
+    if query_count < 0 or (enabled and query_count == 0):
+        requirement = "positive" if enabled else "non-negative"
+        raise ConfigError(
+            f"scenario.query.warmup.query_count must be {requirement}"
+        )
 
 
 def _validate_optional_positive_int(data: Mapping[str, Any], key: str) -> None:

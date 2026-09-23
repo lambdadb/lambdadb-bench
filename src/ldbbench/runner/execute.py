@@ -18,7 +18,7 @@ from typing import Any
 
 import msgpack
 
-from ldbbench.adapters.base import VectorDBAdapter, VectorRecord
+from ldbbench.adapters.base import CollectionStats, VectorDBAdapter, VectorRecord
 from ldbbench.config import ConfigError, ScenarioConfig, TargetConfig
 from ldbbench.datasets.deletion import (
     LoadedDeletionPlan,
@@ -374,6 +374,23 @@ def execute_benchmark(
     deletion_state_output_path = out / DELETION_STATE_FILENAME
     summary_path = out / SUMMARY_FILENAME
     workload = scenario.workload
+    load_checkpoint_context = (
+        _load_checkpoint_context(
+            records_path=records_path,
+            records_sha256=records_sha256,
+            json_records_path=json_records_path,
+            dataset_manifest=dataset_manifest,
+            scenario=scenario,
+            target=target,
+            write_mode=str(scenario.load.get("write_mode")),
+            record_shards=record_shards,
+            batch_size=_batch_size(scenario),
+            max_batch_bytes=_max_batch_bytes(scenario),
+            max_records=max_records,
+        )
+        if not query_only
+        else None
+    )
 
     ticker = ProgressTicker(progress)
     ticker.emit(
@@ -604,6 +621,38 @@ def execute_benchmark(
             summary=summary,
         )
 
+    publish_wait_required = (
+        doc_count_wait.enabled and adapter.capabilities.supports_collection_stats
+    )
+    publish_wait_state = None
+    doc_count_baseline = None
+    if not query_only:
+        assert load_checkpoint_context is not None
+        if resume_load:
+            checkpoint = _read_resume_load_checkpoint(
+                load_checkpoint_path,
+                context=load_checkpoint_context,
+            )
+            publish_wait_state = _resume_publish_wait_state(
+                checkpoint,
+                enabled=doc_count_wait.enabled,
+                required=publish_wait_required,
+            )
+            doc_count_baseline = _publish_wait_baseline(publish_wait_state)
+        else:
+            if publish_wait_required:
+                try:
+                    doc_count_baseline = adapter.collection_stats(target)
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"failed to capture collection baseline before load: {exc}"
+                    ) from exc
+            publish_wait_state = _new_publish_wait_state(
+                enabled=doc_count_wait.enabled,
+                required=publish_wait_required,
+                baseline=doc_count_baseline,
+            )
+
     if query_only:
         ticker.emit("run: skipping load query_only=true")
         ingest_events_path.write_text("", encoding="utf-8")
@@ -626,19 +675,8 @@ def execute_benchmark(
             processes=_load_processes(scenario),
             events_path=ingest_events_path,
             checkpoint_path=load_checkpoint_path,
-            checkpoint_context=_load_checkpoint_context(
-                records_path=records_path,
-                records_sha256=records_sha256,
-                json_records_path=json_records_path,
-                dataset_manifest=dataset_manifest,
-                scenario=scenario,
-                target=target,
-                write_mode=str(scenario.load.get("write_mode")),
-                record_shards=record_shards,
-                batch_size=_batch_size(scenario),
-                max_batch_bytes=_max_batch_bytes(scenario),
-                max_records=max_records,
-            ),
+            checkpoint_context=load_checkpoint_context,
+            publish_wait_state=publish_wait_state,
             resume_load=resume_load,
             progress=progress,
         )
@@ -653,23 +691,56 @@ def execute_benchmark(
             expected_docs = (
                 ingest_summary["records"] + ingest_summary["skipped_records"]
             )
+            assert publish_wait_state is not None
+            publish_wait_state["load_changed_data"] = bool(
+                publish_wait_state.get("load_changed_data")
+            ) or ingest_summary["records"] > 0
             if doc_count_wait.enabled:
-                ingest_summary["doc_count"] = wait_until_doc_count(
-                    adapter=adapter,
-                    target=target,
-                    expected=expected_docs,
-                    timeout_seconds=doc_count_wait.timeout_seconds,
-                    poll_interval_seconds=doc_count_wait.poll_interval_seconds,
-                    progress=progress,
-                )
+                if publish_wait_required and publish_wait_state["completed"]:
+                    saved_result = publish_wait_state.get("result")
+                    if not isinstance(saved_result, Mapping) or (
+                        saved_result.get("status") != "match"
+                    ):
+                        raise ConfigError(
+                            "load checkpoint marks the publish wait complete "
+                            "without a matching result"
+                        )
+                    doc_count_summary = dict(saved_result)
+                else:
+                    doc_count_summary = wait_until_doc_count(
+                        adapter=adapter,
+                        target=target,
+                        expected=expected_docs,
+                        baseline=doc_count_baseline,
+                        load_changed_data=publish_wait_state["load_changed_data"],
+                        timeout_seconds=doc_count_wait.timeout_seconds,
+                        poll_interval_seconds=doc_count_wait.poll_interval_seconds,
+                        progress=progress,
+                    )
             else:
                 ticker.emit("doc_count: skipped reason=disabled_by_scenario")
-                ingest_summary["doc_count"] = skipped_doc_count_summary(
+                doc_count_summary = skipped_doc_count_summary(
                     enabled=False,
                     expected=expected_docs,
                     reason="disabled_by_scenario",
                 )
-            load_succeeded = ingest_summary["doc_count"]["status"] != "timeout"
+            ingest_summary["doc_count"] = doc_count_summary
+            publish_wait_state["completed"] = doc_count_summary["status"] in {
+                "match",
+                "skipped",
+            }
+            publish_wait_state["status"] = doc_count_summary["status"]
+            publish_wait_state["result"] = doc_count_summary
+            assert load_checkpoint_context is not None
+            _persist_load_checkpoint_publish_wait(
+                load_checkpoint_path,
+                context=load_checkpoint_context,
+                state=publish_wait_state,
+            )
+            load_succeeded = ingest_summary["doc_count"]["status"] in {
+                "match",
+                "skipped",
+            }
         if load_succeeded and _wait_until_query_visible(scenario):
             ticker.emit("run: waiting for query visibility")
             ingest_summary["visibility"] = wait_until_query_visible(
@@ -729,6 +800,24 @@ def execute_benchmark(
         search_under_ingest_events_path.write_text("", encoding="utf-8")
         ticker.emit("run: loading query vectors")
         queries = list(read_records(queries_path, limit=max_queries))
+        query_events_path.write_text("", encoding="utf-8")
+        warmup_query_count = _query_warmup_count(scenario)
+        if warmup_query_count:
+            ticker.emit(f"query: warmup starting queries={warmup_query_count}")
+            run_query_warmup(
+                adapter=adapter,
+                target=target,
+                queries=queries,
+                query_count=warmup_query_count,
+                top_k=_top_k(scenario),
+                consistency=str(scenario.query.get("consistency", "eventual")),
+                include_vectors=bool(scenario.query.get("include_vectors", False)),
+                ground_truth=ground_truth,
+                partition_filter_spec=_partition_filter_spec(scenario),
+                query_filter_spec=query_filter_spec,
+                full_text_query_spec=_full_text_query_spec(scenario),
+            )
+            ticker.emit(f"query: warmup finished queries={warmup_query_count}")
         ticker.emit(f"run: starting query stage query_vectors={len(queries)}")
         query_summary = run_query_stage(
             adapter=adapter,
@@ -806,6 +895,7 @@ def run_load_stage(
     events_path: str | Path,
     checkpoint_path: str | Path | None = None,
     checkpoint_context: Mapping[str, Any] | None = None,
+    publish_wait_state: Mapping[str, Any] | None = None,
     resume_load: bool = False,
     visibility_sample_size: int = 10,
     progress: ProgressCallback | None = None,
@@ -814,6 +904,8 @@ def run_load_stage(
     events_output.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_output = Path(checkpoint_path) if checkpoint_path is not None else None
     checkpoint_context_dict = dict(checkpoint_context or {})
+    if publish_wait_state is not None:
+        checkpoint_context_dict["publish_wait"] = dict(publish_wait_state)
     resumed_from_batch_index = _resume_batch_index(
         checkpoint_output,
         context=checkpoint_context_dict,
@@ -2016,7 +2108,7 @@ def _resume_batch_index(
         raise ConfigError(f"load checkpoint {checkpoint_path} does not exist")
     checkpoint = _read_load_checkpoint(checkpoint_path)
     checkpoint_context = checkpoint.get("context")
-    if checkpoint_context != dict(context):
+    if checkpoint_context != _load_checkpoint_context_only(context):
         raise ConfigError(
             "load checkpoint does not match this run's dataset, target, or "
             "load settings"
@@ -2027,6 +2119,173 @@ def _resume_batch_index(
             f"load checkpoint {checkpoint_path} has an invalid batch watermark"
         )
     return batch_index
+
+
+def _read_resume_load_checkpoint(
+    checkpoint_path: Path,
+    *,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not checkpoint_path.exists():
+        raise ConfigError(f"load checkpoint {checkpoint_path} does not exist")
+    checkpoint = _read_load_checkpoint(checkpoint_path)
+    if checkpoint.get("context") != dict(context):
+        raise ConfigError(
+            "load checkpoint does not match this run's dataset, target, or "
+            "load settings"
+        )
+    return checkpoint
+
+
+def _new_publish_wait_state(
+    *,
+    enabled: bool,
+    required: bool,
+    baseline: CollectionStats | None,
+) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "baseline": _collection_stats_checkpoint(baseline) if baseline else None,
+        "load_changed_data": False,
+        "completed": not required,
+        "status": "pending" if required else "skipped",
+        "result": None,
+    }
+
+
+def _resume_publish_wait_state(
+    checkpoint: Mapping[str, Any],
+    *,
+    enabled: bool,
+    required: bool,
+) -> dict[str, Any]:
+    value = checkpoint.get("publish_wait")
+    if value is None:
+        if required:
+            raise ConfigError(
+                "load checkpoint has no publish-wait baseline; it cannot be "
+                "resumed safely with doc-count waiting enabled"
+            )
+        return _new_publish_wait_state(
+            enabled=enabled,
+            required=False,
+            baseline=None,
+        )
+    if not isinstance(value, Mapping):
+        raise ConfigError("load checkpoint has an invalid publish-wait state")
+    state = dict(value)
+    if state.get("enabled") is not enabled:
+        raise ConfigError(
+            "load checkpoint publish-wait setting does not match this run"
+        )
+    if not isinstance(state.get("completed"), bool):
+        raise ConfigError("load checkpoint has an invalid publish-wait completion flag")
+    if not isinstance(state.get("load_changed_data"), bool):
+        raise ConfigError("load checkpoint has an invalid publish-wait load flag")
+    if required:
+        _restore_collection_stats_checkpoint(state.get("baseline"))
+    prior_records = checkpoint.get("records_loaded", 0)
+    state["load_changed_data"] = state["load_changed_data"] or (
+        isinstance(prior_records, int)
+        and not isinstance(prior_records, bool)
+        and prior_records > 0
+    )
+    return state
+
+
+def _publish_wait_baseline(state: Mapping[str, Any]) -> CollectionStats | None:
+    baseline = state.get("baseline")
+    return (
+        _restore_collection_stats_checkpoint(baseline)
+        if baseline is not None
+        else None
+    )
+
+
+def _collection_stats_checkpoint(
+    stats: CollectionStats | None,
+) -> dict[str, Any] | None:
+    if stats is None:
+        return None
+    timestamp = stats.data_updated_at
+    if isinstance(timestamp, datetime):
+        serialized_timestamp: str | int | None = timestamp.isoformat()
+        timestamp_type = "datetime"
+    elif isinstance(timestamp, int) and not isinstance(timestamp, bool):
+        serialized_timestamp = timestamp
+        timestamp_type = "integer"
+    else:
+        serialized_timestamp = None
+        timestamp_type = None
+    return {
+        "num_docs": stats.num_docs,
+        "data_updated_at": serialized_timestamp,
+        "data_updated_at_type": timestamp_type,
+        "supports_data_updated_at": stats.supports_data_updated_at,
+    }
+
+
+def _restore_collection_stats_checkpoint(value: Any) -> CollectionStats:
+    if not isinstance(value, Mapping):
+        raise ConfigError("load checkpoint has no valid publish-wait baseline")
+    num_docs = value.get("num_docs")
+    if num_docs is not None and (
+        not isinstance(num_docs, int) or isinstance(num_docs, bool)
+    ):
+        raise ConfigError("load checkpoint has an invalid baseline document count")
+    supports_timestamp = value.get("supports_data_updated_at")
+    if not isinstance(supports_timestamp, bool):
+        raise ConfigError("load checkpoint has an invalid baseline data-head flag")
+    timestamp_value = value.get("data_updated_at")
+    timestamp_type = value.get("data_updated_at_type")
+    if timestamp_type == "datetime" and isinstance(timestamp_value, str):
+        try:
+            timestamp: datetime | int | None = datetime.fromisoformat(timestamp_value)
+        except ValueError as exc:
+            raise ConfigError(
+                "load checkpoint has an invalid baseline data-head timestamp"
+            ) from exc
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        else:
+            timestamp = timestamp.astimezone(UTC)
+    elif (
+        timestamp_type == "integer"
+        and isinstance(timestamp_value, int)
+        and not isinstance(timestamp_value, bool)
+    ):
+        timestamp = timestamp_value
+    elif timestamp_type is None and timestamp_value is None:
+        timestamp = None
+    else:
+        raise ConfigError("load checkpoint has an invalid baseline data-head timestamp")
+    return CollectionStats(
+        ready=True,
+        num_docs=num_docs,
+        data_updated_at=timestamp,
+        supports_data_updated_at=supports_timestamp,
+    )
+
+
+def _persist_load_checkpoint_publish_wait(
+    checkpoint_path: Path,
+    *,
+    context: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> None:
+    checkpoint = _read_resume_load_checkpoint(checkpoint_path, context=context)
+    checkpoint["publish_wait"] = dict(state)
+    checkpoint["updated_at"] = datetime.now(UTC).isoformat()
+    checkpoint_path.write_text(
+        json.dumps(checkpoint, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _load_checkpoint_context_only(context: Mapping[str, Any]) -> dict[str, Any]:
+    context_only = dict(context)
+    context_only.pop("publish_wait", None)
+    return context_only
 
 
 def _read_load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
@@ -2064,12 +2323,14 @@ def _write_load_checkpoint(
     if checkpoint_path is None:
         return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_context = dict(context)
+    publish_wait = checkpoint_context.pop("publish_wait", None)
     payload = {
         "schema_version": LOAD_CHECKPOINT_SCHEMA_VERSION,
         "stage": "load",
         "status": status,
         "updated_at": datetime.now(UTC).isoformat(),
-        "context": dict(context),
+        "context": checkpoint_context,
         "resumed_from_batch_index": resumed_from_batch_index,
         "highest_contiguous_successful_batch_index": (
             highest_contiguous_successful_batch_index
@@ -2085,6 +2346,8 @@ def _write_load_checkpoint(
         "upsert_attempt_duration_seconds": upsert_attempt_duration_seconds,
         "errors": errors,
     }
+    if isinstance(publish_wait, Mapping):
+        payload["publish_wait"] = dict(publish_wait)
     checkpoint_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -2122,9 +2385,13 @@ def run_query_stage(
     events_output.parent.mkdir(parents=True, exist_ok=True)
     query_list = list(queries)
     ticker = ProgressTicker(progress)
-    _validate_partition_filter_query_records(query_list, partition_filter_spec)
-    _validate_query_filter_ground_truth(query_list, query_filter_spec, ground_truth)
-    _validate_full_text_query_records(query_list, full_text_query_spec)
+    _validate_query_inputs(
+        query_list,
+        ground_truth=ground_truth,
+        partition_filter_spec=partition_filter_spec,
+        query_filter_spec=query_filter_spec,
+        full_text_query_spec=full_text_query_spec,
+    )
     if not query_list:
         events_output.write_text("", encoding="utf-8")
         return _query_summary(
@@ -2214,6 +2481,71 @@ def run_query_stage(
         query_filter_spec=query_filter_spec,
         full_text_query_spec=full_text_query_spec,
     )
+
+
+def run_query_warmup(
+    *,
+    adapter: VectorDBAdapter,
+    target: TargetConfig,
+    queries: Sequence[VectorRecord],
+    query_count: int,
+    top_k: int,
+    consistency: str,
+    include_vectors: bool,
+    ground_truth: Mapping[str, GroundTruthEntry],
+    partition_filter_spec: PartitionFilterSpec | None = None,
+    query_filter_spec: LogicalFilterSpec | None = None,
+    full_text_query_spec: FullTextQuerySpec | None = None,
+) -> None:
+    """Run unrecorded queries to warm the executor before measured stages."""
+
+    if not queries:
+        raise ConfigError(
+            "scenario.query.warmup requires query vectors, but none are available"
+        )
+    _validate_query_inputs(
+        queries,
+        ground_truth=ground_truth,
+        partition_filter_spec=partition_filter_spec,
+        query_filter_spec=query_filter_spec,
+        full_text_query_spec=full_text_query_spec,
+    )
+    for query_index in range(1, query_count + 1):
+        query = queries[(query_index - 1) % len(queries)]
+        event = execute_query_once(
+            adapter=adapter,
+            target=target,
+            query=query,
+            query_index=query_index,
+            query_stage_index=None,
+            worker_index=None,
+            top_k=top_k,
+            consistency=consistency,
+            include_vectors=include_vectors,
+            ground_truth=ground_truth,
+            partition_filter_spec=partition_filter_spec,
+            query_filter_spec=query_filter_spec,
+            full_text_query_spec=full_text_query_spec,
+        )
+        if event["status"] != "ok":
+            raise RuntimeError(
+                f"warmup query {query_index} failed: "
+                f"{event.get('error_type', 'UnknownError')}: "
+                f"{event.get('error_message', 'query failed')}"
+            )
+
+
+def _validate_query_inputs(
+    queries: Sequence[VectorRecord],
+    *,
+    ground_truth: Mapping[str, GroundTruthEntry],
+    partition_filter_spec: PartitionFilterSpec | None,
+    query_filter_spec: LogicalFilterSpec | None,
+    full_text_query_spec: FullTextQuerySpec | None,
+) -> None:
+    _validate_partition_filter_query_records(queries, partition_filter_spec)
+    _validate_query_filter_ground_truth(queries, query_filter_spec, ground_truth)
+    _validate_full_text_query_records(queries, full_text_query_spec)
 
 
 def run_staged_query_stage(
@@ -3481,6 +3813,8 @@ def wait_until_doc_count(
     adapter: VectorDBAdapter,
     target: TargetConfig,
     expected: int,
+    baseline: CollectionStats | None = None,
+    load_changed_data: bool = False,
     timeout_seconds: float,
     poll_interval_seconds: float,
     progress: ProgressCallback | None = None,
@@ -3497,15 +3831,20 @@ def wait_until_doc_count(
     attempts = 0
     observed: int | None = None
     collection_status: str | None = None
-    matched = False
+    observed_data_updated_at: datetime | int | None = None
+    data_updated_after_baseline: bool | None = None
+    status = "timeout"
     last_error: dict[str, str] | None = None
     started = time.perf_counter()
     deadline = started + timeout_seconds
     ticker.emit(
-        f"doc_count: waiting expected={expected} timeout_seconds={timeout_seconds}"
+        f"doc_count: waiting expected={expected} "
+        f"baseline_num_docs={baseline.num_docs if baseline else None} "
+        f"timeout_seconds={timeout_seconds}"
     )
     while True:
         attempts += 1
+        matched = False
         try:
             stats = adapter.collection_stats(target)
         except Exception as exc:  # noqa: BLE001
@@ -3517,8 +3856,26 @@ def wait_until_doc_count(
             last_error = None
             observed = stats.num_docs
             collection_status = stats.status
-            matched = stats.ready and observed == expected
+            observed_data_updated_at = stats.data_updated_at
+            requires_head_advance = load_changed_data and (
+                stats.supports_data_updated_at
+                or (baseline is not None and baseline.supports_data_updated_at)
+            )
+            data_updated_after_baseline = (
+                _data_updated_after_baseline(baseline, stats)
+                if requires_head_advance
+                else None
+            )
+            if observed is not None and observed > expected:
+                status = "over_count"
+                break
+            matched = (
+                stats.ready
+                and observed == expected
+                and data_updated_after_baseline is not False
+            )
         if matched:
+            status = "match"
             break
         ticker.maybe(
             "doc_count: progress "
@@ -3532,7 +3889,6 @@ def wait_until_doc_count(
         time.sleep(min(poll_interval_seconds, remaining))
 
     duration_seconds = time.perf_counter() - started
-    status = "match" if matched else "timeout"
     ticker.emit(
         f"doc_count: finished status={status} observed={observed}/{expected} "
         f"duration_seconds={duration_seconds:.1f}"
@@ -3542,6 +3898,13 @@ def wait_until_doc_count(
         "status": status,
         "expected": expected,
         "observed": observed,
+        "baseline_num_docs": baseline.num_docs if baseline else None,
+        "baseline_data_updated_at": (
+            _timestamp_text(baseline.data_updated_at) if baseline else None
+        ),
+        "observed_data_updated_at": _timestamp_text(observed_data_updated_at),
+        "load_changed_data": load_changed_data,
+        "data_updated_after_baseline": data_updated_after_baseline,
         "collection_status": collection_status,
         "attempts": attempts,
         "duration_seconds": duration_seconds,
@@ -3550,6 +3913,30 @@ def wait_until_doc_count(
     if last_error is not None:
         summary.update(last_error)
     return summary
+
+
+def _data_updated_after_baseline(
+    baseline: CollectionStats | None,
+    observed: CollectionStats,
+) -> bool:
+    if not observed.supports_data_updated_at or observed.data_updated_at is None:
+        return False
+    baseline_updated_at = (
+        baseline.data_updated_at
+        if baseline is not None and baseline.supports_data_updated_at
+        else None
+    )
+    if baseline_updated_at is None:
+        return True
+    if type(observed.data_updated_at) is not type(baseline_updated_at):
+        return False
+    return observed.data_updated_at > baseline_updated_at
+
+
+def _timestamp_text(value: datetime | int | None) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value) if value is not None else None
 
 
 def skipped_doc_count_summary(
@@ -4229,8 +4616,10 @@ def _load_failure_reason(load_summary: Mapping[str, Any]) -> str | None:
         return "load_failed"
     for wait_name in ("doc_count", "visibility"):
         wait = load_summary.get(wait_name)
-        if isinstance(wait, Mapping) and wait.get("status") == "timeout":
-            return f"{wait_name}_timeout"
+        if isinstance(wait, Mapping):
+            status = wait.get("status")
+            if status in {"timeout", "over_count"}:
+                return f"{wait_name}_{status}"
     return None
 
 
@@ -5294,6 +5683,15 @@ def _query_stages(scenario: ScenarioConfig) -> list[dict[str, Any]] | None:
         dict(_as_stage_mapping(stage, stage_index=index))
         for index, stage in enumerate(stages, start=1)
     ]
+
+
+def _query_warmup_count(scenario: ScenarioConfig) -> int:
+    warmup = scenario.query.get("warmup")
+    if warmup is None:
+        return 0
+    if not isinstance(warmup, Mapping):
+        raise ConfigError("scenario.query.warmup must be a mapping")
+    return warmup["query_count"] if warmup["enabled"] else 0
 
 
 def _partition_filter_spec(scenario: ScenarioConfig) -> PartitionFilterSpec | None:

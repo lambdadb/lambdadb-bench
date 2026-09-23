@@ -51,6 +51,18 @@ metadata:
 
     scenario = load_scenario(scenario_path)
     target = load_target(target_path)
+    sdk_direct_url = {
+        "url": "https://github.com/lambdadb/lambdadb.git",
+        "vcs_info": {
+            "vcs": "git",
+            "commit_id": "fedcba98",
+            "requested_revision": "v0.9.0",
+        },
+    }
+    monkeypatch.setattr(
+        "ldbbench.manifest._sdk_direct_url",
+        lambda _package: sdk_direct_url,
+    )
     paths = initialize_run_artifacts(
         scenario=scenario,
         target=target,
@@ -70,6 +82,7 @@ metadata:
     assert paths.scenario_resolved.exists()
     assert manifest["tool"]["sdk_package"] == "lambdadb"
     assert manifest["tool"]["sdk_version"] == metadata.version("lambdadb")
+    assert manifest["tool"]["sdk_direct_url"] == sdk_direct_url
     assert {"git_commit", "git_dirty"} <= set(manifest["tool"])
     assert manifest["scenario"]["name"] == "smoke"
     assert manifest["scenario"]["query"]["consistency"] == "strong"
