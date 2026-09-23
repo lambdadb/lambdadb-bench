@@ -247,6 +247,10 @@ reports as many documents as were loaded before any query runs (LambdaDB:
 ACTIVE and `numDocs` equal to the loaded count). If that wait times out, the
 run is marked `failed` and queries are skipped with `doc_count_timeout`.
 Adapters that cannot report a document count record the wait as skipped.
+The wait only checks that the indexed count reaches the expected total, so it
+does not confirm that a load which overwrites existing documents without
+changing the count has been applied; comparing against a pre-load baseline is
+follow-up work.
 `ldbbench run` exits with status 1 whenever the run status is `failed`, for
 example after load errors or a wait timeout, so scripts can stop before a
 later `--query-only` run measures an unfinished index.
