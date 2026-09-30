@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
 
 from ldbbench.config import TargetConfig
@@ -94,6 +95,8 @@ class CollectionStats:
     ready: bool
     num_docs: int | None
     status: str | None = None
+    data_updated_at: datetime | int | None = None
+    supports_data_updated_at: bool = False
 
 
 class VectorDBAdapter(Protocol):

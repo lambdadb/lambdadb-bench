@@ -97,18 +97,23 @@ def build_run_manifest(
     endpoint_redacted = redacted_target.get("endpoint")
     metadata = target.metadata
     git_commit, git_dirty = tool_git_state(_tool_direct_url())
+    tool: dict[str, Any] = {
+        "name": TOOL_DISTRIBUTION,
+        "version": __version__,
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+        "sdk_package": sdk_package,
+        "sdk_version": _installed_version(sdk_package) if sdk_package else None,
+    }
+    if sdk_package is not None:
+        sdk_direct_url = _sdk_direct_url(sdk_package)
+        if sdk_direct_url is not None:
+            tool["sdk_direct_url"] = sdk_direct_url
 
     return {
         "run_id": str(uuid.uuid4()),
         "created_at": datetime.now(UTC).isoformat(),
-        "tool": {
-            "name": TOOL_DISTRIBUTION,
-            "version": __version__,
-            "git_commit": git_commit,
-            "git_dirty": git_dirty,
-            "sdk_package": sdk_package,
-            "sdk_version": _installed_version(sdk_package) if sdk_package else None,
-        },
+        "tool": tool,
         "scenario": {
             "name": scenario.name,
             "workload": scenario.workload,
@@ -125,6 +130,7 @@ def build_run_manifest(
                 "consistency": scenario.query.get("consistency", "eventual"),
                 "top_k": scenario.query.get("top_k"),
                 "partition_filter": scenario.query.get("partition_filter"),
+                "warmup": scenario.query.get("warmup"),
             },
             "load": {
                 "write_mode": scenario.load.get("write_mode"),
@@ -198,8 +204,16 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _tool_direct_url() -> dict[str, Any] | None:
+    return _distribution_direct_url(TOOL_DISTRIBUTION)
+
+
+def _sdk_direct_url(package: str) -> dict[str, Any] | None:
+    return _distribution_direct_url(package)
+
+
+def _distribution_direct_url(package: str) -> dict[str, Any] | None:
     try:
-        distribution = importlib_metadata.distribution(TOOL_DISTRIBUTION)
+        distribution = importlib_metadata.distribution(package)
     except importlib_metadata.PackageNotFoundError:
         return None
     text = distribution.read_text("direct_url.json")

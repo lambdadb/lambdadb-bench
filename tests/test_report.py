@@ -101,6 +101,27 @@ def test_generate_report_includes_doc_count_server_took_and_provenance(
     assert query_row["server_took_p99_ms"] == "31.250"
     assert "| 0123abcd | yes | lambdadb | 0.9.0 |" in markdown
     assert "lambdadb-bench had uncommitted changes during the run" in markdown
+    assert "coordinator's whole query time" in markdown
+
+
+def test_generate_report_warns_when_tool_commit_is_missing(tmp_path) -> None:
+    result_dir = write_result(
+        tmp_path,
+        "untraceable",
+        target_label="lambdadb-develop",
+        vendor="lambdadb",
+        load_rps=1200.0,
+        query_qps=700.0,
+    )
+    manifest_path = result_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["tool"] = {"git_commit": None}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = generate_report([result_dir], output_path=tmp_path / "report.md")
+
+    markdown = result.markdown_path.read_text(encoding="utf-8")
+    assert "benchmark source commit is unavailable" in markdown
 
 
 def test_generate_report_includes_parallel_search_under_ingest(tmp_path) -> None:

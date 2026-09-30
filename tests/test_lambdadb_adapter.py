@@ -766,7 +766,12 @@ def test_collection_stats_treats_describe_without_status_as_ready() -> None:
 
     stats = make_adapter(client).collection_stats(make_target())
 
-    assert stats == CollectionStats(ready=True, num_docs=42, status=None)
+    assert stats == CollectionStats(
+        ready=True,
+        num_docs=42,
+        status=None,
+        supports_data_updated_at=True,
+    )
 
 
 def test_collection_stats_is_not_ready_while_collection_is_creating() -> None:
@@ -777,7 +782,12 @@ def test_collection_stats_is_not_ready_while_collection_is_creating() -> None:
 
     stats = make_adapter(client).collection_stats(make_target())
 
-    assert stats == CollectionStats(ready=False, num_docs=0, status="CREATING")
+    assert stats == CollectionStats(
+        ready=False,
+        num_docs=0,
+        status="CREATING",
+        supports_data_updated_at=True,
+    )
 
 
 def test_full_text_query_passes_partition_filter() -> None:
@@ -942,6 +952,7 @@ class DevelopServer:
             "snapshotRetentionInDays": 7,
             "createdAt": 1,
             "updatedAt": 2,
+            "dataUpdatedAt": 1790121600000,
         }
 
 
@@ -975,7 +986,13 @@ def test_sdk_collection_stats_reads_develop_num_docs() -> None:
 
     stats = adapter.collection_stats(make_target())
 
-    assert stats == CollectionStats(ready=True, num_docs=3, status=None)
+    assert stats == CollectionStats(
+        ready=True,
+        num_docs=3,
+        status=None,
+        data_updated_at=1790121600000,
+        supports_data_updated_at=True,
+    )
 
 
 def test_sdk_bulk_upsert_sends_signed_upload_headers() -> None:

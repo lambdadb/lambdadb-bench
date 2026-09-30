@@ -247,10 +247,13 @@ reports as many documents as were loaded before any query runs (LambdaDB:
 ACTIVE and `numDocs` equal to the loaded count). If that wait times out, the
 run is marked `failed` and queries are skipped with `doc_count_timeout`.
 Adapters that cannot report a document count record the wait as skipped.
-The wait only checks that the indexed count reaches the expected total, so it
-does not confirm that a load which overwrites existing documents without
-changing the count has been applied; comparing against a pre-load baseline is
-follow-up work.
+For a fresh collection created with `prepare.mode: create` or
+`prepare.mode: recreate`, count growth to the expected total is a complete
+publication signal. For overwrite loads, a matching count and an advanced
+`dataUpdatedAt` do not prove that the last batch is published: overwritten
+documents do not increase `numDocs`, and the head can advance while other
+batches are still publishing. Those loads have no complete publication signal
+until the server exposes a per-load or per-batch signal.
 `ldbbench run` exits with status 1 whenever the run status is `failed`, for
 example after load errors or a wait timeout, so scripts can stop before a
 later `--query-only` run measures an unfinished index.
@@ -327,11 +330,16 @@ Real runs write:
 
 - `run_manifest.json`: scenario and target fingerprints plus tool provenance:
   `tool.git_commit`, `tool.git_dirty` (uncommitted tracked changes), and the
-  vendor SDK in `tool.sdk_package` and `tool.sdk_version`. The commit comes
-  from the checkout for editable installs and from the recorded commit for git
-  installs; it is `null` when neither is available.
+  vendor SDK in `tool.sdk_package` and `tool.sdk_version`. When available,
+  `tool.sdk_direct_url` records the SDK's PEP 610 install source, including its
+  VCS commit or editable checkout path. The tool commit comes from the checkout
+  for editable installs and from the recorded commit for git installs; it is
+  `null` when neither is available, and reports warn when it is `null`.
 - `ingest_events.jsonl`: one event per upsert batch, including load errors.
 - `load_checkpoint.json`: resumable load watermark and matching load context.
+  Its `publish_wait` state retains the pre-load count/head baseline and wait
+  result so `--resume-load` can continue after a timeout. A checkpoint without
+  that state cannot be resumed safely when collection-stat waiting is enabled.
 - `delete_events.jsonl`: one event per document-ID delete batch in
   `--delete-only` runs.
 - `deletion_state.json`: written by `--delete-only` with the cumulative delete
@@ -342,7 +350,9 @@ Real runs write:
   produce a completed state with visibility marked `skipped`.
 - `query_events.jsonl`: one event per query attempt, including query errors.
   Successful events include `server_took_ms` when the database reports its own
-  query time (LambdaDB `took`).
+  query time (LambdaDB `took`). LambdaDB `took` is the coordinator's whole query
+  time for routing, fan-out, retrieve, and merge; it excludes the gateway and
+  transport.
 - `search_under_ingest_events.jsonl`: one event per upload-and-ask probe when
   `search_under_ingest.pattern: upload_and_ask` is used. Parallel
   upsert/query runs write their operation events to `ingest_events.jsonl` and
@@ -353,7 +363,9 @@ Real runs write:
   applicable. `load.doc_count` records the post-load document-count wait
   (`status`, `expected`, `observed`, `attempts`, `duration_seconds`), and
   `query.server_took_ms` summarizes server-reported query time with the same
-  percentiles as the client-side `query.latency_ms`.
+  percentiles as the client-side `query.latency_ms`. `server_took_ms` is not
+  end-to-end client latency; for LambdaDB it excludes gateway and transport
+  time.
 
 ### Delete-only and search-after-delete runs
 
@@ -731,10 +743,21 @@ Useful load settings:
   requests. The first sharded load path does not support `max_batch_bytes`;
   remove this setting when `sharded_records: true`.
 - `wait_until_doc_count`: when true (the default), wait after the load until the
-  collection is ready and reports every loaded document, including records
-  loaded by an earlier run that `--resume-load` skipped.
+  collection's full `numDocs` count matches this run's expected document count,
+  including records loaded by an earlier run that `--resume-load` skipped. The
+  runner captures `numDocs` and LambdaDB `dataUpdatedAt` before loading; when
+  this run writes records, the count must match and LambdaDB's data head must
+  advance past that baseline. This checks collection-level publication, not
+  query visibility or a sample of documents. On a fresh collection created
+  with `prepare.mode: create` or `prepare.mode: recreate`, `numDocs` growth to
+  the expected total is a complete publication signal. On overwrite loads, a
+  matching count and an advanced `dataUpdatedAt` do not prove that the last
+  batch is published; there is no complete signal until the server exposes a
+  per-load or per-batch signal. An observed count above expected fails
+  immediately. Adapters without collection statistics skip this wait.
 - `doc_count_timeout`: optional duration string, defaults to `1h`. The run fails
-  when the count does not match within this time.
+  when the expected count and required data-head advance do not appear within
+  this time.
 - `doc_count_poll_interval`: optional duration string, defaults to `5s`.
 - `wait_until_query_visible`: when true, wait for a loaded-record sample to be
   visible through vector query before the query stage starts.
@@ -751,6 +774,13 @@ want a fixed-size concurrent query run instead of a duration-based load test.
 The `parallel_upsert_query` search-under-ingest workload also uses
 `query.processes`, with `search_under_ingest.query_concurrency` as the total
 in-flight query count.
+
+`query.warmup` can set `enabled: true` and a positive `query_count`. The runner
+sends that many queries after the post-load waits and before measured query
+stages. Warmup requests are not written to `query_events.jsonl` and do not
+contribute to measured query summaries; the runner cycles through the available
+query vectors when the warmup count is larger than the query set. Unknown keys
+under `scenario.query` are rejected instead of ignored.
 
 Partition-pruned query workloads can set `query.partition_filter` with a target
 field such as `metadata.url` and query metadata source field such as `url`.

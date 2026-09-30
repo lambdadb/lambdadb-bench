@@ -6,6 +6,7 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from threading import Lock, get_ident
 from typing import Any
 
@@ -318,6 +319,8 @@ class LambdaDBAdapter:
             ready=_is_active_collection_status(status),
             num_docs=_collection_num_docs(response),
             status=status,
+            data_updated_at=_collection_data_updated_at(response),
+            supports_data_updated_at=True,
         )
 
     def _client(self, settings: LambdaDBTargetSettings) -> Any:
@@ -545,6 +548,33 @@ def _collection_num_docs(response: Any) -> int | None:
         if isinstance(value, int):
             return value
     return None
+
+
+def _collection_data_updated_at(response: Any) -> datetime | int | None:
+    value = _field_value(response, "data_updated_at")
+    if value is None:
+        value = _field_value(response, "dataUpdatedAt")
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"LambdaDB data_updated_at is not an ISO timestamp: {value!r}"
+            ) from exc
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    raise TypeError(
+        "LambdaDB data_updated_at must be a datetime or ISO timestamp string"
+    )
 
 
 def _field_value(value: Any, key: str) -> Any:
