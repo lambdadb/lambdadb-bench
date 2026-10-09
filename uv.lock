@@ -682,16 +682,16 @@ wheels = [
 
 [[package]]
 name = "lambdadb"
-version = "0.9.0"
+version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpcore" },
     { name = "httpx" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/58/ee/6b348cbd37069e020a913f1384842e8ecee6bfc301acee93bbdd477bc185/lambdadb-0.9.0.tar.gz", hash = "sha256:557cc6e260e7739d33d5c9713c6b453e4a49064290407349ba896e5b7d3fb6d7", size = 82971, upload-time = "2026-09-16T09:48:39.133Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/90/8e/c83348c74b6dfe8f4381b53e6f11681c2fafb3cf3ef101e0f8b7297b43fe/lambdadb-0.12.1.tar.gz", hash = "sha256:de534d5004752a347efd093fdadc59fa245f1d039e0ecec46fd5d15ddf3b0805", size = 90473, upload-time = "2026-10-07T07:25:47.879Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/4e/0801231f770c8f5aa76fa65702379737d2c0d2bcb5158ad7b62a6080cd3e/lambdadb-0.9.0-py3-none-any.whl", hash = "sha256:3913d810a2a720dca164658b3f7e250fcd66c895d576900d3eeb6989b775d809", size = 112861, upload-time = "2026-09-16T09:48:37.658Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/69/727765ec34c020e676c0d020b8d6b6c6462c0b52c70bdc2eeeaaa00dafe3/lambdadb-0.12.1-py3-none-any.whl", hash = "sha256:3fd84c367f4cfca1b69f3dac47502941bebc474b332709e21d9c452136c73eca", size = 119615, upload-time = "2026-10-07T07:25:46.639Z" },
 ]
 
 [[package]]
@@ -722,7 +722,7 @@ groundtruth = [
 requires-dist = [
     { name = "datasets", specifier = ">=2.20" },
     { name = "faiss-cpu", marker = "extra == 'groundtruth'", specifier = ">=1.8.0" },
-    { name = "lambdadb", specifier = ">=0.9.0" },
+    { name = "lambdadb", specifier = ">=0.12.1" },
     { name = "msgpack", specifier = ">=1.1" },
     { name = "numpy", marker = "extra == 'groundtruth'", specifier = ">=1.26" },
     { name = "orjson", specifier = ">=3.11" },
