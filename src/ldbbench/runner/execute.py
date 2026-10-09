@@ -4311,6 +4311,8 @@ def run_parallel_search_under_ingest_stage(
                         include_vectors,
                         dict(ground_truth),
                         None,
+                        None,
+                        None,
                     ),
                     name=f"ldbbench-parallel-query-{index}",
                 )
