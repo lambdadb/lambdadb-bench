@@ -22,6 +22,10 @@ Install the package in editable mode with development dependencies:
 uv sync --extra dev
 ```
 
+For reproducible benchmark runs, use `uv sync --frozen --extra dev` to install
+the versions in `uv.lock`, including LambdaDB SDK 0.12.1. An existing virtual
+environment may still contain an older SDK until it is synchronized.
+
 For FAISS-backed ground truth generation on larger datasets, install the
 optional ground truth dependencies too:
 
@@ -701,6 +705,13 @@ LambdaDB targets with:
   `vector`.
 - `timeout_ms`: per-request SDK timeout in milliseconds. The example targets
   use `30000` to keep long-tail concurrent ingest/query calls bounded.
+- `sdk_retries`: defaults to `false`. LambdaDB SDK automatic retries are disabled
+  so throttling and server errors appear in benchmark events instead of being
+  hidden by retries and backoff. This applies to all SDK operations, including
+  collection preparation. Explicit readiness/publication polling is unchanged.
+  Set `true` only to measure the SDK's default retry behavior; those results
+  include retry/backoff time and can exceed the per-request timeout. Keep this
+  setting identical across compared runs.
 - `index_configs`: LambdaDB collection index config used by create/recreate
   preparation modes. Metadata fields that need indexing should be declared
   under a `metadata` object field with `objectIndexConfigs`; the example targets

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -1061,7 +1062,30 @@ def test_execute_benchmark_runs_search_under_ingest_upload_and_ask(tmp_path) -> 
     assert result.query_events_path.read_text(encoding="utf-8") == ""
 
 
-def test_execute_benchmark_runs_parallel_search_under_ingest(tmp_path) -> None:
+def _parallel_fake_worker(worker, args) -> None:
+    import ldbbench.runner.execute as runner
+
+    runner._worker_adapter = lambda vendor: FakeAdapter(
+        load_delay_seconds=0.05, query_delay_seconds=0.001
+    )
+    worker(*args)
+
+
+@pytest.mark.parametrize("processes", [1, 2])
+def test_execute_benchmark_runs_parallel_search_under_ingest(
+    tmp_path, monkeypatch, processes
+) -> None:
+    if processes > 1:
+        context = multiprocessing.get_context("spawn")
+        process_factory = context.Process
+        monkeypatch.setattr(
+            context,
+            "Process",
+            lambda *, target, args, name: process_factory(
+                target=_parallel_fake_worker, args=(target, args), name=name
+            ),
+        )
+        monkeypatch.setattr("ldbbench.runner.execute.mp", context)
     scenario = make_scenario(
         rows=4,
         batch_size=2,
@@ -1069,12 +1093,17 @@ def test_execute_benchmark_runs_parallel_search_under_ingest(tmp_path) -> None:
         workload="search_under_ingest",
         search_under_ingest={
             "pattern": "parallel_upsert_query",
-            "duration": "50ms",
+            "duration": "2s",
             "ingest_concurrency": 2,
             "query_concurrency": 2,
             "top_k": 2,
             "consistency": "eventual",
         },
+    )
+    scenario = replace(
+        scenario,
+        load={**scenario.load, "processes": processes},
+        query={**scenario.query, "processes": processes},
     )
     target = make_target()
     scenario_path, target_path = write_configs(tmp_path, scenario, target)
@@ -1118,14 +1147,18 @@ def test_execute_benchmark_runs_parallel_search_under_ingest(tmp_path) -> None:
     assert result.summary["search_under_ingest"]["pattern"] == "parallel_upsert_query"
     assert result.summary["load"]["records"] == 4
     assert result.summary["load"]["concurrency"] == 2
-    assert result.summary["load"]["processes"] == 1
-    assert result.summary["load"]["worker_threads_per_process"] == [2]
+    assert result.summary["load"]["processes"] == processes
+    expected_threads = [2 // processes] * processes
+    assert result.summary["load"]["worker_threads_per_process"] == expected_threads
     assert result.summary["query"]["mode"] == "parallel_under_ingest"
-    assert result.summary["query"]["processes"] == 1
-    assert result.summary["query"]["stages"][0]["worker_threads_per_process"] == [2]
+    assert result.summary["query"]["processes"] == processes
+    assert (
+        result.summary["query"]["stages"][0]["worker_threads_per_process"]
+        == expected_threads
+    )
     assert result.summary["query"]["queries"] > 0
-    assert result.summary["search_under_ingest"]["ingest_processes"] == 1
-    assert result.summary["search_under_ingest"]["query_processes"] == 1
+    assert result.summary["search_under_ingest"]["ingest_processes"] == processes
+    assert result.summary["search_under_ingest"]["query_processes"] == processes
     assert result.summary["search_under_ingest"]["queries"] == len(query_events)
     assert result.summary["search_under_ingest"]["records"] == 4
     assert len(ingest_events) == 2

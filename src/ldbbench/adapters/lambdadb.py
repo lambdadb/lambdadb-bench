@@ -77,6 +77,7 @@ class LambdaDBTargetSettings:
     index_configs: dict[str, Any]
     partition_config: dict[str, Any] | None
     timeout_ms: int | None
+    sdk_retries: bool
     delete_wait_timeout_seconds: float
     delete_wait_poll_seconds: float
     create_wait_timeout_seconds: float
@@ -111,6 +112,7 @@ class LambdaDBAdapter:
             "collection_name": settings.collection_name,
             "vector_field": settings.vector_field,
             "partition_config": settings.partition_config,
+            "sdk_retries": settings.sdk_retries,
             "api_key_env": settings.api_key_env,
             "api_key_present": bool(
                 settings.api_key_env and self._environ.get(settings.api_key_env)
@@ -331,6 +333,7 @@ class LambdaDBAdapter:
             settings.project_name,
             api_key,
             settings.timeout_ms,
+            settings.sdk_retries,
         )
         with self._client_lock:
             client = self._clients.get(cache_key)
@@ -349,6 +352,8 @@ class LambdaDBAdapter:
         kwargs: dict[str, Any] = {
             "project_api_key": api_key,
         }
+        if not settings.sdk_retries:
+            kwargs["retry_config"] = None
         if settings.timeout_ms is not None:
             kwargs["timeout_ms"] = settings.timeout_ms
         kwargs["base_url"] = settings.base_url
@@ -457,6 +462,10 @@ def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
     ):
         raise ConfigError("target.timeout_ms must be a positive integer")
 
+    sdk_retries = target.raw.get("sdk_retries", False)
+    if not isinstance(sdk_retries, bool):
+        raise ConfigError("target.sdk_retries must be a boolean")
+
     delete_wait_timeout_seconds = _optional_positive_float(
         target.raw,
         "delete_wait_timeout_seconds",
@@ -487,6 +496,7 @@ def _settings_from_target(target: TargetConfig) -> LambdaDBTargetSettings:
         index_configs=target.index_configs,
         partition_config=_partition_config(target.partition_config),
         timeout_ms=timeout_ms,
+        sdk_retries=sdk_retries,
         delete_wait_timeout_seconds=delete_wait_timeout_seconds,
         delete_wait_poll_seconds=delete_wait_poll_seconds,
         create_wait_timeout_seconds=create_wait_timeout_seconds,

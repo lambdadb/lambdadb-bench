@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import pytest
 from lambdadb import LambdaDB
+from lambdadb.errors import LambdaDBError
 
 from ldbbench.adapters.base import CollectionStats
 from ldbbench.adapters.lambdadb import LambdaDBAdapter
@@ -208,6 +209,14 @@ def test_check_reports_missing_project_name() -> None:
 
     assert not result.ok
     assert "project_name" in result.message
+
+
+@pytest.mark.parametrize("value", [None, "false", 1])
+def test_check_rejects_non_boolean_sdk_retries(value: Any) -> None:
+    result = make_adapter(FakeClient()).check(make_target(sdk_retries=value))
+
+    assert not result.ok
+    assert "sdk_retries must be a boolean" in result.message
 
 
 def test_prepare_create_builds_vector_index_config() -> None:
@@ -481,6 +490,26 @@ def test_adapter_uses_separate_clients_per_worker_thread() -> None:
             future.result()
 
     assert len(clients) == 2
+
+
+def test_adapter_does_not_reuse_clients_across_retry_settings() -> None:
+    client_options: list[dict[str, Any]] = []
+
+    def factory(**kwargs: Any) -> FakeClient:
+        client_options.append(kwargs)
+        return FakeClient()
+
+    adapter = LambdaDBAdapter(
+        client_factory=factory,
+        environ={"LAMBDADB_API_KEY": "secret"},
+    )
+    adapter.prepare(make_target())
+    adapter.prepare(make_target(sdk_retries=True))
+    adapter.prepare(make_target(sdk_retries=False))
+
+    assert len(client_options) == 2
+    assert client_options[0]["retry_config"] is None
+    assert "retry_config" not in client_options[1]
 
 
 def test_prepare_recreate_waits_for_delete_then_active_collection() -> None:
@@ -1022,6 +1051,45 @@ def test_sdk_query_reports_develop_server_took() -> None:
 
     assert [match.id for match in result.matches] == ["a"]
     assert result.server_took_ms == 7.0
+
+
+@pytest.mark.parametrize("operation", ["upsert", "query"])
+@pytest.mark.parametrize("status_code", [429, 503])
+def test_sdk_surfaces_first_http_failure_without_retry(
+    operation: str,
+    status_code: int,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(status_code, json={"message": "overloaded"})
+        if operation == "upsert":
+            return httpx.Response(202, json={"message": "accepted"})
+        return DevelopServer()(request)
+
+    with httpx.Client(transport=httpx.MockTransport(server)) as http_client:
+        adapter = LambdaDBAdapter(
+            client_factory=lambda **kwargs: LambdaDB(**kwargs, client=http_client),
+            environ={"LAMBDADB_API_KEY": "secret"},
+        )
+        with pytest.raises(LambdaDBError) as failure:
+            if operation == "upsert":
+                adapter.upsert_batch(
+                    make_target(),
+                    [{"id": "a", "vector": [0.1, 0.2], "metadata": {}}],
+                )
+            else:
+                adapter.query(
+                    make_target(),
+                    vector=[0.1, 0.2],
+                    top_k=1,
+                    consistency="strong",
+                )
+
+    assert failure.value.status_code == status_code
+    assert len(requests) == 1
 
 
 def test_operations_require_api_key_env() -> None:

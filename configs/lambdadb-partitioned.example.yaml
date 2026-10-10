@@ -7,6 +7,7 @@ collection_name: ${LAMBDADB_COLLECTION_NAME}
 vector_field: vector
 region: us-east-1
 timeout_ms: 30000
+sdk_retries: false
 
 prepare:
   mode: existing
