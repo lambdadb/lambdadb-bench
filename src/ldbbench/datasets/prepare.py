@@ -7,6 +7,8 @@ import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from inspect import signature
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -212,8 +214,42 @@ def load_huggingface_rows(
     config_name = subset if isinstance(subset, str) and subset else None
     iterable = load_dataset(source, config_name, split=split, streaming=True)
     if hasattr(iterable, "shuffle"):
+        if "max_buffer_input_shards" in signature(iterable.shuffle).parameters:
+            # Shuffle shard order only; datasets 5.x changed row sampling twice.
+            iterable = iterable.shuffle(
+                seed=seed, buffer_size=1, max_buffer_input_shards=1
+            )
+            return islice(
+                _shuffle_rows(iterable, seed=seed, buffer_size=buffer_size), limit
+            )
         iterable = iterable.shuffle(seed=seed, buffer_size=buffer_size)
     return iter(iterable.take(limit) if hasattr(iterable, "take") else iterable)
+
+
+def _shuffle_rows(
+    rows: Iterable[Mapping[str, Any]], *, seed: int, buffer_size: int
+) -> Iterator[Mapping[str, Any]]:
+    """Preserve datasets 4.x row sampling with a bounded streaming buffer."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+
+    def random_indices() -> Iterator[int]:
+        while True:
+            # Batch size also determines RNG state when the final buffer drains.
+            yield from (int(i) for i in rng.integers(0, buffer_size, size=1000))
+
+    indices = random_indices()
+    buffer: list[Mapping[str, Any]] = []
+    for row in rows:
+        if len(buffer) == buffer_size:
+            index = next(indices)
+            yield buffer[index]
+            buffer[index] = row
+        else:
+            buffer.append(row)
+    rng.shuffle(buffer)
+    yield from buffer
 
 
 def write_prepared_records(
